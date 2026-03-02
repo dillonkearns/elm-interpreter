@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildProjectEnv, eval, evalProject, evalWithEnv, trace, traceOrEvalModule)
+module Eval.Module exposing (ProjectEnv, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, parseProjectSources, trace, traceOrEvalModule)
 
 import Core
 import Dict as ElmDict
@@ -110,79 +110,92 @@ The result can be reused across multiple `evalWithEnv` calls.
 -}
 buildProjectEnv : List String -> Result Error ProjectEnv
 buildProjectEnv sources =
-    let
-        parseResult :
-            Result Error
-                (List
-                    { file : File
-                    , moduleName : ModuleName
-                    , interface : List Exposed
-                    }
-                )
-        parseResult =
-            sources
-                |> List.map
-                    (\source ->
-                        source
-                            |> Elm.Parser.parseToFile
-                            |> Result.mapError ParsingError
-                            |> Result.andThen
-                                (\file ->
-                                    let
-                                        modName : ModuleName
-                                        modName =
-                                            fileModuleName file
-                                    in
-                                    Ok
-                                        { file = file
-                                        , moduleName = modName
-                                        , interface = buildInterfaceFromFile file
-                                        }
-                                )
-                    )
-                |> combineResults
-    in
-    case parseResult of
-        Err e ->
-            Err e
+    parseProjectSources sources
+        |> Result.andThen buildProjectEnvFromParsed
 
-        Ok parsedModules ->
-            let
-                userInterfaces : ElmDict.Dict ModuleName (List Exposed)
-                userInterfaces =
-                    parsedModules
-                        |> List.map (\m -> ( m.moduleName, m.interface ))
-                        |> ElmDict.fromList
 
-                allInterfaces : ElmDict.Dict ModuleName (List Exposed)
-                allInterfaces =
-                    ElmDict.union userInterfaces Core.dependency.interfaces
-
-                envResult : Result Error Env
-                envResult =
-                    parsedModules
-                        |> Result.MyExtra.combineFoldl
-                            (\parsedModule envAcc ->
-                                buildModuleEnv allInterfaces parsedModule envAcc
-                            )
-                            (Ok
-                                { currentModule = []
-                                , callStack = []
-                                , functions = Core.functions
-                                , values = Dict.empty
-                                , imports = emptyImports
-                                , moduleImports = Dict.empty
+{-| Phase 1: Parse all source strings into files with module names and interfaces.
+-}
+parseProjectSources :
+    List String
+    ->
+        Result Error
+            (List
+                { file : File
+                , moduleName : ModuleName
+                , interface : List Exposed
+                }
+            )
+parseProjectSources sources =
+    sources
+        |> List.map
+            (\source ->
+                source
+                    |> Elm.Parser.parseToFile
+                    |> Result.mapError ParsingError
+                    |> Result.andThen
+                        (\file ->
+                            let
+                                modName : ModuleName
+                                modName =
+                                    fileModuleName file
+                            in
+                            Ok
+                                { file = file
+                                , moduleName = modName
+                                , interface = buildInterfaceFromFile file
                                 }
-                            )
-            in
-            envResult
-                |> Result.map
-                    (\env ->
-                        ProjectEnv
-                            { env = env
-                            , allInterfaces = allInterfaces
-                            }
+                        )
+            )
+        |> combineResults
+
+
+{-| Phase 2: Build the project environment from already-parsed modules.
+-}
+buildProjectEnvFromParsed :
+    List
+        { file : File
+        , moduleName : ModuleName
+        , interface : List Exposed
+        }
+    -> Result Error ProjectEnv
+buildProjectEnvFromParsed parsedModules =
+    let
+        userInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        userInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        allInterfaces =
+            ElmDict.union userInterfaces Core.dependency.interfaces
+
+        envResult : Result Error Env
+        envResult =
+            parsedModules
+                |> Result.MyExtra.combineFoldl
+                    (\parsedModule envAcc ->
+                        buildModuleEnv allInterfaces parsedModule envAcc
                     )
+                    (Ok
+                        { currentModule = []
+                        , callStack = []
+                        , functions = Core.functions
+                        , values = Dict.empty
+                        , imports = emptyImports
+                        , moduleImports = Dict.empty
+                        }
+                    )
+    in
+    envResult
+        |> Result.map
+            (\env ->
+                ProjectEnv
+                    { env = env
+                    , allInterfaces = allInterfaces
+                    }
+            )
 
 
 {-| Evaluate an expression using a pre-built ProjectEnv plus additional sources.
