@@ -41,6 +41,16 @@ empty moduleName =
     , callStack = []
     , functions = Dict.empty
     , values = Dict.empty
+    , imports = emptyImports
+    , moduleImports = Dict.empty
+    }
+
+
+emptyImports : Types.ImportedNames
+emptyImports =
+    { aliases = Dict.empty
+    , exposedValues = Dict.empty
+    , exposedConstructors = Dict.empty
     }
 
 
@@ -51,4 +61,7 @@ call moduleName name env =
         , callStack =
             { moduleName = moduleName, name = name }
                 :: env.callStack
+        , imports =
+            Dict.get moduleName env.moduleImports
+                |> Maybe.withDefault env.imports
     }
