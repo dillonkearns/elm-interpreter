@@ -130,10 +130,10 @@ buildInitialEnv file =
                     Ok (Environment.addFunction moduleName implementation env)
 
                 PortDeclaration _ ->
-                    Err <| Types.EvalError <| unsupported env "Port declaration"
+                    Ok env
 
                 InfixDeclaration _ ->
-                    Err <| Types.EvalError <| unsupported env "Infix declaration"
+                    Ok env
 
                 Destructuring _ _ ->
                     Err <| Types.EvalError <| unsupported env "Top level destructuring"
@@ -472,10 +472,10 @@ buildModuleEnv allInterfaces { file, moduleName } env =
                     Ok (registerConstructors moduleName customType envAcc)
 
                 PortDeclaration _ ->
-                    Err <| Types.EvalError <| unsupported envAcc "Port declaration"
+                    Ok envAcc
 
                 InfixDeclaration _ ->
-                    Err <| Types.EvalError <| unsupported envAcc "Infix declaration"
+                    Ok envAcc
 
                 Destructuring _ _ ->
                     Err <| Types.EvalError <| unsupported envAcc "Top level destructuring"
