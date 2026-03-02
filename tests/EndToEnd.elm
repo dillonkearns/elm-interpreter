@@ -33,6 +33,7 @@ suite =
         , recordUpdateTest
         , caseBoolPatternTest
         , kernelFunctionAsArgTest
+        , edgeCaseTests
         ]
 
 
@@ -347,4 +348,88 @@ kernelFunctionAsArgTest =
             "String.filter Char.isUpper \"Hello World\""
             String
             "HW"
+        ]
+
+
+edgeCaseTests : Test
+edgeCaseTests =
+    describe "Edge cases"
+        [ -- Debug.toString on nested structures
+          evalTest "Debug.toString nested Maybe"
+            "Debug.toString (Just (Just 1))"
+            String
+            "Just (Just 1)"
+        , evalTest "Debug.toString list of Maybe"
+            "Debug.toString [Just 1, Nothing]"
+            String
+            "[Just 1,Nothing]"
+        , evalTest "Debug.toString negative in constructor"
+            "Debug.toString (Just -1)"
+            String
+            "Just (-1)"
+        , evalTest "Debug.toString empty list"
+            "Debug.toString []"
+            String
+            "[]"
+        , evalTest "Debug.toString tuple"
+            "Debug.toString (1, 2)"
+            String
+            "(1,2)"
+        , evalTest "Debug.toString empty record"
+            "Debug.toString {}"
+            String
+            "{}"
+
+        -- Nested destructuring
+        , evalTest "nested tuple destructuring"
+            "let (a, (b, c)) = (1, (2, 3)) in a + b + c"
+            Int
+            6
+        , evalTest "let record destructuring"
+            "let { x, y } = { x = 10, y = 20 } in x + y"
+            Int
+            30
+
+        -- Wildcard pattern
+        , evalTest "wildcard in case"
+            "case Just 42 of\n    Nothing -> 0\n    _ -> 1"
+            Int
+            1
+
+        -- String operations
+        , evalTest "String.fromFloat"
+            "String.fromFloat 3.14"
+            String
+            "3.14"
+        , evalTest "String.fromInt"
+            "String.fromInt 42"
+            String
+            "42"
+        , evalTest "String.toInt valid"
+            """String.toInt "123" """
+            (TestUtils.maybe Int)
+            (Just 123)
+        , evalTest "String.toInt invalid"
+            """String.toInt "abc" """
+            (TestUtils.maybe Int)
+            Nothing
+        , evalTest "append strings"
+            """"hello" ++ " world" """
+            String
+            "hello world"
+        , evalTest "append lists"
+            "[1, 2] ++ [3, 4]"
+            (list Int)
+            [ 1, 2, 3, 4 ]
+
+        -- Composing functions
+        , evalTest "function composition >>"
+            "(String.fromInt >> String.length) 123"
+            Int
+            3
+        , evalTest "function composition <<"
+            "(String.length << String.fromInt) 123"
+            Int
+            3
+
         ]
