@@ -161,10 +161,10 @@ innerCompare l r env =
                 Ok EQ
 
             else if lb then
-                Ok LT
+                Ok GT
 
             else
-                Ok GT
+                Ok LT
 
         ( Bool _, _ ) ->
             uncomparable ()

@@ -17,6 +17,7 @@ suite =
         [ diffTests
         , recordTests
         , listTests
+        , boolComparisonTests
         ]
 
 
@@ -85,4 +86,25 @@ recordTests =
             """({ ctor = Just 3 } /= { ctor = Nothing })"""
             Bool
             ({ ctor = Just 3 } /= { ctor = Nothing })
+        ]
+
+
+boolComparisonTests : Test
+boolComparisonTests =
+    describe "Bool comparison"
+        [ evalTest "compare True False"
+            "compare True False"
+            identity
+        <|
+            Custom { moduleName = [ "Basics" ], name = "GT" } []
+        , evalTest "compare False True"
+            "compare False True"
+            identity
+        <|
+            Custom { moduleName = [ "Basics" ], name = "LT" } []
+        , evalTest "compare True True"
+            "compare True True"
+            identity
+        <|
+            Custom { moduleName = [ "Basics" ], name = "EQ" } []
         ]
