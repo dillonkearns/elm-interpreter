@@ -12,7 +12,8 @@ import Types exposing (Value(..))
 suite : Test
 suite =
     describe "Variable scoping across module calls"
-        [ describe "caller's local variables should not leak into callee"
+        [ recordAliasConstructorTests
+        , describe "caller's local variables should not leak into callee"
             [ evalProjectTest "local var does not shadow callee's module-level function"
                 [ """module Foo exposing (greet, helper)
 
@@ -95,6 +96,45 @@ main =
                 (list Int)
                 [ 10, 21, 32 ]
             ]
+        ]
+
+
+recordAliasConstructorTests : Test
+recordAliasConstructorTests =
+    describe "Record type alias constructors"
+        [ test "Record alias constructor field access .x" <|
+            \_ ->
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type alias Point = { x : Int, y : Int }
+
+main = (Point 1 2).x
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 1))
+        , test "Record alias constructor field access .y" <|
+            \_ ->
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type alias Point = { x : Int, y : Int }
+
+main = (Point 3 4).y
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 4))
+        , test "Record alias constructor used as function" <|
+            \_ ->
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type alias Point = { x : Int, y : Int }
+
+main = List.map .x [Point 10 20, Point 30 40]
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (List [ Int 10, Int 30 ]))
         ]
 
 
