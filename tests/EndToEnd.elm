@@ -3,6 +3,7 @@ module EndToEnd exposing (suite)
 import Elm.Syntax.Expression as Expression
 import Eval.Module
 import Expect
+import FastDict as Dict
 import Test exposing (Test, describe, test)
 import TestUtils exposing (evalTest, evalTest_, list, slowTest)
 import Types exposing (Value(..))
@@ -28,6 +29,8 @@ suite =
         , modulesTest
         , higherOrderTest
         , shadowingTest
+        , recordUpdateTest
+        , caseBoolPatternTest
         ]
 
 
@@ -275,3 +278,41 @@ main =
             [ 0, 1 ]
     in
     foo [ 4, 5 ] [ node ]""" (list (list Int)) [ [ 4, 5 ], [ 0, 1 ] ]
+
+
+recordUpdateTest : Test
+recordUpdateTest =
+    describe "Record update"
+        [ evalTest "preserves original fields"
+            """let rec = { a = 1, b = 2 } in { rec | a = 10 }"""
+            Record
+            (Dict.fromList [ ( "a", Int 10 ), ( "b", Int 2 ) ])
+        , evalTest "updates multiple fields"
+            """let rec = { x = 1, y = 2, z = 3 } in { rec | x = 10, z = 30 }"""
+            Record
+            (Dict.fromList [ ( "x", Int 10 ), ( "y", Int 2 ), ( "z", Int 30 ) ])
+        ]
+
+
+caseBoolPatternTest : Test
+caseBoolPatternTest =
+    describe "Case matching on Bool constructors"
+        [ evalTest "True branch"
+            """case True of
+    True -> 1
+    False -> 0"""
+            Int
+            1
+        , evalTest "False branch"
+            """case False of
+    True -> 1
+    False -> 0"""
+            Int
+            0
+        , evalTest "Bool variable"
+            """let x = True in case x of
+    True -> "yes"
+    False -> "no" """
+            String
+            "yes"
+        ]

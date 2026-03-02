@@ -956,7 +956,7 @@ evalRecordUpdate (Node range name) setters cfg env =
     Types.recurseThen ( Node range <| Expression.FunctionOrValue [] name, cfg, env )
         (\value ->
             case value of
-                Record _ ->
+                Record originalFields ->
                     let
                         ( fieldNames, fieldExpressions ) =
                             setters
@@ -970,8 +970,13 @@ evalRecordUpdate (Node range name) setters cfg env =
                     in
                     Types.recurseMapThen ( fieldExpressions, cfg, env )
                         (\fieldValues ->
-                            List.map2 Tuple.pair fieldNames fieldValues
-                                |> Dict.fromList
+                            let
+                                updates : Dict String Value
+                                updates =
+                                    List.map2 Tuple.pair fieldNames fieldValues
+                                        |> Dict.fromList
+                            in
+                            Dict.union updates originalFields
                                 |> Record
                                 |> Types.succeedPartial
                         )
@@ -1091,6 +1096,20 @@ match env (Node _ pattern) value =
 
         ( ParenthesizedPattern subPattern, _ ) ->
             match env subPattern value
+
+        ( NamedPattern { name } [], Bool True ) ->
+            if name == "True" then
+                ok Dict.empty
+
+            else
+                noMatch
+
+        ( NamedPattern { name } [], Bool False ) ->
+            if name == "False" then
+                ok Dict.empty
+
+            else
+                noMatch
 
         ( NamedPattern namePattern argsPatterns, Custom variant args ) ->
             -- Two names from different modules can never have the same type
