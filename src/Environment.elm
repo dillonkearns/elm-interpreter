@@ -1,4 +1,4 @@
-module Environment exposing (addFunction, addValue, call, callKernel, empty, moduleKey, with)
+module Environment exposing (addFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, with)
 
 import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -150,6 +150,56 @@ call moduleName name env =
         , callStack =
             { moduleName = moduleName, name = name }
                 :: env.callStack
+        , functions = env.functions
+        , currentModuleFunctions =
+            Dict.get key env.functions
+                |> Maybe.withDefault Dict.empty
+        , values = env.values
+        , imports =
+            Dict.get key env.moduleImports
+                |> Maybe.withDefault env.imports
+        , moduleImports = env.moduleImports
+        }
+
+
+{-| Like callKernel but skips callStack update. Used when trace is off.
+-}
+callKernelNoStack : ModuleName -> String -> Env -> Env
+callKernelNoStack moduleName _ env =
+    let
+        key : String
+        key =
+            moduleKey moduleName
+    in
+    { currentModule = moduleName
+    , currentModuleKey = key
+    , callStack = env.callStack
+    , functions = env.functions
+    , currentModuleFunctions =
+        Dict.get key env.functions
+            |> Maybe.withDefault Dict.empty
+    , values = env.values
+    , imports = env.imports
+    , moduleImports = env.moduleImports
+    }
+
+
+{-| Like call but skips callStack update. Used when trace is off.
+-}
+callNoStack : ModuleName -> String -> Env -> Env
+callNoStack moduleName _ env =
+    if moduleName == env.currentModule then
+        env
+
+    else
+        let
+            key : String
+            key =
+                moduleKey moduleName
+        in
+        { currentModule = moduleName
+        , currentModuleKey = key
+        , callStack = env.callStack
         , functions = env.functions
         , currentModuleFunctions =
             Dict.get key env.functions

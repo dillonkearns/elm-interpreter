@@ -2,7 +2,7 @@ module Kernel.Debug exposing (log, todo)
 
 import EvalResult
 import Rope
-import Types exposing (Eval, Value)
+import Types exposing (Eval, EvalResult(..), Value)
 import Value
 
 
@@ -13,10 +13,7 @@ log key value _ _ =
         message =
             key ++ ": " ++ Value.toString value
     in
-    ( Ok value
-    , Rope.empty
-    , Rope.singleton message
-    )
+    EvOkTrace value Rope.empty (Rope.singleton message)
 
 
 todo : String -> Eval Value

@@ -1,4 +1,4 @@
-module Types exposing (CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult, ImportedNames, PartialEval, PartialResult, Value(..))
+module Types exposing (CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), ImportedNames, PartialEval, PartialResult, Value(..))
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -26,11 +26,11 @@ type alias Eval out =
     Config -> Env -> EvalResult out
 
 
-type alias EvalResult out =
-    ( Result EvalErrorData out
-    , Rope CallTree
-    , Rope String
-    )
+type EvalResult out
+    = EvOk out
+    | EvErr EvalErrorData
+    | EvOkTrace out (Rope CallTree) (Rope String)
+    | EvErrTrace EvalErrorData (Rope CallTree) (Rope String)
 
 
 type alias Config =

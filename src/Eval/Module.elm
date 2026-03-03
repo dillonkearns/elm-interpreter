@@ -24,7 +24,8 @@ import List.Extra
 import Result.MyExtra
 import Rope exposing (Rope)
 import Syntax exposing (fakeNode)
-import Types exposing (CallTree, Env, Error(..), ImportedNames, Value)
+import EvalResult
+import Types exposing (CallTree, Env, Error(..), EvalResult(..), ImportedNames, Value)
 import Value exposing (unsupported)
 
 
@@ -93,11 +94,15 @@ traceOrEvalModule cfg source expression =
                         _ ->
                             fakeNode
 
-                ( result, callTrees, logLines ) =
+                evalResult : Types.EvalResult Value
+                evalResult =
                     Eval.Expression.evalExpression
                         (maybeNode expression)
                         { trace = cfg.trace }
                         env
+
+                ( result, callTrees, logLines ) =
+                    EvalResult.toTriple evalResult
             in
             ( Result.mapError Types.EvalError result
             , callTrees
@@ -322,11 +327,13 @@ evalWithEnv (ProjectEnv projectEnv) additionalSources expression =
                                 , imports = finalImports
                             }
 
-                        ( result, _, _ ) =
+                        result : Result Types.EvalErrorData Value
+                        result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
                                 { trace = False }
                                 finalEnv
+                                |> EvalResult.toResult
                     in
                     Result.mapError Types.EvalError result
 
@@ -678,11 +685,13 @@ evalProject sources expression =
                                 , imports = finalImports
                             }
 
-                        ( result, _, _ ) =
+                        result : Result Types.EvalErrorData Value
+                        result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
                                 { trace = False }
                                 finalEnv
+                                |> EvalResult.toResult
                     in
                     Result.mapError Types.EvalError result
 

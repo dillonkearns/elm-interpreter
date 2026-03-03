@@ -6,20 +6,23 @@ import EvalResult
 import Parser
 import Recursion exposing (Rec)
 import Recursion.Traverse
-import Rope
+import Rope exposing (Rope)
 import Syntax
-import Types exposing (Config, Env, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult, PartialResult)
+import Types exposing (Config, Env, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), PartialResult)
 
 
 combineMap : (a -> Eval b) -> List a -> Eval (List b)
 combineMap f xs cfg env =
     List.foldr
         (\el acc ->
-            case EvalResult.toResult acc of
-                Err _ ->
+            case acc of
+                EvErr _ ->
                     acc
 
-                Ok _ ->
+                EvErrTrace _ _ _ ->
+                    acc
+
+                _ ->
                     EvalResult.map2 (::)
                         (f el cfg env)
                         acc
@@ -32,12 +35,15 @@ foldl : (a -> out -> Eval out) -> out -> List a -> Eval out
 foldl f init xs cfg env =
     List.foldl
         (\el acc ->
-            case EvalResult.toResult acc of
-                Err _ ->
-                    acc
-
-                Ok a ->
+            case acc of
+                EvOk a ->
                     f el a cfg env
+
+                EvOkTrace a _ _ ->
+                    EvalResult.andThen (\a2 -> f el a2 cfg env) acc
+
+                _ ->
+                    acc
         )
         (EvalResult.succeed init)
         xs
@@ -47,12 +53,15 @@ foldr : (a -> out -> Eval out) -> out -> List a -> Eval out
 foldr f init xs cfg env =
     List.foldr
         (\el acc ->
-            case EvalResult.toResult acc of
-                Err _ ->
-                    acc
-
-                Ok a ->
+            case acc of
+                EvOk a ->
                     f el a cfg env
+
+                EvOkTrace a _ _ ->
+                    EvalResult.andThen (\a2 -> f el a2 cfg env) acc
+
+                _ ->
+                    acc
         )
         (EvalResult.succeed init)
         xs
@@ -60,12 +69,12 @@ foldr f init xs cfg env =
 
 succeedPartial : v -> PartialResult v
 succeedPartial v =
-    Recursion.base (EvalResult.succeed v)
+    Recursion.base (EvOk v)
 
 
 failPartial : EvalErrorData -> PartialResult v
 failPartial e =
-    Recursion.base (EvalResult.fail e)
+    Recursion.base (EvErr e)
 
 
 errorToString : Error -> String
@@ -116,24 +125,38 @@ wrapThen :
     )
     -> EvalResult value
     -> Rec r t (EvalResult a)
-wrapThen f ( value, trees, logs ) =
-    case value of
-        Err e ->
-            Recursion.base ( Err e, trees, logs )
+wrapThen f er =
+    case er of
+        EvOk v ->
+            f v
 
-        Ok v ->
-            if Rope.isEmpty trees && Rope.isEmpty logs then
-                f v
+        EvErr e ->
+            Recursion.base (EvErr e)
 
-            else
-                f v
-                    |> Recursion.map
-                        (\( result, ftrees, flogs ) ->
-                            ( result
-                            , EvalResult.appendRopes trees ftrees
-                            , EvalResult.appendRopes logs flogs
-                            )
-                        )
+        EvOkTrace v trees logs ->
+            f v
+                |> Recursion.map (mergeTraceInto trees logs)
+
+        EvErrTrace e trees logs ->
+            Recursion.base (EvErrTrace e trees logs)
+
+
+{-| Merge trace data from an outer evaluation into an inner result.
+-}
+mergeTraceInto : Rope Types.CallTree -> Rope String -> EvalResult a -> EvalResult a
+mergeTraceInto trees logs er =
+    case er of
+        EvOk v ->
+            EvOkTrace v trees logs
+
+        EvErr e ->
+            EvErrTrace e trees logs
+
+        EvOkTrace v ft fl ->
+            EvOkTrace v (Rope.appendTo trees ft) (Rope.appendTo fl logs)
+
+        EvErrTrace e ft fl ->
+            EvErrTrace e (Rope.appendTo trees ft) (Rope.appendTo fl logs)
 
 
 recurseMapThen :
@@ -143,25 +166,17 @@ recurseMapThen :
 recurseMapThen ( exprs, cfg, env ) f =
     Recursion.Traverse.sequenceListThen (List.map (\e -> ( e, cfg, env )) exprs)
         (\results ->
-            let
-                ( values, trees, logs ) =
-                    EvalResult.combine results
-            in
-            case values of
-                Err e ->
-                    Recursion.base ( Err e, trees, logs )
+            case EvalResult.combine results of
+                EvOk vs ->
+                    f vs
 
-                Ok vs ->
-                    if Rope.isEmpty trees && Rope.isEmpty logs then
-                        f vs
+                EvErr e ->
+                    Recursion.base (EvErr e)
 
-                    else
-                        f vs
-                            |> Recursion.map
-                                (\( result, ftrees, flogs ) ->
-                                    ( result
-                                    , EvalResult.appendRopes trees ftrees
-                                    , EvalResult.appendRopes logs flogs
-                                    )
-                                )
+                EvOkTrace vs trees logs ->
+                    f vs
+                        |> Recursion.map (mergeTraceInto trees logs)
+
+                EvErrTrace e trees logs ->
+                    Recursion.base (EvErrTrace e trees logs)
         )

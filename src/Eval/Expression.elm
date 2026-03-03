@@ -15,11 +15,11 @@ import Kernel
 import List.Extra
 import Recursion
 import Result.MyExtra
-import Rope
+import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
-import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalResult, PartialEval, PartialResult, Value(..))
+import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalResult(..), PartialEval, PartialResult, Value(..))
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -121,17 +121,28 @@ evalExpression initExpression initCfg initEnv =
             if cfg.trace then
                 result
                     |> Recursion.map
-                        (\( value, trees, logs ) ->
-                            ( value
-                            , CallNode
-                                { env = env
-                                , expression = Node range expression
-                                , children = trees
-                                , result = value
-                                }
-                                |> Rope.singleton
-                            , logs
-                            )
+                        (\evalResult ->
+                            let
+                                ( value, trees, logs ) =
+                                    EvalResult.toTriple evalResult
+
+                                callTree : Rope CallTree
+                                callTree =
+                                    Rope.singleton
+                                        (CallNode
+                                            { env = env
+                                            , expression = Node range expression
+                                            , children = trees
+                                            , result = value
+                                            }
+                                        )
+                            in
+                            case value of
+                                Ok v ->
+                                    EvOkTrace v callTree logs
+
+                                Err e ->
+                                    EvErrTrace e callTree logs
                         )
 
             else
@@ -307,28 +318,35 @@ evalOperatorApplication opName l r cfg env =
                                     childEnv =
                                         Environment.callKernel kernelModuleName opName env
 
-                                    ( result, children, logLines ) =
+                                    kernelEvalResult : EvalResult Value
+                                    kernelEvalResult =
                                         kernelFn [ lValue, rValue ] cfg childEnv
+
+                                    ( result, children, logLines ) =
+                                        EvalResult.toTriple kernelEvalResult
+
+                                    callTree : Rope CallTree
+                                    callTree =
+                                        Rope.singleton
+                                            (CallNode
+                                                { env = childEnv
+                                                , expression = fakeNode <| Expression.OperatorApplication opName Elm.Syntax.Infix.Non l r
+                                                , result = result
+                                                , children = children
+                                                }
+                                            )
                                 in
                                 Recursion.base
-                                    ( result
-                                    , Rope.singleton
-                                        (CallNode
-                                            { env = childEnv
-                                            , expression = fakeNode <| Expression.OperatorApplication opName Elm.Syntax.Infix.Non l r
-                                            , result = result
-                                            , children = children
-                                            }
-                                        )
-                                    , logLines
+                                    (case result of
+                                        Ok v ->
+                                            EvOkTrace v callTree logLines
+
+                                        Err e ->
+                                            EvErrTrace e callTree logLines
                                     )
 
                             else
-                                let
-                                    ( result, _, logLines ) =
-                                        kernelFn [ lValue, rValue ] cfg env
-                                in
-                                Recursion.base ( result, Rope.empty, logLines )
+                                Recursion.base (kernelFn [ lValue, rValue ] cfg env)
                         )
                 )
 
@@ -555,33 +573,39 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                                     childEnv =
                                         Environment.callKernel moduleName name env
 
+                                    kernelEvalResult : EvalResult Value
+                                    kernelEvalResult =
+                                        f args cfg childEnv
+
                                     ( kernelResult, children, logLines ) =
-                                        f args
-                                            cfg
-                                            childEnv
+                                        EvalResult.toTriple kernelEvalResult
+
+                                    callTree : Rope CallTree
+                                    callTree =
+                                        Rope.singleton
+                                            (CallNode
+                                                { env = childEnv
+                                                , expression =
+                                                    Node range <|
+                                                        Application <|
+                                                            Node range (FunctionOrValue moduleName name)
+                                                                :: List.map Value.toExpression args
+                                                , result = kernelResult
+                                                , children = children
+                                                }
+                                            )
                                 in
-                                ( kernelResult
-                                , CallNode
-                                    { env = childEnv
-                                    , expression =
-                                        Node range <|
-                                            Application <|
-                                                Node range (FunctionOrValue moduleName name)
-                                                    :: List.map Value.toExpression args
-                                    , result = kernelResult
-                                    , children = children
-                                    }
-                                    |> Rope.singleton
-                                , logLines
+                                (case kernelResult of
+                                    Ok v ->
+                                        EvOkTrace v callTree logLines
+
+                                    Err e ->
+                                        EvErrTrace e callTree logLines
                                 )
                                     |> Recursion.base
 
                             else
-                                let
-                                    ( kernelResult, _, logLines ) =
-                                        f args cfg env
-                                in
-                                Recursion.base ( kernelResult, Rope.empty, logLines )
+                                Recursion.base (f args cfg env)
 
         _ ->
             call
@@ -595,10 +619,18 @@ call : Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
 call maybeQualifiedName implementation cfg env =
     case maybeQualifiedName of
         Just qualifiedName ->
+            let
+                callFn =
+                    if cfg.trace then
+                        Environment.call
+
+                    else
+                        Environment.callNoStack
+            in
             Recursion.recurse
                 ( implementation
                 , cfg
-                , Environment.call qualifiedName.moduleName qualifiedName.name env
+                , callFn qualifiedName.moduleName qualifiedName.name env
                 )
 
         Nothing ->
@@ -637,13 +669,20 @@ evalQualifiedOrVariant moduleName name cfg env =
                         qualifiedNameRef : QualifiedNameRef
                         qualifiedNameRef =
                             { moduleName = env.currentModule, name = name }
+
+                        callFn =
+                            if cfg.trace then
+                                Environment.call
+
+                            else
+                                Environment.callNoStack
                     in
                     if List.isEmpty function.arguments then
                         call (Just qualifiedNameRef) function.expression cfg env
 
                     else
                         PartiallyApplied
-                            (Environment.call env.currentModule name env)
+                            (callFn env.currentModule name env)
                             []
                             function.arguments
                             (Just qualifiedNameRef)
@@ -870,8 +909,16 @@ evalNonVariant moduleName name cfg env =
                                     call (Just qualifiedNameRef) function.expression cfg env
 
                                 else
+                                    let
+                                        callFn =
+                                            if cfg.trace then
+                                                Environment.call
+
+                                            else
+                                                Environment.callNoStack
+                                    in
                                     PartiallyApplied
-                                        (Environment.call resolvedModule name env)
+                                        (callFn resolvedModule name env)
                                         []
                                         function.arguments
                                         (Just qualifiedNameRef)
@@ -893,8 +940,12 @@ evalNonVariant moduleName name cfg env =
                                         { currentModule = resolvedModule
                                         , currentModuleKey = resolvedModuleKey
                                         , callStack =
-                                            { moduleName = resolvedModule, name = name }
-                                                :: env.callStack
+                                            if cfg.trace then
+                                                { moduleName = resolvedModule, name = name }
+                                                    :: env.callStack
+
+                                            else
+                                                env.callStack
                                         , functions = env.functions
                                         , currentModuleFunctions =
                                             Dict.get resolvedModuleKey env.functions
@@ -1101,26 +1152,35 @@ evalKernelFunctionWithKey key moduleName name cfg env =
                     if argCount == 0 then
                         if cfg.trace then
                             let
-                                ( result, callTrees, logLines ) =
+                                kernelEvalResult : EvalResult Value
+                                kernelEvalResult =
                                     f [] cfg (Environment.callKernel moduleName name env)
 
-                                callTree : CallTree
-                                callTree =
-                                    CallNode
-                                        { env = env
-                                        , expression = fakeNode <| FunctionOrValue moduleName name
-                                        , result = result
-                                        , children = callTrees
-                                        }
+                                ( result, callTrees, logLines ) =
+                                    EvalResult.toTriple kernelEvalResult
+
+                                callTreeRope : Rope CallTree
+                                callTreeRope =
+                                    Rope.singleton
+                                        (CallNode
+                                            { env = env
+                                            , expression = fakeNode <| FunctionOrValue moduleName name
+                                            , result = result
+                                            , children = callTrees
+                                            }
+                                        )
                             in
-                            Recursion.base ( result, Rope.singleton callTree, logLines )
+                            Recursion.base
+                                (case result of
+                                    Ok v ->
+                                        EvOkTrace v callTreeRope logLines
+
+                                    Err e ->
+                                        EvErrTrace e callTreeRope logLines
+                                )
 
                         else
-                            let
-                                ( result, _, _ ) =
-                                    f [] cfg env
-                            in
-                            Recursion.base <| EvalResult.fromResult result
+                            Recursion.base (f [] cfg env)
 
                     else
                         PartiallyApplied (Environment.empty moduleName)
@@ -1150,8 +1210,16 @@ evalKernelFunctionFromAstWithKey key moduleName name cfg env =
                     evalKernelFunctionWithKey key moduleName name cfg env
 
                 Just function ->
+                    let
+                        callFn =
+                            if cfg.trace then
+                                Environment.callKernel
+
+                            else
+                                Environment.callKernelNoStack
+                    in
                     PartiallyApplied
-                        (Environment.callKernel moduleName name env)
+                        (callFn moduleName name env)
                         []
                         function.arguments
                         (Just { moduleName = moduleName, name = name })
@@ -1194,18 +1262,20 @@ evalLetBlockSingle declaration body cfg env =
             addLetDeclaration declaration cfg env
     in
     case newEnv of
-        ( Ok ne, trees, logs ) ->
-            if Rope.isEmpty trees && Rope.isEmpty logs then
-                Recursion.recurse ( body, cfg, ne )
+        EvOk ne ->
+            Recursion.recurse ( body, cfg, ne )
 
-            else
-                Types.recurseThen ( body, cfg, ne )
-                    (\res ->
-                        Recursion.base ( Ok res, trees, logs )
-                    )
+        EvErr e ->
+            Recursion.base (EvErr e)
 
-        ( Err e, trees, logs ) ->
-            Recursion.base ( Err e, trees, logs )
+        EvOkTrace ne trees logs ->
+            Types.recurseThen ( body, cfg, ne )
+                (\res ->
+                    Recursion.base (EvOkTrace res trees logs)
+                )
+
+        EvErrTrace e trees logs ->
+            Recursion.base (EvErrTrace e trees logs)
 
 
 evalLetBlockFull : Expression.LetBlock -> PartialEval Value
@@ -1267,12 +1337,18 @@ evalLetBlockFull letBlock cfg env =
                         sd
     in
     case newEnv of
-        ( Ok ne, trees, logs ) ->
-            Types.recurseThen ( letBlock.expression, cfg, ne )
-                (\res -> Recursion.base ( Ok res, trees, logs ))
+        EvOk ne ->
+            Recursion.recurse ( letBlock.expression, cfg, ne )
 
-        ( Err e, trees, logs ) ->
-            Recursion.base ( Err e, trees, logs )
+        EvErr e ->
+            Recursion.base (EvErr e)
+
+        EvOkTrace ne trees logs ->
+            Types.recurseThen ( letBlock.expression, cfg, ne )
+                (\res -> Recursion.base (EvOkTrace res trees logs))
+
+        EvErrTrace e trees logs ->
+            Recursion.base (EvErrTrace e trees logs)
 
 
 isLetDeclarationFunction : Node LetDeclaration -> Bool
@@ -1507,14 +1583,22 @@ evalRecordUpdate (Node range name) setters cfg env =
 
 
 evalOperator : String -> PartialEval Value
-evalOperator opName _ env =
+evalOperator opName cfg env =
     case Dict.get opName Core.operators of
         Nothing ->
             Types.failPartial <| nameError env opName
 
         Just kernelFunction ->
+            let
+                callFn =
+                    if cfg.trace then
+                        Environment.call
+
+                    else
+                        Environment.callNoStack
+            in
             PartiallyApplied
-                (Environment.call kernelFunction.moduleName opName env)
+                (callFn kernelFunction.moduleName opName env)
                 []
                 [ fakeNode <| VarPattern "$l", fakeNode <| VarPattern "$r" ]
                 Nothing
