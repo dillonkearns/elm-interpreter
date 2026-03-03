@@ -1,4 +1,4 @@
-module Environment exposing (addFunction, addValue, call, empty, with)
+module Environment exposing (addFunction, addValue, call, callKernel, empty, with)
 
 import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -83,6 +83,26 @@ emptyImports =
     { aliases = Dict.empty
     , exposedValues = Dict.empty
     , exposedConstructors = Dict.empty
+    }
+
+
+{-| Optimized call for kernel functions. Kernel modules (Elm.Kernel.*)
+are never the current user module, so we skip the equality check and
+the moduleImports lookup (kernel modules have no user imports).
+-}
+callKernel : ModuleName -> String -> Env -> Env
+callKernel moduleName name env =
+    { currentModule = moduleName
+    , callStack =
+        { moduleName = moduleName, name = name }
+            :: env.callStack
+    , functions = env.functions
+    , currentModuleFunctions =
+        Dict.get moduleName env.functions
+            |> Maybe.withDefault Dict.empty
+    , values = env.values
+    , imports = env.imports
+    , moduleImports = env.moduleImports
     }
 
 

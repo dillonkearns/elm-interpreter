@@ -283,7 +283,7 @@ evalOperatorApplication opName l r cfg env =
                             let
                                 childEnv : Env
                                 childEnv =
-                                    Environment.call kernelModuleName opName env
+                                    Environment.callKernel kernelModuleName opName env
 
                                 ( result, children, logLines ) =
                                     kernelFn [ lValue, rValue ] cfg childEnv
@@ -518,7 +518,7 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                             let
                                 childEnv : Env
                                 childEnv =
-                                    Environment.call moduleName name env
+                                    Environment.callKernel moduleName name env
 
                                 ( kernelResult, children, logLines ) =
                                     f args
@@ -779,33 +779,35 @@ evalNonVariant moduleName name cfg env =
                                         Nothing
 
                             else
-                                let
-                                    fixedModuleName : ModuleName
-                                    fixedModuleName =
-                                        fixModuleName moduleName env
+                                -- Try direct lookup first (common case: module not aliased)
+                                case Dict.get moduleName env.functions of
+                                    Just moduleDict ->
+                                        case Dict.get name moduleDict of
+                                            Just f ->
+                                                Just ( moduleName, f )
 
-                                    fromModule : Maybe ( ModuleName, Expression.FunctionImplementation )
-                                    fromModule =
-                                        Dict.get fixedModuleName env.functions
-                                            |> Maybe.andThen (Dict.get name)
-                                            |> Maybe.map (\f -> ( fixedModuleName, f ))
-                                in
-                                case fromModule of
-                                    Just _ ->
-                                        fromModule
+                                            Nothing ->
+                                                -- Module exists but function not found.
+                                                -- Could be aliased to a different module.
+                                                case Dict.get moduleName env.imports.aliases of
+                                                    Just canonical ->
+                                                        Dict.get canonical env.functions
+                                                            |> Maybe.andThen (Dict.get name)
+                                                            |> Maybe.map (\f -> ( canonical, f ))
+
+                                                    Nothing ->
+                                                        Nothing
 
                                     Nothing ->
-                                        -- Alias resolution may have mapped to the wrong
-                                        -- module (e.g. `import MyArray` and
-                                        -- `import MyArray.Extra as MyArray`). Fall back
-                                        -- to the original AST module name.
-                                        if fixedModuleName /= moduleName then
-                                            Dict.get moduleName env.functions
-                                                |> Maybe.andThen (Dict.get name)
-                                                |> Maybe.map (\f -> ( moduleName, f ))
+                                        -- Module not found directly; try alias resolution
+                                        case Dict.get moduleName env.imports.aliases of
+                                            Just canonical ->
+                                                Dict.get canonical env.functions
+                                                    |> Maybe.andThen (Dict.get name)
+                                                    |> Maybe.map (\f -> ( canonical, f ))
 
-                                        else
-                                            Nothing
+                                            Nothing ->
+                                                Nothing
                     in
                     case maybeFunction of
                         Just ( resolvedModule, function ) ->
@@ -813,39 +815,55 @@ evalNonVariant moduleName name cfg env =
                                 qualifiedNameRef : QualifiedNameRef
                                 qualifiedNameRef =
                                     { moduleName = resolvedModule, name = name }
-
-                                -- Clear caller's local values when calling into
-                                -- a different module, so they don't leak into
-                                -- the callee's scope and shadow its own names.
-                                -- We keep values for same-module calls because
-                                -- let-bound functions are stored in env.functions
-                                -- and need access to their enclosing scope.
-                                targetEnv : Env
-                                targetEnv =
-                                    if resolvedModule /= env.currentModule then
-                                        { currentModule = env.currentModule
-                                        , callStack = env.callStack
-                                        , functions = env.functions
-                                        , currentModuleFunctions = env.currentModuleFunctions
-                                        , values = Dict.empty
-                                        , imports = env.imports
-                                        , moduleImports = env.moduleImports
-                                        }
-
-                                    else
-                                        env
                             in
-                            if List.isEmpty function.arguments then
-                                call (Just qualifiedNameRef) function.expression cfg targetEnv
+                            if resolvedModule == env.currentModule then
+                                -- Same module: keep local values, use existing caches
+                                if List.isEmpty function.arguments then
+                                    call (Just qualifiedNameRef) function.expression cfg env
+
+                                else
+                                    PartiallyApplied
+                                        (Environment.call resolvedModule name env)
+                                        []
+                                        function.arguments
+                                        (Just qualifiedNameRef)
+                                        function.expression
+                                        |> Types.succeedPartial
 
                             else
-                                PartiallyApplied
-                                    (Environment.call resolvedModule name targetEnv)
-                                    []
-                                    function.arguments
-                                    (Just qualifiedNameRef)
-                                    function.expression
-                                    |> Types.succeedPartial
+                                -- Cross-module: combine clearing values + Environment.call
+                                -- into a single record construction. We know resolvedModule /=
+                                -- env.currentModule, so we inline the cross-module branch
+                                -- of Environment.call directly.
+                                let
+                                    callEnv : Env
+                                    callEnv =
+                                        { currentModule = resolvedModule
+                                        , callStack =
+                                            { moduleName = resolvedModule, name = name }
+                                                :: env.callStack
+                                        , functions = env.functions
+                                        , currentModuleFunctions =
+                                            Dict.get resolvedModule env.functions
+                                                |> Maybe.withDefault Dict.empty
+                                        , values = Dict.empty
+                                        , imports =
+                                            Dict.get resolvedModule env.moduleImports
+                                                |> Maybe.withDefault env.imports
+                                        , moduleImports = env.moduleImports
+                                        }
+                                in
+                                if List.isEmpty function.arguments then
+                                    Recursion.recurse ( function.expression, cfg, callEnv )
+
+                                else
+                                    PartiallyApplied
+                                        callEnv
+                                        []
+                                        function.arguments
+                                        (Just qualifiedNameRef)
+                                        function.expression
+                                        |> Types.succeedPartial
 
                         Nothing ->
                             Syntax.qualifiedNameToString
@@ -939,7 +957,7 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                     Just ( _, f ) ->
                                         f oldArgs
                                             cfg
-                                            (Environment.call moduleName name localEnv)
+                                            (Environment.callKernel moduleName name localEnv)
 
                     _ ->
                         evalExpression implementation cfg boundEnv
@@ -979,7 +997,7 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                             Just ( _, f ) ->
                                                 f oldArgs
                                                     cfg
-                                                    (Environment.call moduleName name localEnv)
+                                                    (Environment.callKernel moduleName name localEnv)
 
                             _ ->
                                 -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
@@ -1003,7 +1021,7 @@ evalKernelFunction moduleName name cfg env =
                     if argCount == 0 then
                         let
                             ( result, callTrees, logLines ) =
-                                f [] cfg (Environment.call moduleName name env)
+                                f [] cfg (Environment.callKernel moduleName name env)
                         in
                         if cfg.trace then
                             let
@@ -1045,7 +1063,7 @@ evalKernelFunctionFromAst moduleName name cfg env =
 
                 Just function ->
                     PartiallyApplied
-                        (Environment.call moduleName name env)
+                        (Environment.callKernel moduleName name env)
                         []
                         function.arguments
                         (Just { moduleName = moduleName, name = name })
@@ -1422,26 +1440,18 @@ evalOperator opName _ env =
                 |> Types.succeedPartial
 
 
+{-| Check if name starts with uppercase (variant/constructor).
+Uses String.left 1 + native string comparison instead of
+String.uncons + Char.toCode to avoid Char boxing overhead.
+-}
 isVariant : String -> Bool
 isVariant name =
-    case String.uncons name of
-        Nothing ->
-            False
-
-        Just ( first, _ ) ->
-            isAsciiUpper first
-
-
-{-| Fast alternative to Unicode.isUpper/Char.isUpper which avoids expensive
-structural equality on Char objects (_Utils_eq). Elm constructors only use ASCII.
--}
-isAsciiUpper : Char -> Bool
-isAsciiUpper c =
     let
-        code =
-            Char.toCode c
+        firstChar : String
+        firstChar =
+            String.left 1 name
     in
-    code >= 65 && code <= 90
+    "A" <= firstChar && firstChar <= "Z"
 
 
 evalCase : Expression.CaseBlock -> PartialEval Value
