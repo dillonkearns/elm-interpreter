@@ -518,21 +518,29 @@ evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg en
 {-| Try to bind all patterns directly via addValue. Returns Just the new env
 if all patterns are simple (VarPattern, AllPattern, ParenthesizedPattern wrapping one).
 Returns Nothing for complex patterns that need full match.
+
+Batches dict insertions to avoid creating intermediate env records.
 -}
 bindSimplePatterns : List (Node Pattern) -> List Value -> Env -> Maybe Env
 bindSimplePatterns patterns args env =
+    bindSimplePatternsHelp patterns args env.values
+        |> Maybe.map (\newValues -> Environment.replaceValues newValues env)
+
+
+bindSimplePatternsHelp : List (Node Pattern) -> List Value -> EnvValues -> Maybe EnvValues
+bindSimplePatternsHelp patterns args values =
     case ( patterns, args ) of
         ( [], [] ) ->
-            Just env
+            Just values
 
         ( (Node _ (VarPattern name)) :: ptail, value :: atail ) ->
-            bindSimplePatterns ptail atail (Environment.addValue name value env)
+            bindSimplePatternsHelp ptail atail (Dict.insert name value values)
 
         ( (Node _ AllPattern) :: ptail, _ :: atail ) ->
-            bindSimplePatterns ptail atail env
+            bindSimplePatternsHelp ptail atail values
 
         ( (Node _ (ParenthesizedPattern inner)) :: ptail, value :: atail ) ->
-            bindSimplePatterns (inner :: ptail) (value :: atail) env
+            bindSimplePatternsHelp (inner :: ptail) (value :: atail) values
 
         _ ->
             Nothing
@@ -543,28 +551,18 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
     case implementation of
         Node range (FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
             let
-                qualifiedName : QualifiedNameRef
-                qualifiedName =
-                    { moduleName = moduleName
-                    , name = name
-                    }
-
-                fullName : String
-                fullName =
-                    Syntax.qualifiedNameToString qualifiedName
-
                 key : String
                 key =
                     Environment.moduleKey moduleName
             in
             case Dict.get key kernelFunctions of
                 Nothing ->
-                    Types.failPartial <| nameError env fullName
+                    Types.failPartial <| nameError env (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
 
                 Just kernelModule ->
                     case Dict.get name kernelModule of
                         Nothing ->
-                            Types.failPartial <| nameError env fullName
+                            Types.failPartial <| nameError env (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
 
                         Just ( _, f ) ->
                             if cfg.trace then
@@ -1051,22 +1049,18 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                 case implementation of
                     Node _ (Expression.FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
                         let
-                            fullName : String
-                            fullName =
-                                Syntax.qualifiedNameToString { moduleName = moduleName, name = name }
-
                             key : String
                             key =
                                 Environment.moduleKey moduleName
                         in
                         case Dict.get key kernelFunctions of
                             Nothing ->
-                                EvalResult.fail <| nameError localEnv fullName
+                                EvalResult.fail <| nameError localEnv (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
 
                             Just kernelModule ->
                                 case Dict.get name kernelModule of
                                     Nothing ->
-                                        EvalResult.fail <| nameError localEnv fullName
+                                        EvalResult.fail <| nameError localEnv (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
 
                                     Just ( _, f ) ->
                                         if cfg.trace then
@@ -1099,22 +1093,18 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                         case implementation of
                             Node _ (Expression.FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
                                 let
-                                    fullName : String
-                                    fullName =
-                                        Syntax.qualifiedNameToString { moduleName = moduleName, name = name }
-
                                     key : String
                                     key =
                                         Environment.moduleKey moduleName
                                 in
                                 case Dict.get key kernelFunctions of
                                     Nothing ->
-                                        EvalResult.fail <| nameError localEnv fullName
+                                        EvalResult.fail <| nameError localEnv (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
 
                                     Just kernelModule ->
                                         case Dict.get name kernelModule of
                                             Nothing ->
-                                                EvalResult.fail <| nameError localEnv fullName
+                                                EvalResult.fail <| nameError localEnv (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
 
                                             Just ( _, f ) ->
                                                 if cfg.trace then

@@ -1,4 +1,4 @@
-module Environment exposing (addFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, with)
+module Environment exposing (addFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, replaceValues, with)
 
 import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -31,6 +31,21 @@ addValue name value env =
     , functions = env.functions
     , currentModuleFunctions = env.currentModuleFunctions
     , values = Dict.insert name value env.values
+    , imports = env.imports
+    , moduleImports = env.moduleImports
+    }
+
+
+{-| Replace the values dict entirely (explicit construction, avoids _Utils_update).
+-}
+replaceValues : EnvValues -> Env -> Env
+replaceValues newValues env =
+    { currentModule = env.currentModule
+    , currentModuleKey = env.currentModuleKey
+    , callStack = env.callStack
+    , functions = env.functions
+    , currentModuleFunctions = env.currentModuleFunctions
+    , values = newValues
     , imports = env.imports
     , moduleImports = env.moduleImports
     }
