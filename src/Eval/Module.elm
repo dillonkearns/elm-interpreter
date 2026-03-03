@@ -28,6 +28,16 @@ import Types exposing (CallTree, Env, Error(..), ImportedNames, Value)
 import Value exposing (unsupported)
 
 
+coreFunctions : Dict.Dict String (Dict.Dict String Elm.Syntax.Expression.FunctionImplementation)
+coreFunctions =
+    Core.functions
+        |> Dict.foldl
+            (\moduleName moduleDict acc ->
+                Dict.insert (Environment.moduleKey moduleName) moduleDict acc
+            )
+            Dict.empty
+
+
 eval : String -> Expression -> Result Error Value
 eval source expression =
     let
@@ -182,8 +192,9 @@ buildProjectEnvFromParsed parsedModules =
                     )
                     (Ok
                         { currentModule = []
+                        , currentModuleKey = ""
                         , callStack = []
-                        , functions = Core.functions
+                        , functions = coreFunctions
                         , currentModuleFunctions = Dict.empty
                         , values = Dict.empty
                         , imports = emptyImports
@@ -296,12 +307,17 @@ evalWithEnv (ProjectEnv projectEnv) additionalSources expression =
                                 Nothing ->
                                     emptyImports
 
+                        lastModuleKey : String
+                        lastModuleKey =
+                            Environment.moduleKey lastModule
+
                         finalEnv : Env
                         finalEnv =
                             { env
                                 | currentModule = lastModule
+                                , currentModuleKey = lastModuleKey
                                 , currentModuleFunctions =
-                                    Dict.get lastModule env.functions
+                                    Dict.get lastModuleKey env.functions
                                         |> Maybe.withDefault Dict.empty
                                 , imports = finalImports
                             }
@@ -334,12 +350,13 @@ buildInitialEnv file =
         coreEnv : Env
         coreEnv =
             { currentModule = moduleName
+            , currentModuleKey = Environment.moduleKey moduleName
             , callStack = []
-            , functions = Core.functions
+            , functions = coreFunctions
             , currentModuleFunctions = Dict.empty
             , values = Dict.empty
             , imports = imports
-            , moduleImports = Dict.singleton moduleName imports
+            , moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports
             }
 
         addDeclaration : Node Declaration -> Env -> Result Error Env
@@ -391,14 +408,14 @@ processImport allInterfaces (Node _ imp) acc =
         -- Always register the full module name as an alias to itself
         withFullName : ImportedNames
         withFullName =
-            { acc | aliases = Dict.insert canonicalName canonicalName acc.aliases }
+            { acc | aliases = Dict.insert (Environment.moduleKey canonicalName) canonicalName acc.aliases }
 
         -- If there's an alias, also register alias -> canonical
         withAlias : ImportedNames
         withAlias =
             case imp.moduleAlias of
                 Just (Node _ alias_) ->
-                    { withFullName | aliases = Dict.insert alias_ canonicalName withFullName.aliases }
+                    { withFullName | aliases = Dict.insert (Environment.moduleKey alias_) canonicalName withFullName.aliases }
 
                 Nothing ->
                     withFullName
@@ -603,8 +620,9 @@ evalProject sources expression =
                             )
                             (Ok
                                 { currentModule = []
+                                , currentModuleKey = ""
                                 , callStack = []
-                                , functions = Core.functions
+                                , functions = coreFunctions
                                 , currentModuleFunctions = Dict.empty
                                 , values = Dict.empty
                                 , imports = emptyImports
@@ -645,12 +663,17 @@ evalProject sources expression =
                                 Nothing ->
                                     emptyImports
 
+                        lastModuleKey : String
+                        lastModuleKey =
+                            Environment.moduleKey lastModule
+
                         finalEnv : Env
                         finalEnv =
                             { env
                                 | currentModule = lastModule
+                                , currentModuleKey = lastModuleKey
                                 , currentModuleFunctions =
-                                    Dict.get lastModule env.functions
+                                    Dict.get lastModuleKey env.functions
                                         |> Maybe.withDefault Dict.empty
                                 , imports = finalImports
                             }
@@ -683,7 +706,7 @@ buildModuleEnv allInterfaces { file, moduleName } env =
 
         envWithModuleImports : Env
         envWithModuleImports =
-            { env | moduleImports = Dict.insert moduleName moduleImportedNames env.moduleImports }
+            { env | moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.moduleImports }
 
         addDeclaration : Node Declaration -> Env -> Result Error Env
         addDeclaration (Node _ decl) envAcc =

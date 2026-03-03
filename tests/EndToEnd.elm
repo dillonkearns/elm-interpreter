@@ -34,6 +34,8 @@ suite =
         , caseBoolPatternTest
         , kernelFunctionAsArgTest
         , edgeCaseTests
+        , patternMatchTests
+        , lambdaInlineTests
         ]
 
 
@@ -432,4 +434,191 @@ edgeCaseTests =
             Int
             3
 
+        ]
+
+
+patternMatchTests : Test
+patternMatchTests =
+    describe "Pattern matching"
+        [ -- Single-arg constructor (Just x) — fast path
+          evalTest "Just x pattern"
+            """case Just 42 of
+    Nothing -> 0
+    Just x -> x"""
+            Int
+            42
+        , evalTest "Ok x pattern"
+            """case Ok "hello" of
+    Err _ -> ""
+    Ok x -> x"""
+            String
+            "hello"
+        , evalTest "Err e pattern"
+            """case Err 99 of
+    Ok _ -> 0
+    Err e -> e"""
+            Int
+            99
+
+        -- UnCons pattern (x :: xs)
+        , evalTest "uncons pattern"
+            """case [1, 2, 3] of
+    x :: xs -> x
+    [] -> 0"""
+            Int
+            1
+        , evalTest "uncons rest"
+            """case [1, 2, 3] of
+    x :: xs -> List.length xs
+    [] -> 0"""
+            Int
+            2
+
+        -- Tuple pattern with bindings
+        , evalTest "tuple pattern both vars"
+            """let (a, b) = (10, 20) in a + b"""
+            Int
+            30
+        , evalTest "triple pattern all vars"
+            """let (a, b, c) = (1, 2, 3) in a + b + c"""
+            Int
+            6
+
+        -- Nested constructor patterns
+        , evalTest "nested Just"
+            """case Just (Just 7) of
+    Just (Just n) -> n
+    _ -> 0"""
+            Int
+            7
+        , evalTest "Just with tuple"
+            """case Just (1, 2) of
+    Just (a, b) -> a + b
+    Nothing -> 0"""
+            Int
+            3
+
+        -- List pattern
+        , evalTest "list pattern exact match"
+            """case [1, 2, 3] of
+    [a, b, c] -> a + b + c
+    _ -> 0"""
+            Int
+            6
+        , evalTest "list pattern no match"
+            """case [1, 2] of
+    [a, b, c] -> a + b + c
+    _ -> 0"""
+            Int
+            0
+
+        -- As pattern
+        , evalTest "as pattern"
+            """case Just 5 of
+    (Just n) as whole -> n
+    _ -> 0"""
+            Int
+            5
+
+        -- Record pattern
+        , evalTest "record pattern in case"
+            """case { x = 1, y = 2 } of
+    { x, y } -> x + y"""
+            Int
+            3
+
+        -- Multi-arg constructor
+        , evalTestModule "multi-arg constructor pattern"
+            """module Temp exposing (main)
+
+type Pair = Pair Int Int
+
+main : Int
+main =
+    case Pair 3 4 of
+        Pair a b -> a + b"""
+            Int
+            7
+        ]
+
+
+lambdaInlineTests : Test
+lambdaInlineTests =
+    describe "Lambda and inline expression evaluation"
+        [ -- Lambda passed as argument (tests evalOrRecurse Lambda inline)
+          evalTest "lambda as argument"
+            "List.map (\\x -> x + 1) [1, 2, 3]"
+            (list Int)
+            [ 2, 3, 4 ]
+
+        -- Record access function (tests evalOrRecurse RecordAccessFunction inline)
+        , evalTest "record access function"
+            "List.map .name [{ name = \"a\" }, { name = \"b\" }]"
+            (list String)
+            [ "a", "b" ]
+
+        -- Parenthesized expression (tests evalOrRecurse Parenthesized inline)
+        , evalTest "parenthesized literal"
+            "(42)"
+            Int
+            42
+        , evalTest "parenthesized variable"
+            "let x = 7 in (x)"
+            Int
+            7
+
+        -- Partial application
+        , evalTest "partial application 3-arg"
+            """let add3 a b c = a + b + c in let add1 = add3 1 in add1 2 3"""
+            Int
+            6
+
+        -- Negation literals inline (tests evalOrRecurse Negation inline)
+        , evalTest "negation int literal"
+            "let x = -5 in x"
+            Int
+            -5
+        , evalTest "negation float literal"
+            "let x = -3.14 in x + 3.14"
+            Float
+            0.0
+
+        -- Case with no bindings (tests Dict.isEmpty skip for Environment.with)
+        , evalTest "case Nothing branch"
+            """case Nothing of
+    Nothing -> 42
+    Just _ -> 0"""
+            Int
+            42
+        , evalTest "case wildcard no binding"
+            """case 7 of
+    _ -> 42"""
+            Int
+            42
+
+        -- Operator with inline args (tests skip callKernel for operators)
+        , evalTest "arithmetic operators"
+            "1 + 2 * 3 - 4"
+            Int
+            3
+        , evalTest "comparison operators"
+            "3 > 2"
+            Bool
+            True
+        , evalTest "string concat operator"
+            """"hello" ++ " " ++ "world" """
+            String
+            "hello world"
+
+        -- Empty list inline (tests evalOrRecurse ListExpr [] inline)
+        , evalTest "empty list literal"
+            "[]"
+            (list Int)
+            []
+
+        -- Empty tuple (unit) inline (tests evalOrRecurse TupledExpression [] inline)
+        , evalTest "unit from empty tuple"
+            "()"
+            identity
+            Unit
         ]

@@ -177,6 +177,27 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                 Nothing ->
                     Types.recurseThen ( fullExpr, cfg, env ) continuation
 
+        Expression.ParenthesizedExpression inner ->
+            evalOrRecurse ( inner, cfg, env ) continuation
+
+        Expression.LambdaExpression lambda ->
+            continuation (PartiallyApplied env [] lambda.args Nothing lambda.expression)
+
+        Expression.RecordAccessFunction field ->
+            continuation (evalRecordAccessFunction field)
+
+        Expression.Negation (Node _ (Expression.Integer i)) ->
+            continuation (Int -i)
+
+        Expression.Negation (Node _ (Expression.Floatable f)) ->
+            continuation (Float -f)
+
+        Expression.ListExpr [] ->
+            continuation (List [])
+
+        Expression.TupledExpression [] ->
+            continuation Unit
+
         _ ->
             Types.recurseThen ( fullExpr, cfg, env ) continuation
 
@@ -256,7 +277,7 @@ operatorKernelFunctions =
                 kernelModuleName =
                     "Elm" :: "Kernel" :: ref.moduleName
             in
-            case Dict.get kernelModuleName kernelFunctions of
+            case Dict.get (Environment.moduleKey kernelModuleName) kernelFunctions of
                 Nothing ->
                     acc
 
@@ -280,15 +301,15 @@ evalOperatorApplication opName l r cfg env =
                 (\lValue ->
                     evalOrRecurse ( r, cfg, env )
                         (\rValue ->
-                            let
-                                childEnv : Env
-                                childEnv =
-                                    Environment.callKernel kernelModuleName opName env
-
-                                ( result, children, logLines ) =
-                                    kernelFn [ lValue, rValue ] cfg childEnv
-                            in
                             if cfg.trace then
+                                let
+                                    childEnv : Env
+                                    childEnv =
+                                        Environment.callKernel kernelModuleName opName env
+
+                                    ( result, children, logLines ) =
+                                        kernelFn [ lValue, rValue ] cfg childEnv
+                                in
                                 Recursion.base
                                     ( result
                                     , Rope.singleton
@@ -303,6 +324,10 @@ evalOperatorApplication opName l r cfg env =
                                     )
 
                             else
+                                let
+                                    ( result, _, logLines ) =
+                                        kernelFn [ lValue, rValue ] cfg env
+                                in
                                 Recursion.base ( result, Rope.empty, logLines )
                         )
                 )
@@ -419,13 +444,18 @@ evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv 
             )
 
     else
+        let
+            -- Since leftover is empty, rest has exactly (patternsLength - oldArgsLength) elements.
+            -- So oldArgsLength + restLength == patternsLength when leftover is empty,
+            -- or restLength < patternsLength - oldArgsLength is impossible (splitAt would have given us leftover).
+            -- But rest could be shorter than (patternsLength - oldArgsLength) meaning still not enough args.
+            restLength : Int
+            restLength =
+                List.length rest
+        in
         Types.recurseMapThen ( rest, cfg, env )
             (\values ->
                 let
-                    restLength : Int
-                    restLength =
-                        List.length rest
-
                     args : List Value
                     args =
                         oldArgs ++ values
@@ -504,8 +534,12 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                 fullName : String
                 fullName =
                     Syntax.qualifiedNameToString qualifiedName
+
+                key : String
+                key =
+                    Environment.moduleKey moduleName
             in
-            case Dict.get moduleName kernelFunctions of
+            case Dict.get key kernelFunctions of
                 Nothing ->
                     Types.failPartial <| nameError env fullName
 
@@ -515,19 +549,19 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                             Types.failPartial <| nameError env fullName
 
                         Just ( _, f ) ->
-                            let
-                                childEnv : Env
-                                childEnv =
-                                    Environment.callKernel moduleName name env
+                            if cfg.trace then
+                                let
+                                    childEnv : Env
+                                    childEnv =
+                                        Environment.callKernel moduleName name env
 
-                                ( kernelResult, children, logLines ) =
-                                    f args
-                                        cfg
-                                        childEnv
-                            in
-                            ( kernelResult
-                            , if cfg.trace then
-                                CallNode
+                                    ( kernelResult, children, logLines ) =
+                                        f args
+                                            cfg
+                                            childEnv
+                                in
+                                ( kernelResult
+                                , CallNode
                                     { env = childEnv
                                     , expression =
                                         Node range <|
@@ -538,12 +572,16 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                                     , children = children
                                     }
                                     |> Rope.singleton
+                                , logLines
+                                )
+                                    |> Recursion.base
 
-                              else
-                                Rope.empty
-                            , logLines
-                            )
-                                |> Recursion.base
+                            else
+                                let
+                                    ( kernelResult, _, logLines ) =
+                                        f args cfg env
+                                in
+                                Recursion.base ( kernelResult, Rope.empty, logLines )
 
         _ ->
             call
@@ -673,7 +711,7 @@ findRecordAliasConstructor moduleName name env =
                 Dict.get name env.currentModuleFunctions
 
             else
-                Dict.get resolvedModule env.functions
+                Dict.get (Environment.moduleKey resolvedModule) env.functions
                     |> Maybe.andThen (Dict.get name)
     in
     maybeFunc
@@ -693,7 +731,7 @@ fixModuleName moduleName env =
         env.currentModule
 
     else
-        case Dict.get moduleName env.imports.aliases of
+        case Dict.get (Environment.moduleKey moduleName) env.imports.aliases of
             Just canonical ->
                 canonical
 
@@ -748,17 +786,22 @@ evalNonVariant moduleName name cfg env =
             -- Check native kernel functions first; they take precedence over
             -- generated AST because they handle edge cases (e.g. Unicode
             -- surrogate pairs, stable sort) that the generated AST may not.
-            case Dict.get moduleName kernelFunctions of
+            let
+                key : String
+                key =
+                    Environment.moduleKey moduleName
+            in
+            case Dict.get key kernelFunctions of
                 Just nativeModule ->
                     case Dict.get name nativeModule of
                         Just _ ->
-                            evalKernelFunction moduleName name cfg env
+                            evalKernelFunctionWithKey key moduleName name cfg env
 
                         Nothing ->
-                            evalKernelFunctionFromAst moduleName name cfg env
+                            evalKernelFunctionFromAstWithKey key moduleName name cfg env
 
                 Nothing ->
-                    evalKernelFunctionFromAst moduleName name cfg env
+                    evalKernelFunctionFromAstWithKey key moduleName name cfg env
 
         _ ->
             -- Note: env.values lookup for moduleName=[] is already done in
@@ -771,7 +814,7 @@ evalNonVariant moduleName name cfg env =
                                 -- in evalQualifiedOrVariant, so go straight to imports.
                                 case Dict.get name env.imports.exposedValues of
                                     Just sourceModule ->
-                                        Dict.get sourceModule env.functions
+                                        Dict.get (Environment.moduleKey sourceModule) env.functions
                                             |> Maybe.andThen (Dict.get name)
                                             |> Maybe.map (\f -> ( sourceModule, f ))
 
@@ -779,8 +822,13 @@ evalNonVariant moduleName name cfg env =
                                         Nothing
 
                             else
+                                let
+                                    moduleNameKey : String
+                                    moduleNameKey =
+                                        Environment.moduleKey moduleName
+                                in
                                 -- Try direct lookup first (common case: module not aliased)
-                                case Dict.get moduleName env.functions of
+                                case Dict.get moduleNameKey env.functions of
                                     Just moduleDict ->
                                         case Dict.get name moduleDict of
                                             Just f ->
@@ -789,9 +837,9 @@ evalNonVariant moduleName name cfg env =
                                             Nothing ->
                                                 -- Module exists but function not found.
                                                 -- Could be aliased to a different module.
-                                                case Dict.get moduleName env.imports.aliases of
+                                                case Dict.get moduleNameKey env.imports.aliases of
                                                     Just canonical ->
-                                                        Dict.get canonical env.functions
+                                                        Dict.get (Environment.moduleKey canonical) env.functions
                                                             |> Maybe.andThen (Dict.get name)
                                                             |> Maybe.map (\f -> ( canonical, f ))
 
@@ -800,9 +848,9 @@ evalNonVariant moduleName name cfg env =
 
                                     Nothing ->
                                         -- Module not found directly; try alias resolution
-                                        case Dict.get moduleName env.imports.aliases of
+                                        case Dict.get moduleNameKey env.imports.aliases of
                                             Just canonical ->
-                                                Dict.get canonical env.functions
+                                                Dict.get (Environment.moduleKey canonical) env.functions
                                                     |> Maybe.andThen (Dict.get name)
                                                     |> Maybe.map (\f -> ( canonical, f ))
 
@@ -836,19 +884,24 @@ evalNonVariant moduleName name cfg env =
                                 -- env.currentModule, so we inline the cross-module branch
                                 -- of Environment.call directly.
                                 let
+                                    resolvedModuleKey : String
+                                    resolvedModuleKey =
+                                        Environment.moduleKey resolvedModule
+
                                     callEnv : Env
                                     callEnv =
                                         { currentModule = resolvedModule
+                                        , currentModuleKey = resolvedModuleKey
                                         , callStack =
                                             { moduleName = resolvedModule, name = name }
                                                 :: env.callStack
                                         , functions = env.functions
                                         , currentModuleFunctions =
-                                            Dict.get resolvedModule env.functions
+                                            Dict.get resolvedModuleKey env.functions
                                                 |> Maybe.withDefault Dict.empty
                                         , values = Dict.empty
                                         , imports =
-                                            Dict.get resolvedModule env.moduleImports
+                                            Dict.get resolvedModuleKey env.moduleImports
                                                 |> Maybe.withDefault env.imports
                                         , moduleImports = env.moduleImports
                                         }
@@ -914,9 +967,15 @@ evalRecord fields cfg env =
         )
 
 
-kernelFunctions : Dict ModuleName (Dict String ( Int, List Value -> Eval Value ))
+kernelFunctions : Dict String (Dict String ( Int, List Value -> Eval Value ))
 kernelFunctions =
     Kernel.functions evalFunction
+        |> Dict.foldl
+            (\moduleName moduleDict acc ->
+                Dict.insert (String.join "." moduleName) moduleDict acc
+            )
+            Dict.empty
+
 
 
 evalFunction : Kernel.EvalFunction
@@ -944,8 +1003,12 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                             fullName : String
                             fullName =
                                 Syntax.qualifiedNameToString { moduleName = moduleName, name = name }
+
+                            key : String
+                            key =
+                                Environment.moduleKey moduleName
                         in
-                        case Dict.get moduleName kernelFunctions of
+                        case Dict.get key kernelFunctions of
                             Nothing ->
                                 EvalResult.fail <| nameError localEnv fullName
 
@@ -955,9 +1018,13 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                         EvalResult.fail <| nameError localEnv fullName
 
                                     Just ( _, f ) ->
-                                        f oldArgs
-                                            cfg
-                                            (Environment.callKernel moduleName name localEnv)
+                                        if cfg.trace then
+                                            f oldArgs
+                                                cfg
+                                                (Environment.callKernel moduleName name localEnv)
+
+                                        else
+                                            f oldArgs cfg localEnv
 
                     _ ->
                         evalExpression implementation cfg boundEnv
@@ -984,8 +1051,12 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                     fullName : String
                                     fullName =
                                         Syntax.qualifiedNameToString { moduleName = moduleName, name = name }
+
+                                    key : String
+                                    key =
+                                        Environment.moduleKey moduleName
                                 in
-                                case Dict.get moduleName kernelFunctions of
+                                case Dict.get key kernelFunctions of
                                     Nothing ->
                                         EvalResult.fail <| nameError localEnv fullName
 
@@ -995,9 +1066,13 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                                 EvalResult.fail <| nameError localEnv fullName
 
                                             Just ( _, f ) ->
-                                                f oldArgs
-                                                    cfg
-                                                    (Environment.callKernel moduleName name localEnv)
+                                                if cfg.trace then
+                                                    f oldArgs
+                                                        cfg
+                                                        (Environment.callKernel moduleName name localEnv)
+
+                                                else
+                                                    f oldArgs cfg localEnv
 
                             _ ->
                                 -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
@@ -1008,7 +1083,12 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
 
 evalKernelFunction : ModuleName -> String -> PartialEval Value
 evalKernelFunction moduleName name cfg env =
-    case Dict.get moduleName kernelFunctions of
+    evalKernelFunctionWithKey (Environment.moduleKey moduleName) moduleName name cfg env
+
+
+evalKernelFunctionWithKey : String -> ModuleName -> String -> PartialEval Value
+evalKernelFunctionWithKey key moduleName name cfg env =
+    case Dict.get key kernelFunctions of
         Nothing ->
             Types.failPartial <| nameError env (String.join "." moduleName)
 
@@ -1019,12 +1099,11 @@ evalKernelFunction moduleName name cfg env =
 
                 Just ( argCount, f ) ->
                     if argCount == 0 then
-                        let
-                            ( result, callTrees, logLines ) =
-                                f [] cfg (Environment.callKernel moduleName name env)
-                        in
                         if cfg.trace then
                             let
+                                ( result, callTrees, logLines ) =
+                                    f [] cfg (Environment.callKernel moduleName name env)
+
                                 callTree : CallTree
                                 callTree =
                                     CallNode
@@ -1037,6 +1116,10 @@ evalKernelFunction moduleName name cfg env =
                             Recursion.base ( result, Rope.singleton callTree, logLines )
 
                         else
+                            let
+                                ( result, _, _ ) =
+                                    f [] cfg env
+                            in
                             Recursion.base <| EvalResult.fromResult result
 
                     else
@@ -1052,14 +1135,19 @@ evalKernelFunction moduleName name cfg env =
 -}
 evalKernelFunctionFromAst : ModuleName -> String -> PartialEval Value
 evalKernelFunctionFromAst moduleName name cfg env =
-    case Dict.get moduleName env.functions of
+    evalKernelFunctionFromAstWithKey (Environment.moduleKey moduleName) moduleName name cfg env
+
+
+evalKernelFunctionFromAstWithKey : String -> ModuleName -> String -> PartialEval Value
+evalKernelFunctionFromAstWithKey key moduleName name cfg env =
+    case Dict.get key env.functions of
         Nothing ->
-            evalKernelFunction moduleName name cfg env
+            evalKernelFunctionWithKey key moduleName name cfg env
 
         Just kernelModule ->
             case Dict.get name kernelModule of
                 Nothing ->
-                    evalKernelFunction moduleName name cfg env
+                    evalKernelFunctionWithKey key moduleName name cfg env
 
                 Just function ->
                     PartiallyApplied
@@ -1486,11 +1574,15 @@ evalCase { expression, cases } cfg env =
                     Types.failPartial <| typeError env <| "Missing case branch for " ++ Value.toString exprValue
 
                 Ok (Just ( additionalEnv, branchExpression )) ->
-                    Recursion.recurse
-                        ( branchExpression
-                        , cfg
-                        , Environment.with additionalEnv env
-                        )
+                    if Dict.isEmpty additionalEnv then
+                        Recursion.recurse ( branchExpression, cfg, env )
+
+                    else
+                        Recursion.recurse
+                            ( branchExpression
+                            , cfg
+                            , Environment.with additionalEnv env
+                            )
 
                 Err e ->
                     Types.failPartial e
@@ -1553,27 +1645,37 @@ match env (Node _ pattern) value =
             -- Two names from different modules can never have the same type
             -- so if we assume the code typechecks we can skip the module name check
             if namePattern.name == variant.name then
-                let
-                    matchNamedPatternHelper :
-                        EnvValues
-                        -> ( List (Node Pattern), List Value )
-                        -> Result EvalErrorData (Maybe EnvValues)
-                    matchNamedPatternHelper envValues queue =
-                        case queue of
-                            ( [], [] ) ->
-                                matchOk envValues
+                case ( argsPatterns, args ) of
+                    ( [], [] ) ->
+                        -- Zero-arg constructor like True, False, Nothing
+                        matchOk Dict.empty
 
-                            ( patternHead :: patternTail, argHead :: argTail ) ->
-                                match env patternHead argHead
-                                    |> matchAndThen
-                                        (\newEnvValues ->
-                                            matchNamedPatternHelper (Dict.foldl Dict.insert envValues newEnvValues) ( patternTail, argTail )
-                                        )
+                    ( [ singlePattern ], [ singleArg ] ) ->
+                        -- Single-arg constructor like Just x, Ok x — very common
+                        match env singlePattern singleArg
 
-                            _ ->
-                                Err <| typeError env "Mismatched number of arguments to variant"
-                in
-                matchNamedPatternHelper Dict.empty ( argsPatterns, args )
+                    _ ->
+                        let
+                            matchNamedPatternHelper :
+                                EnvValues
+                                -> ( List (Node Pattern), List Value )
+                                -> Result EvalErrorData (Maybe EnvValues)
+                            matchNamedPatternHelper envValues queue =
+                                case queue of
+                                    ( [], [] ) ->
+                                        matchOk envValues
+
+                                    ( patternHead :: patternTail, argHead :: argTail ) ->
+                                        match env patternHead argHead
+                                            |> matchAndThen
+                                                (\newEnvValues ->
+                                                    matchNamedPatternHelper (Dict.union newEnvValues envValues) ( patternTail, argTail )
+                                                )
+
+                                    _ ->
+                                        Err <| typeError env "Mismatched number of arguments to variant"
+                        in
+                        matchNamedPatternHelper Dict.empty ( argsPatterns, args )
 
             else
                 matchNoMatch
@@ -1584,6 +1686,10 @@ match env (Node _ pattern) value =
         ( ListPattern patterns, List values ) ->
             matchListHelp env Dict.empty patterns values
 
+        ( UnConsPattern (Node _ (VarPattern headName)) (Node _ (VarPattern tailName)), List (listHead :: listTail) ) ->
+            -- Fast path: x :: xs with VarPatterns — avoid match calls
+            matchOk <| Dict.insert tailName (List listTail) (Dict.singleton headName listHead)
+
         ( UnConsPattern patternHead patternTail, List (listHead :: listTail) ) ->
             match env patternHead listHead
                 |> matchAndThen
@@ -1592,7 +1698,7 @@ match env (Node _ pattern) value =
                             |> matchAndThen
                                 (\tailEnv ->
                                     matchOk
-                                        (Dict.foldl Dict.insert headEnv tailEnv)
+                                        (Dict.union headEnv tailEnv)
                                 )
                     )
 
@@ -1655,6 +1761,10 @@ match env (Node _ pattern) value =
         ( FloatPattern _, _ ) ->
             matchNoMatch
 
+        ( TuplePattern [ Node _ (VarPattern lname), Node _ (VarPattern rname) ], Tuple lvalue rvalue ) ->
+            -- Fast path: two VarPatterns — avoid match calls entirely
+            matchOk <| Dict.insert rname rvalue (Dict.singleton lname lvalue)
+
         ( TuplePattern [ lpattern, rpattern ], Tuple lvalue rvalue ) ->
             match env lpattern lvalue
                 |> matchAndThen
@@ -1662,9 +1772,13 @@ match env (Node _ pattern) value =
                         match env rpattern rvalue
                             |> matchAndThen
                                 (\renv ->
-                                    matchOk <| Dict.foldl Dict.insert lenv renv
+                                    matchOk <| Dict.union lenv renv
                                 )
                     )
+
+        ( TuplePattern [ Node _ (VarPattern lname), Node _ (VarPattern mname), Node _ (VarPattern rname) ], Triple lvalue mvalue rvalue ) ->
+            -- Fast path: three VarPatterns — avoid match calls entirely
+            matchOk <| Dict.insert rname rvalue (Dict.insert mname mvalue (Dict.singleton lname lvalue))
 
         ( TuplePattern [ lpattern, mpattern, rpattern ], Triple lvalue mvalue rvalue ) ->
             match env lpattern lvalue
@@ -1676,7 +1790,7 @@ match env (Node _ pattern) value =
                                     match env rpattern rvalue
                                         |> matchAndThen
                                             (\renv ->
-                                                matchOk <| Dict.foldl Dict.insert (Dict.foldl Dict.insert lenv menv) renv
+                                                matchOk <| Dict.union lenv (Dict.union menv renv)
                                             )
                                 )
                     )
@@ -1724,7 +1838,7 @@ matchListHelp env acc patterns values =
                     Ok Nothing
 
                 Ok (Just headEnv) ->
-                    matchListHelp env (Dict.foldl Dict.insert acc headEnv) patternTail valueTail
+                    matchListHelp env (Dict.union headEnv acc) patternTail valueTail
 
         _ ->
             Ok Nothing

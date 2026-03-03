@@ -70,17 +70,18 @@ type Value
 
 type alias Env =
     { currentModule : ModuleName
-    , functions : Dict ModuleName (Dict String FunctionImplementation)
+    , currentModuleKey : String
+    , functions : Dict String (Dict String FunctionImplementation)
     , currentModuleFunctions : Dict String FunctionImplementation
     , values : EnvValues
     , callStack : List QualifiedNameRef
     , imports : ImportedNames
-    , moduleImports : Dict ModuleName ImportedNames
+    , moduleImports : Dict String ImportedNames
     }
 
 
 type alias ImportedNames =
-    { aliases : Dict ModuleName ModuleName
+    { aliases : Dict String ModuleName
     , exposedValues : Dict String ModuleName
     , exposedConstructors : Dict String ModuleName
     }
