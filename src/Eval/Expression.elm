@@ -19,7 +19,6 @@ import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
 import Types exposing (CallTree(..), Env, EnvValues, Eval, EvalErrorData, EvalResult, PartialEval, PartialResult, Value(..))
-import Unicode
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -580,7 +579,13 @@ evalNonVariant moduleName name cfg env =
                                 targetEnv : Env
                                 targetEnv =
                                     if resolvedModule /= env.currentModule then
-                                        { env | values = Dict.empty }
+                                        { currentModule = env.currentModule
+                                        , callStack = env.callStack
+                                        , functions = env.functions
+                                        , values = Dict.empty
+                                        , imports = env.imports
+                                        , moduleImports = env.moduleImports
+                                        }
 
                                     else
                                         env
@@ -1122,7 +1127,19 @@ isVariant name =
             False
 
         Just ( first, _ ) ->
-            Unicode.isUpper first
+            isAsciiUpper first
+
+
+{-| Fast alternative to Unicode.isUpper/Char.isUpper which avoids expensive
+structural equality on Char objects (_Utils_eq). Elm constructors only use ASCII.
+-}
+isAsciiUpper : Char -> Bool
+isAsciiUpper c =
+    let
+        code =
+            Char.toCode c
+    in
+    code >= 65 && code <= 90
 
 
 evalCase : Expression.CaseBlock -> PartialEval Value

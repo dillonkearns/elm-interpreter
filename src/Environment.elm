@@ -9,8 +9,12 @@ import Types exposing (Env, EnvValues, Value)
 
 addValue : String -> Value -> Env -> Env
 addValue name value env =
-    { env
-        | values = Dict.insert name value env.values
+    { currentModule = env.currentModule
+    , callStack = env.callStack
+    , functions = env.functions
+    , values = Dict.insert name value env.values
+    , imports = env.imports
+    , moduleImports = env.moduleImports
     }
 
 
@@ -32,7 +36,13 @@ addFunction moduleName function env =
 
 with : EnvValues -> Env -> Env
 with newValues old =
-    { old | values = Dict.union newValues old.values }
+    { currentModule = old.currentModule
+    , callStack = old.callStack
+    , functions = old.functions
+    , values = Dict.union newValues old.values
+    , imports = old.imports
+    , moduleImports = old.moduleImports
+    }
 
 
 empty : ModuleName -> Env
@@ -56,12 +66,14 @@ emptyImports =
 
 call : ModuleName -> String -> Env -> Env
 call moduleName name env =
-    { env
-        | currentModule = moduleName
-        , callStack =
-            { moduleName = moduleName, name = name }
-                :: env.callStack
-        , imports =
-            Dict.get moduleName env.moduleImports
-                |> Maybe.withDefault env.imports
+    { currentModule = moduleName
+    , callStack =
+        { moduleName = moduleName, name = name }
+            :: env.callStack
+    , functions = env.functions
+    , values = env.values
+    , imports =
+        Dict.get moduleName env.moduleImports
+            |> Maybe.withDefault env.imports
+    , moduleImports = env.moduleImports
     }
