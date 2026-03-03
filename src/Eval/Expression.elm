@@ -280,80 +280,115 @@ evalApplication first rest cfg env =
 
 evalFullyApplied : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
 evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env =
-    let
-        maybeNewEnvValues : Result EvalErrorData (Maybe EnvValues)
-        maybeNewEnvValues =
-            match env
-                (fakeNode <| ListPattern patterns)
-                (List args)
-    in
-    case maybeNewEnvValues of
-        Err e ->
-            Types.failPartial e
+    -- Fast path: if all patterns are simple VarPatterns or AllPatterns,
+    -- bind directly via addValue instead of building an intermediate Dict.
+    case bindSimplePatterns patterns args localEnv of
+        Just boundEnv ->
+            evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env
 
-        Ok Nothing ->
-            Types.failPartial <| typeError env "Could not match lambda patterns"
+        Nothing ->
+            let
+                maybeNewEnvValues : Result EvalErrorData (Maybe EnvValues)
+                maybeNewEnvValues =
+                    match env
+                        (fakeNode <| ListPattern patterns)
+                        (List args)
+            in
+            case maybeNewEnvValues of
+                Err e ->
+                    Types.failPartial e
 
-        Ok (Just newEnvValues) ->
-            case implementation of
-                Node range (FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
-                    let
-                        qualifiedName : QualifiedNameRef
-                        qualifiedName =
-                            { moduleName = moduleName
-                            , name = name
-                            }
+                Ok Nothing ->
+                    Types.failPartial <| typeError env "Could not match lambda patterns"
 
-                        fullName : String
-                        fullName =
-                            Syntax.qualifiedNameToString qualifiedName
-                    in
-                    case Dict.get moduleName kernelFunctions of
+                Ok (Just newEnvValues) ->
+                    evalFullyAppliedWithEnv (Environment.with newEnvValues localEnv) args maybeQualifiedName implementation cfg env
+
+
+{-| Try to bind all patterns directly via addValue. Returns Just the new env
+if all patterns are simple (VarPattern, AllPattern, ParenthesizedPattern wrapping one).
+Returns Nothing for complex patterns that need full match.
+-}
+bindSimplePatterns : List (Node Pattern) -> List Value -> Env -> Maybe Env
+bindSimplePatterns patterns args env =
+    case ( patterns, args ) of
+        ( [], [] ) ->
+            Just env
+
+        ( (Node _ (VarPattern name)) :: ptail, value :: atail ) ->
+            bindSimplePatterns ptail atail (Environment.addValue name value env)
+
+        ( (Node _ AllPattern) :: ptail, _ :: atail ) ->
+            bindSimplePatterns ptail atail env
+
+        ( (Node _ (ParenthesizedPattern inner)) :: ptail, value :: atail ) ->
+            bindSimplePatterns (inner :: ptail) (value :: atail) env
+
+        _ ->
+            Nothing
+
+
+evalFullyAppliedWithEnv : Env -> List Value -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
+evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env =
+    case implementation of
+        Node range (FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
+            let
+                qualifiedName : QualifiedNameRef
+                qualifiedName =
+                    { moduleName = moduleName
+                    , name = name
+                    }
+
+                fullName : String
+                fullName =
+                    Syntax.qualifiedNameToString qualifiedName
+            in
+            case Dict.get moduleName kernelFunctions of
+                Nothing ->
+                    Types.failPartial <| nameError env fullName
+
+                Just kernelModule ->
+                    case Dict.get name kernelModule of
                         Nothing ->
                             Types.failPartial <| nameError env fullName
 
-                        Just kernelModule ->
-                            case Dict.get name kernelModule of
-                                Nothing ->
-                                    Types.failPartial <| nameError env fullName
+                        Just ( _, f ) ->
+                            let
+                                childEnv : Env
+                                childEnv =
+                                    Environment.call moduleName name env
 
-                                Just ( _, f ) ->
-                                    let
-                                        childEnv : Env
-                                        childEnv =
-                                            Environment.call moduleName name env
+                                ( kernelResult, children, logLines ) =
+                                    f args
+                                        cfg
+                                        childEnv
+                            in
+                            ( kernelResult
+                            , if cfg.trace then
+                                CallNode
+                                    { env = childEnv
+                                    , expression =
+                                        Node range <|
+                                            Application <|
+                                                Node range (FunctionOrValue moduleName name)
+                                                    :: List.map Value.toExpression args
+                                    , result = kernelResult
+                                    , children = children
+                                    }
+                                    |> Rope.singleton
 
-                                        ( kernelResult, children, logLines ) =
-                                            f args
-                                                cfg
-                                                childEnv
-                                    in
-                                    ( kernelResult
-                                    , if cfg.trace then
-                                        CallNode
-                                            { env = childEnv
-                                            , expression =
-                                                Node range <|
-                                                    Application <|
-                                                        Node range (FunctionOrValue moduleName name)
-                                                            :: List.map Value.toExpression args
-                                            , result = kernelResult
-                                            , children = children
-                                            }
-                                            |> Rope.singleton
+                              else
+                                Rope.empty
+                            , logLines
+                            )
+                                |> Recursion.base
 
-                                      else
-                                        Rope.empty
-                                    , logLines
-                                    )
-                                        |> Recursion.base
-
-                _ ->
-                    call
-                        maybeQualifiedName
-                        implementation
-                        cfg
-                        (localEnv |> Environment.with newEnvValues)
+        _ ->
+            call
+                maybeQualifiedName
+                implementation
+                cfg
+                boundEnv
 
 
 call : Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
@@ -372,10 +407,27 @@ call maybeQualifiedName implementation cfg env =
 
 evalFunctionOrValue : ModuleName -> String -> PartialEval Value
 evalFunctionOrValue moduleName name cfg env =
+    case moduleName of
+        [] ->
+            -- Fast path: local value lookup before isVariant check.
+            -- Avoids String.uncons + Char.toCode for the most common case.
+            case Dict.get name env.values of
+                Just (PartiallyApplied localEnv [] [] maybeName implementation) ->
+                    call maybeName implementation cfg localEnv
+
+                Just value ->
+                    Types.succeedPartial value
+
+                Nothing ->
+                    evalQualifiedOrVariant [] name cfg env
+
+        _ ->
+            evalQualifiedOrVariant moduleName name cfg env
+
+
+evalQualifiedOrVariant : ModuleName -> String -> PartialEval Value
+evalQualifiedOrVariant moduleName name cfg env =
     if isVariant name then
-        -- Check if this variant name is a record alias constructor
-        -- (registered with a RecordExpr body). If so, treat it as a
-        -- function rather than a bare constructor.
         case findRecordAliasConstructor moduleName name env of
             Just ( resolvedModule, function ) ->
                 if List.isEmpty function.arguments then
@@ -673,21 +725,8 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
 
     else
         -- Just right, we special case this for TCO
-        let
-            maybeNewEnvValues : Result EvalErrorData (Maybe EnvValues)
-            maybeNewEnvValues =
-                match localEnv
-                    (Node (Range.combine (List.map Node.range patterns)) <| ListPattern patterns)
-                    (List oldArgs)
-        in
-        case maybeNewEnvValues of
-            Err e ->
-                EvalResult.fail e
-
-            Ok Nothing ->
-                EvalResult.fail <| typeError localEnv "Could not match lambda patterns"
-
-            Ok (Just newEnvValues) ->
+        case bindSimplePatterns patterns oldArgs localEnv of
+            Just boundEnv ->
                 case implementation of
                     Node _ (Expression.FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
                         let
@@ -710,10 +749,50 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                             (Environment.call moduleName name localEnv)
 
                     _ ->
-                        -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
-                        evalExpression implementation
-                            cfg
-                            (localEnv |> Environment.with newEnvValues)
+                        evalExpression implementation cfg boundEnv
+
+            Nothing ->
+                let
+                    maybeNewEnvValues : Result EvalErrorData (Maybe EnvValues)
+                    maybeNewEnvValues =
+                        match localEnv
+                            (Node (Range.combine (List.map Node.range patterns)) <| ListPattern patterns)
+                            (List oldArgs)
+                in
+                case maybeNewEnvValues of
+                    Err e ->
+                        EvalResult.fail e
+
+                    Ok Nothing ->
+                        EvalResult.fail <| typeError localEnv "Could not match lambda patterns"
+
+                    Ok (Just newEnvValues) ->
+                        case implementation of
+                            Node _ (Expression.FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
+                                let
+                                    fullName : String
+                                    fullName =
+                                        Syntax.qualifiedNameToString { moduleName = moduleName, name = name }
+                                in
+                                case Dict.get moduleName kernelFunctions of
+                                    Nothing ->
+                                        EvalResult.fail <| nameError localEnv fullName
+
+                                    Just kernelModule ->
+                                        case Dict.get name kernelModule of
+                                            Nothing ->
+                                                EvalResult.fail <| nameError localEnv fullName
+
+                                            Just ( _, f ) ->
+                                                f oldArgs
+                                                    cfg
+                                                    (Environment.call moduleName name localEnv)
+
+                            _ ->
+                                -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
+                                evalExpression implementation
+                                    cfg
+                                    (localEnv |> Environment.with newEnvValues)
 
 
 evalKernelFunction : ModuleName -> String -> PartialEval Value
@@ -799,6 +878,39 @@ evalNegation child cfg env =
 
 evalLetBlock : Expression.LetBlock -> PartialEval Value
 evalLetBlock letBlock cfg env =
+    case letBlock.declarations of
+        [ singleDecl ] ->
+            -- Fast path: single declaration needs no topological sort
+            evalLetBlockSingle singleDecl letBlock.expression cfg env
+
+        _ ->
+            evalLetBlockFull letBlock cfg env
+
+
+evalLetBlockSingle : Node LetDeclaration -> Node Expression -> PartialEval Value
+evalLetBlockSingle declaration body cfg env =
+    let
+        newEnv : EvalResult Env
+        newEnv =
+            addLetDeclaration declaration cfg env
+    in
+    case newEnv of
+        ( Ok ne, trees, logs ) ->
+            if Rope.isEmpty trees && Rope.isEmpty logs then
+                Recursion.recurse ( body, cfg, ne )
+
+            else
+                Types.recurseThen ( body, cfg, ne )
+                    (\res ->
+                        Recursion.base ( Ok res, trees, logs )
+                    )
+
+        ( Err e, trees, logs ) ->
+            Recursion.base ( Err e, trees, logs )
+
+
+evalLetBlockFull : Expression.LetBlock -> PartialEval Value
+evalLetBlockFull letBlock cfg env =
     let
         envDefs : Set String
         envDefs =
@@ -1185,55 +1297,57 @@ evalCase { expression, cases } cfg env =
         )
 
 
+matchOk : a -> Result error (Maybe a)
+matchOk val =
+    Ok (Just val)
+
+
+matchNoMatch : Result error (Maybe a)
+matchNoMatch =
+    Ok Nothing
+
+
+matchAndThen : (a -> Result error (Maybe a)) -> Result error (Maybe a) -> Result error (Maybe a)
+matchAndThen f v =
+    case v of
+        Err _ ->
+            v
+
+        Ok Nothing ->
+            v
+
+        Ok (Just w) ->
+            f w
+
+
 match : Env -> Node Pattern -> Value -> Result EvalErrorData (Maybe EnvValues)
 match env (Node _ pattern) value =
-    let
-        ok : a -> Result error (Maybe a)
-        ok val =
-            Ok (Just val)
-
-        noMatch : Result error (Maybe a)
-        noMatch =
-            Ok Nothing
-
-        andThen : (a -> Result error (Maybe a)) -> Result error (Maybe a) -> Result error (Maybe a)
-        andThen f v =
-            case v of
-                Err _ ->
-                    v
-
-                Ok Nothing ->
-                    v
-
-                Ok (Just w) ->
-                    f w
-    in
     case ( pattern, value ) of
         ( UnitPattern, Unit ) ->
-            ok Dict.empty
+            matchOk Dict.empty
 
         ( UnitPattern, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( AllPattern, _ ) ->
-            ok Dict.empty
+            matchOk Dict.empty
 
         ( ParenthesizedPattern subPattern, _ ) ->
             match env subPattern value
 
         ( NamedPattern { name } [], Bool True ) ->
             if name == "True" then
-                ok Dict.empty
+                matchOk Dict.empty
 
             else
-                noMatch
+                matchNoMatch
 
         ( NamedPattern { name } [], Bool False ) ->
             if name == "False" then
-                ok Dict.empty
+                matchOk Dict.empty
 
             else
-                noMatch
+                matchNoMatch
 
         ( NamedPattern namePattern argsPatterns, Custom variant args ) ->
             -- Two names from different modules can never have the same type
@@ -1247,13 +1361,13 @@ match env (Node _ pattern) value =
                     matchNamedPatternHelper envValues queue =
                         case queue of
                             ( [], [] ) ->
-                                ok envValues
+                                matchOk envValues
 
                             ( patternHead :: patternTail, argHead :: argTail ) ->
                                 match env patternHead argHead
-                                    |> andThen
+                                    |> matchAndThen
                                         (\newEnvValues ->
-                                            matchNamedPatternHelper (Dict.union newEnvValues envValues) ( patternTail, argTail )
+                                            matchNamedPatternHelper (Dict.foldl Dict.insert envValues newEnvValues) ( patternTail, argTail )
                                         )
 
                             _ ->
@@ -1262,137 +1376,137 @@ match env (Node _ pattern) value =
                 matchNamedPatternHelper Dict.empty ( argsPatterns, args )
 
             else
-                noMatch
+                matchNoMatch
 
         ( NamedPattern _ _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( ListPattern patterns, List values ) ->
             matchListHelp env Dict.empty patterns values
 
         ( UnConsPattern patternHead patternTail, List (listHead :: listTail) ) ->
             match env patternHead listHead
-                |> andThen
+                |> matchAndThen
                     (\headEnv ->
                         match env patternTail (List listTail)
-                            |> andThen
+                            |> matchAndThen
                                 (\tailEnv ->
-                                    ok
-                                        (Dict.union tailEnv headEnv)
+                                    matchOk
+                                        (Dict.foldl Dict.insert headEnv tailEnv)
                                 )
                     )
 
         ( UnConsPattern _ _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( VarPattern name, _ ) ->
-            ok <| Dict.insert name value Dict.empty
+            matchOk <| Dict.singleton name value
 
         ( ListPattern _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( CharPattern c, Char d ) ->
             if c == d then
-                ok Dict.empty
+                matchOk Dict.empty
 
             else
-                noMatch
+                matchNoMatch
 
         ( CharPattern _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( StringPattern c, String d ) ->
             if c == d then
-                ok Dict.empty
+                matchOk Dict.empty
 
             else
-                noMatch
+                matchNoMatch
 
         ( StringPattern _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( IntPattern c, Int d ) ->
             if c == d then
-                ok Dict.empty
+                matchOk Dict.empty
 
             else
-                noMatch
+                matchNoMatch
 
         ( IntPattern _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( HexPattern c, Int d ) ->
             if c == d then
-                ok Dict.empty
+                matchOk Dict.empty
 
             else
-                noMatch
+                matchNoMatch
 
         ( HexPattern _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( FloatPattern c, Float d ) ->
             if c == d then
-                ok Dict.empty
+                matchOk Dict.empty
 
             else
-                noMatch
+                matchNoMatch
 
         ( FloatPattern _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( TuplePattern [ lpattern, rpattern ], Tuple lvalue rvalue ) ->
             match env lpattern lvalue
-                |> andThen
+                |> matchAndThen
                     (\lenv ->
                         match env rpattern rvalue
-                            |> andThen
+                            |> matchAndThen
                                 (\renv ->
-                                    ok <| Dict.union renv lenv
+                                    matchOk <| Dict.foldl Dict.insert lenv renv
                                 )
                     )
 
         ( TuplePattern [ lpattern, mpattern, rpattern ], Triple lvalue mvalue rvalue ) ->
             match env lpattern lvalue
-                |> andThen
+                |> matchAndThen
                     (\lenv ->
                         match env mpattern mvalue
-                            |> andThen
+                            |> matchAndThen
                                 (\menv ->
                                     match env rpattern rvalue
-                                        |> andThen
+                                        |> matchAndThen
                                             (\renv ->
-                                                ok <| Dict.union renv <| Dict.union menv lenv
+                                                matchOk <| Dict.foldl Dict.insert (Dict.foldl Dict.insert lenv menv) renv
                                             )
                                 )
                     )
 
         ( TuplePattern _, _ ) ->
-            noMatch
+            matchNoMatch
 
         ( AsPattern childPattern (Node _ asName), _ ) ->
             match env childPattern value
-                |> andThen
-                    (\e -> ok <| Dict.insert asName value e)
+                |> matchAndThen
+                    (\e -> matchOk <| Dict.insert asName value e)
 
         ( RecordPattern fields, Record fieldValues ) ->
             List.foldl
                 (\(Node _ fieldName) ->
-                    andThen
+                    matchAndThen
                         (\acc ->
                             case Dict.get fieldName fieldValues of
                                 Nothing ->
                                     Err <| typeError env <| "Field " ++ fieldName ++ " not found in record"
 
                                 Just fieldValue ->
-                                    ok <| Dict.insert fieldName fieldValue acc
+                                    matchOk <| Dict.insert fieldName fieldValue acc
                         )
                 )
-                (ok Dict.empty)
+                (matchOk Dict.empty)
                 fields
 
         ( RecordPattern _, _ ) ->
-            noMatch
+            matchNoMatch
 
 
 matchListHelp : Env -> EnvValues -> List (Node Pattern) -> List Value -> Result EvalErrorData (Maybe EnvValues)
@@ -1410,7 +1524,7 @@ matchListHelp env acc patterns values =
                     Ok Nothing
 
                 Ok (Just headEnv) ->
-                    matchListHelp env (Dict.union headEnv acc) patternTail valueTail
+                    matchListHelp env (Dict.foldl Dict.insert acc headEnv) patternTail valueTail
 
         _ ->
             Ok Nothing

@@ -73,7 +73,11 @@ call moduleName name env =
     , functions = env.functions
     , values = env.values
     , imports =
-        Dict.get moduleName env.moduleImports
-            |> Maybe.withDefault env.imports
+        if moduleName == env.currentModule then
+            env.imports
+
+        else
+            Dict.get moduleName env.moduleImports
+                |> Maybe.withDefault env.imports
     , moduleImports = env.moduleImports
     }
