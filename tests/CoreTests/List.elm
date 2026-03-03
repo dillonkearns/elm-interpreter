@@ -12,6 +12,21 @@ suite =
         , testListOfN 1
         , testListOfN 2
         , slowTest testListOfN
+        , sortStabilityTests
+        ]
+
+
+sortStabilityTests : Test
+sortStabilityTests =
+    describe "sortWith stability"
+        [ evalTest "sortWith all-EQ preserves order"
+            "List.sortWith (\\_ _ -> EQ) [3, 1, 4, 1, 5]"
+            (list Int)
+            (List.sortWith (\_ _ -> EQ) [ 3, 1, 4, 1, 5 ])
+        , evalTest "sortWith stable on equal keys"
+            "List.sortWith (\\a b -> compare (modBy 2 a) (modBy 2 b)) [1, 2, 3, 4, 5, 6]"
+            (list Int)
+            (List.sortWith (\a b -> compare (modBy 2 a) (modBy 2 b)) [ 1, 2, 3, 4, 5, 6 ])
         ]
 
 

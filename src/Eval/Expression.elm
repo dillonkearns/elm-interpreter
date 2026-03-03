@@ -488,23 +488,20 @@ evalNonVariant : ModuleName -> String -> PartialEval Value
 evalNonVariant moduleName name cfg env =
     case moduleName of
         "Elm" :: "Kernel" :: _ ->
-            case Dict.get moduleName env.functions of
-                Nothing ->
-                    evalKernelFunction moduleName name cfg env
-
-                Just kernelModule ->
-                    case Dict.get name kernelModule of
-                        Nothing ->
+            -- Check native kernel functions first; they take precedence over
+            -- generated AST because they handle edge cases (e.g. Unicode
+            -- surrogate pairs, stable sort) that the generated AST may not.
+            case Dict.get moduleName kernelFunctions of
+                Just nativeModule ->
+                    case Dict.get name nativeModule of
+                        Just _ ->
                             evalKernelFunction moduleName name cfg env
 
-                        Just function ->
-                            PartiallyApplied
-                                (Environment.call moduleName name env)
-                                []
-                                function.arguments
-                                (Just { moduleName = moduleName, name = name })
-                                function.expression
-                                |> Types.succeedPartial
+                        Nothing ->
+                            evalKernelFunctionFromAst moduleName name cfg env
+
+                Nothing ->
+                    evalKernelFunctionFromAst moduleName name cfg env
 
         _ ->
             case ( moduleName, Dict.get name env.values ) of
@@ -750,6 +747,29 @@ evalKernelFunction moduleName name cfg env =
                             (Just { moduleName = moduleName, name = name })
                             (fakeNode <| Expression.FunctionOrValue moduleName name)
                             |> Types.succeedPartial
+
+
+{-| Fall back to generated AST for kernel functions not in native kernel.
+-}
+evalKernelFunctionFromAst : ModuleName -> String -> PartialEval Value
+evalKernelFunctionFromAst moduleName name cfg env =
+    case Dict.get moduleName env.functions of
+        Nothing ->
+            evalKernelFunction moduleName name cfg env
+
+        Just kernelModule ->
+            case Dict.get name kernelModule of
+                Nothing ->
+                    evalKernelFunction moduleName name cfg env
+
+                Just function ->
+                    PartiallyApplied
+                        (Environment.call moduleName name env)
+                        []
+                        function.arguments
+                        (Just { moduleName = moduleName, name = name })
+                        function.expression
+                        |> Types.succeedPartial
 
 
 evalNegation : Node Expression -> PartialEval Value

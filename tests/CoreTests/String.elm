@@ -2,7 +2,7 @@ module CoreTests.String exposing (suite)
 
 import Expect
 import Test exposing (Test, describe, test)
-import TestUtils exposing (evalTest_, list)
+import TestUtils exposing (evalTest, evalTest_, list)
 import Types exposing (Value(..))
 
 
@@ -103,6 +103,9 @@ encodingTests =
         , test "foldr" <| \() -> Expect.equal 3 (String.foldr (\_ c -> c + 1) 0 "😃😃😃")
         , test "all" <| \() -> Expect.equal True (String.all ((==) '😃') "😃😃😃")
         , test "any" <| \() -> Expect.equal True (String.any ((==) '😃') "abc😃123")
+        , evalTest "toList emoji (interpreted)" "String.toList \"\\u{1F4A9}!\"" (list Char) (String.toList "\u{1F4A9}!")
+        , evalTest "toCodePoints emoji (interpreted)" "List.map Char.toCode (String.toList \"\\u{1F4A9}!\")" (list Int) (List.map Char.toCode (String.toList "\u{1F4A9}!"))
+        , evalTest "fromCodePoints emoji (interpreted)" "String.fromList (List.map Char.fromCode [128169, 33])" String (String.fromList (List.map Char.fromCode [ 128169, 33 ]))
         ]
 
 

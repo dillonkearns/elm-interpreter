@@ -19,6 +19,7 @@ import EvalResult
 import FastDict as Dict exposing (Dict)
 import Kernel.Debug
 import Kernel.JsArray
+import Kernel.List
 import Kernel.String
 import Kernel.Utils
 import Maybe.Extra
@@ -126,6 +127,7 @@ functions evalFunction =
     , ( [ "Elm", "Kernel", "List" ]
       , [ ( "cons", two anything anyList to anyList (::) Core.List.cons )
         , ( "fromArray", one (jsArray anything) to anyList Array.toList Core.Array.toList )
+        , ( "sortWith", twoWithError (function2 evalFunction anything anything to order) anyList to anyList Kernel.List.sortWith Core.List.sortWith )
         , ( "toArray", one anyList to (jsArray anything) Array.fromList Core.Array.fromList )
         ]
       )
