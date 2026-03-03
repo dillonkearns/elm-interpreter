@@ -2,6 +2,7 @@ module Eval.Expression exposing (evalExpression, evalFunction)
 
 import Core
 import Elm.Syntax.Expression as Expression exposing (Expression(..), LetDeclaration)
+import Elm.Syntax.Infix
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..), QualifiedNameRef)
@@ -18,7 +19,7 @@ import Rope
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
-import Types exposing (CallTree(..), Env, EnvValues, Eval, EvalErrorData, EvalResult, PartialEval, PartialResult, Value(..))
+import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalResult, PartialEval, PartialResult, Value(..))
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -54,17 +55,14 @@ evalExpression initExpression initCfg initEnv =
                         Expression.OperatorApplication "&&" _ l r ->
                             evalShortCircuitAnd l r cfg env
 
-                        Expression.OperatorApplication opName _ l r ->
-                            let
-                                first : Node Expression
-                                first =
-                                    fakeNode <| Expression.Operator opName
+                        Expression.OperatorApplication "<|" _ l r ->
+                            evalApplication l [ r ] cfg env
 
-                                rest : List (Node Expression)
-                                rest =
-                                    [ l, r ]
-                            in
-                            evalApplication first rest cfg env
+                        Expression.OperatorApplication "|>" _ l r ->
+                            evalApplication r [ l ] cfg env
+
+                        Expression.OperatorApplication opName _ l r ->
+                            evalOperatorApplication opName l r cfg env
 
                         Expression.Application [] ->
                             Types.failPartial <| typeError env "Empty application"
@@ -142,9 +140,50 @@ evalExpression initExpression initCfg initEnv =
         ( initExpression, initCfg, initEnv )
 
 
+{-| Evaluate an expression, using inline evaluation for simple cases
+(literals, variables) to skip the trampoline round-trip. Falls back
+to recurseThen for complex expressions.
+-}
+evalOrRecurse : ( Node Expression, Config, Env ) -> (Value -> PartialResult Value) -> PartialResult Value
+evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
+    case expr of
+        Expression.Integer i ->
+            continuation (Int i)
+
+        Expression.Hex i ->
+            continuation (Int i)
+
+        Expression.Floatable f ->
+            continuation (Float f)
+
+        Expression.Literal s ->
+            continuation (String s)
+
+        Expression.CharLiteral c ->
+            continuation (Char c)
+
+        Expression.UnitExpr ->
+            continuation Unit
+
+        Expression.FunctionOrValue [] name ->
+            case Dict.get name env.values of
+                Just (PartiallyApplied _ [] [] _ _) ->
+                    -- Zero-arg thunk, needs call path via trampoline
+                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                Just value ->
+                    continuation value
+
+                Nothing ->
+                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+        _ ->
+            Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+
 evalShortCircuitAnd : Node Expression -> Node Expression -> PartialEval Value
 evalShortCircuitAnd l r cfg env =
-    Types.recurseThen ( l, cfg, env )
+    evalOrRecurse ( l, cfg, env )
         (\value ->
             case value of
                 Bool False ->
@@ -160,7 +199,7 @@ evalShortCircuitAnd l r cfg env =
 
 evalShortCircuitOr : Node Expression -> Node Expression -> PartialEval Value
 evalShortCircuitOr l r cfg env =
-    Types.recurseThen ( l, cfg, env )
+    evalOrRecurse ( l, cfg, env )
         (\value ->
             case value of
                 Bool True ->
@@ -184,20 +223,20 @@ evalTuple exprs cfg env =
             Recursion.recurse ( c, cfg, env )
 
         [ l, r ] ->
-            Types.recurseThen ( l, cfg, env )
+            evalOrRecurse ( l, cfg, env )
                 (\lValue ->
-                    Types.recurseThen ( r, cfg, env )
+                    evalOrRecurse ( r, cfg, env )
                         (\rValue ->
                             Types.succeedPartial (Tuple lValue rValue)
                         )
                 )
 
         [ l, m, r ] ->
-            Types.recurseThen ( l, cfg, env )
+            evalOrRecurse ( l, cfg, env )
                 (\lValue ->
-                    Types.recurseThen ( m, cfg, env )
+                    evalOrRecurse ( m, cfg, env )
                         (\mValue ->
-                            Types.recurseThen ( r, cfg, env )
+                            evalOrRecurse ( r, cfg, env )
                                 (\rValue ->
                                     Types.succeedPartial (Triple lValue mValue rValue)
                                 )
@@ -208,60 +247,135 @@ evalTuple exprs cfg env =
             Types.failPartial <| typeError env "Tuples with more than three elements are not supported"
 
 
+operatorKernelFunctions : Dict String ( ModuleName, List Value -> Eval Value )
+operatorKernelFunctions =
+    Dict.foldl
+        (\opName ref acc ->
+            let
+                kernelModuleName : ModuleName
+                kernelModuleName =
+                    "Elm" :: "Kernel" :: ref.moduleName
+            in
+            case Dict.get kernelModuleName kernelFunctions of
+                Nothing ->
+                    acc
+
+                Just kernelModule ->
+                    case Dict.get ref.name kernelModule of
+                        Nothing ->
+                            acc
+
+                        Just ( _, f ) ->
+                            Dict.insert opName ( kernelModuleName, f ) acc
+        )
+        Dict.empty
+        Core.operators
+
+
+evalOperatorApplication : String -> Node Expression -> Node Expression -> PartialEval Value
+evalOperatorApplication opName l r cfg env =
+    case Dict.get opName operatorKernelFunctions of
+        Just ( kernelModuleName, kernelFn ) ->
+            evalOrRecurse ( l, cfg, env )
+                (\lValue ->
+                    evalOrRecurse ( r, cfg, env )
+                        (\rValue ->
+                            let
+                                childEnv : Env
+                                childEnv =
+                                    Environment.call kernelModuleName opName env
+
+                                ( result, children, logLines ) =
+                                    kernelFn [ lValue, rValue ] cfg childEnv
+                            in
+                            if cfg.trace then
+                                Recursion.base
+                                    ( result
+                                    , Rope.singleton
+                                        (CallNode
+                                            { env = childEnv
+                                            , expression = fakeNode <| Expression.OperatorApplication opName Elm.Syntax.Infix.Non l r
+                                            , result = result
+                                            , children = children
+                                            }
+                                        )
+                                    , logLines
+                                    )
+
+                            else
+                                Recursion.base ( result, Rope.empty, logLines )
+                        )
+                )
+
+        Nothing ->
+            -- Fallback for operators not in kernel (e.g., <<, >>)
+            let
+                first : Node Expression
+                first =
+                    fakeNode <| Expression.Operator opName
+            in
+            evalApplication first [ l, r ] cfg env
+
+
 evalApplication : Node Expression -> List (Node Expression) -> PartialEval Value
 evalApplication first rest cfg env =
     let
         inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialResult Value
         inner localEnv oldArgs patterns maybeQualifiedName implementation =
-            let
-                patternsLength : Int
-                patternsLength =
-                    List.length patterns
-
-                oldArgsLength : Int
-                oldArgsLength =
-                    List.length oldArgs
-            in
             case ( oldArgs, rest ) of
                 ( [], [ singleArg ] ) ->
                     -- Fast path: single argument, no oldArgs, exactly 1 new arg
-                    -- Only when patternsLength >= 1 (no splitting needed)
-                    if patternsLength >= 1 then
-                        Types.recurseThen ( singleArg, cfg, env )
-                            (\argValue ->
-                                if patternsLength > 1 then
-                                    Types.succeedPartial <| PartiallyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation
-
-                                else
+                    -- Pattern match on patterns list to avoid List.length
+                    case patterns of
+                        [ _ ] ->
+                            -- Exactly 1 pattern: fully applied
+                            evalOrRecurse ( singleArg, cfg, env )
+                                (\argValue ->
                                     evalFullyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation cfg env
-                            )
+                                )
 
-                    else
-                        evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env
+                        _ :: _ :: _ ->
+                            -- 2+ patterns: still partially applied after 1 arg
+                            evalOrRecurse ( singleArg, cfg, env )
+                                (\argValue ->
+                                    Types.succeedPartial <| PartiallyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation
+                                )
+
+                        [] ->
+                            -- 0 patterns with 1 arg: need general path (splitting)
+                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
 
                 ( [], [ arg1, arg2 ] ) ->
-                    -- Fast path: two arguments (binary ops, List.map f xs, etc.)
-                    -- Only when patternsLength >= 2 (no splitting needed)
-                    if patternsLength >= 2 then
-                        Types.recurseThen ( arg1, cfg, env )
-                            (\val1 ->
-                                Types.recurseThen ( arg2, cfg, env )
-                                    (\val2 ->
-                                        if patternsLength > 2 then
-                                            Types.succeedPartial <| PartiallyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation
-
-                                        else
+                    -- Fast path: two arguments, no oldArgs
+                    case patterns of
+                        [ _, _ ] ->
+                            -- Exactly 2 patterns: fully applied
+                            evalOrRecurse ( arg1, cfg, env )
+                                (\val1 ->
+                                    evalOrRecurse ( arg2, cfg, env )
+                                        (\val2 ->
                                             evalFullyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation cfg env
-                                    )
-                            )
+                                        )
+                                )
 
-                    else
-                        evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env
+                        _ :: _ :: _ :: _ ->
+                            -- 3+ patterns: still partially applied after 2 args
+                            evalOrRecurse ( arg1, cfg, env )
+                                (\val1 ->
+                                    evalOrRecurse ( arg2, cfg, env )
+                                        (\val2 ->
+                                            Types.succeedPartial <| PartiallyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation
+                                        )
+                                )
+
+                        _ ->
+                            -- 0 or 1 pattern with 2 args: need general path (splitting)
+                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
 
                 _ ->
-                    evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env
+                    evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
     in
-    Types.recurseThen ( first, cfg, env )
+    evalOrRecurse ( first, cfg, env )
         (\firstValue ->
             case firstValue of
                 Custom name customArgs ->
@@ -278,6 +392,11 @@ evalApplication first rest cfg env =
                                 ++ Value.toString other
                                 ++ ", which is a non-lambda non-variant"
         )
+
+
+evalApplicationGeneralCompute : Node Expression -> List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
+evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env =
+    evalApplicationGeneral first rest oldArgs (List.length oldArgs) (List.length patterns) localEnv patterns maybeQualifiedName implementation cfg env
 
 
 evalApplicationGeneral : Node Expression -> List (Node Expression) -> List Value -> Int -> Int -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
@@ -470,6 +589,38 @@ evalFunctionOrValue moduleName name cfg env =
 
 evalQualifiedOrVariant : ModuleName -> String -> PartialEval Value
 evalQualifiedOrVariant moduleName name cfg env =
+    case moduleName of
+        [] ->
+            -- For unqualified names: check currentModuleFunctions first to
+            -- skip the expensive isVariant check (String.uncons + Char.toCode)
+            case Dict.get name env.currentModuleFunctions of
+                Just function ->
+                    let
+                        qualifiedNameRef : QualifiedNameRef
+                        qualifiedNameRef =
+                            { moduleName = env.currentModule, name = name }
+                    in
+                    if List.isEmpty function.arguments then
+                        call (Just qualifiedNameRef) function.expression cfg env
+
+                    else
+                        PartiallyApplied
+                            (Environment.call env.currentModule name env)
+                            []
+                            function.arguments
+                            (Just qualifiedNameRef)
+                            function.expression
+                            |> Types.succeedPartial
+
+                Nothing ->
+                    evalQualifiedOrVariantSlow moduleName name cfg env
+
+        _ ->
+            evalQualifiedOrVariantSlow moduleName name cfg env
+
+
+evalQualifiedOrVariantSlow : ModuleName -> String -> PartialEval Value
+evalQualifiedOrVariantSlow moduleName name cfg env =
     if isVariant name then
         case findRecordAliasConstructor moduleName name env of
             Just ( resolvedModule, function ) ->
@@ -616,22 +767,16 @@ evalNonVariant moduleName name cfg env =
                         maybeFunction : Maybe ( ModuleName, Expression.FunctionImplementation )
                         maybeFunction =
                             if List.isEmpty moduleName then
-                                -- Unqualified: use cached currentModuleFunctions to skip
-                                -- the expensive outer Dict.get with List String key
-                                case Dict.get name env.currentModuleFunctions of
-                                    Just f ->
-                                        Just ( env.currentModule, f )
+                                -- Unqualified: currentModuleFunctions was already checked
+                                -- in evalQualifiedOrVariant, so go straight to imports.
+                                case Dict.get name env.imports.exposedValues of
+                                    Just sourceModule ->
+                                        Dict.get sourceModule env.functions
+                                            |> Maybe.andThen (Dict.get name)
+                                            |> Maybe.map (\f -> ( sourceModule, f ))
 
                                     Nothing ->
-                                        -- Check exposed values from imports
-                                        case Dict.get name env.imports.exposedValues of
-                                            Just sourceModule ->
-                                                Dict.get sourceModule env.functions
-                                                    |> Maybe.andThen (Dict.get name)
-                                                    |> Maybe.map (\f -> ( sourceModule, f ))
-
-                                            Nothing ->
-                                                Nothing
+                                        Nothing
 
                             else
                                 let
@@ -713,7 +858,7 @@ evalNonVariant moduleName name cfg env =
 
 evalIfBlock : Node Expression -> Node Expression -> Node Expression -> PartialEval Value
 evalIfBlock cond true false cfg env =
-    Types.recurseThen ( cond, cfg, env )
+    evalOrRecurse ( cond, cfg, env )
         (\condValue ->
             case condValue of
                 Bool True ->
@@ -910,7 +1055,7 @@ evalKernelFunctionFromAst moduleName name cfg env =
 
 evalNegation : Node Expression -> PartialEval Value
 evalNegation child cfg env =
-    Types.recurseThen ( child, cfg, env )
+    evalOrRecurse ( child, cfg, env )
         (\value ->
             case value of
                 Int i ->
@@ -1190,7 +1335,7 @@ declarationDefinedVariables (Node _ letDeclaration) =
 
 evalRecordAccess : Node Expression -> Node String -> PartialEval Value
 evalRecordAccess recordExpr (Node _ field) cfg env =
-    Types.recurseThen ( recordExpr, cfg, env )
+    evalOrRecurse ( recordExpr, cfg, env )
         (\value ->
             case value of
                 Record fields ->
@@ -1222,7 +1367,7 @@ evalRecordAccessFunction field =
 
 evalRecordUpdate : Node String -> List (Node Expression.RecordSetter) -> PartialEval Value
 evalRecordUpdate (Node range name) setters cfg env =
-    Types.recurseThen ( Node range <| Expression.FunctionOrValue [] name, cfg, env )
+    evalOrRecurse ( Node range <| Expression.FunctionOrValue [] name, cfg, env )
         (\value ->
             case value of
                 Record originalFields ->
@@ -1301,7 +1446,7 @@ isAsciiUpper c =
 
 evalCase : Expression.CaseBlock -> PartialEval Value
 evalCase { expression, cases } cfg env =
-    Types.recurseThen ( expression, cfg, env )
+    evalOrRecurse ( expression, cfg, env )
         (\exprValue ->
             let
                 maybePartial : Result EvalErrorData (Maybe ( EnvValues, Node Expression ))
