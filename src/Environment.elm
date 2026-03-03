@@ -9,7 +9,18 @@ import Types exposing (Env, EnvValues, Value)
 
 moduleKey : ModuleName -> String
 moduleKey moduleName =
-    String.join "." moduleName
+    case moduleName of
+        [ a ] ->
+            a
+
+        [ a, b ] ->
+            a ++ "." ++ b
+
+        [ a, b, c ] ->
+            a ++ "." ++ b ++ "." ++ c
+
+        _ ->
+            String.join "." moduleName
 
 
 addValue : String -> Value -> Env -> Env
