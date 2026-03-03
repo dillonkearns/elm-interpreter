@@ -122,14 +122,18 @@ wrapThen f ( value, trees, logs ) =
             Recursion.base ( Err e, trees, logs )
 
         Ok v ->
-            f v
-                |> Recursion.map
-                    (\( result, ftrees, flogs ) ->
-                        ( result
-                        , EvalResult.appendRopes trees ftrees
-                        , EvalResult.appendRopes logs flogs
+            if Rope.isEmpty trees && Rope.isEmpty logs then
+                f v
+
+            else
+                f v
+                    |> Recursion.map
+                        (\( result, ftrees, flogs ) ->
+                            ( result
+                            , EvalResult.appendRopes trees ftrees
+                            , EvalResult.appendRopes logs flogs
+                            )
                         )
-                    )
 
 
 recurseMapThen :
@@ -148,12 +152,16 @@ recurseMapThen ( exprs, cfg, env ) f =
                     Recursion.base ( Err e, trees, logs )
 
                 Ok vs ->
-                    f vs
-                        |> Recursion.map
-                            (\( result, ftrees, flogs ) ->
-                                ( result
-                                , EvalResult.appendRopes trees ftrees
-                                , EvalResult.appendRopes logs flogs
+                    if Rope.isEmpty trees && Rope.isEmpty logs then
+                        f vs
+
+                    else
+                        f vs
+                            |> Recursion.map
+                                (\( result, ftrees, flogs ) ->
+                                    ( result
+                                    , EvalResult.appendRopes trees ftrees
+                                    , EvalResult.appendRopes logs flogs
+                                    )
                                 )
-                            )
         )

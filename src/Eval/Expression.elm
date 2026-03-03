@@ -120,10 +120,10 @@ evalExpression initExpression initCfg initEnv =
                         Expression.GLSLExpression _ ->
                             Types.failPartial <| unsupported env "GLSL not supported"
             in
-            result
-                |> Recursion.map
-                    (\( value, trees, logs ) ->
-                        if cfg.trace then
+            if cfg.trace then
+                result
+                    |> Recursion.map
+                        (\( value, trees, logs ) ->
                             ( value
                             , CallNode
                                 { env = env
@@ -134,10 +134,10 @@ evalExpression initExpression initCfg initEnv =
                                 |> Rope.singleton
                             , logs
                             )
+                        )
 
-                        else
-                            ( value, Rope.empty, logs )
-                    )
+            else
+                result
         )
         ( initExpression, initCfg, initEnv )
 
