@@ -12,6 +12,7 @@ addValue name value env =
     { currentModule = env.currentModule
     , callStack = env.callStack
     , functions = env.functions
+    , currentModuleFunctions = env.currentModuleFunctions
     , values = Dict.insert name value env.values
     , imports = env.imports
     , moduleImports = env.moduleImports
@@ -20,17 +21,36 @@ addValue name value env =
 
 addFunction : ModuleName -> FunctionImplementation -> Env -> Env
 addFunction moduleName function env =
+    let
+        funcName : String
+        funcName =
+            Node.value function.name
+
+        isCurrentModule : Bool
+        isCurrentModule =
+            moduleName == env.currentModule
+
+        currentInner : Dict.Dict String FunctionImplementation
+        currentInner =
+            if isCurrentModule then
+                env.currentModuleFunctions
+
+            else
+                Maybe.withDefault Dict.empty
+                    (Dict.get moduleName env.functions)
+
+        newInner : Dict.Dict String FunctionImplementation
+        newInner =
+            Dict.insert funcName function currentInner
+    in
     { env
-        | functions =
-            Dict.insert
-                moduleName
-                (Dict.insert (Node.value function.name)
-                    function
-                    (Maybe.withDefault Dict.empty
-                        (Dict.get moduleName env.functions)
-                    )
-                )
-                env.functions
+        | functions = Dict.insert moduleName newInner env.functions
+        , currentModuleFunctions =
+            if isCurrentModule then
+                newInner
+
+            else
+                env.currentModuleFunctions
     }
 
 
@@ -39,6 +59,7 @@ with newValues old =
     { currentModule = old.currentModule
     , callStack = old.callStack
     , functions = old.functions
+    , currentModuleFunctions = old.currentModuleFunctions
     , values = Dict.union newValues old.values
     , imports = old.imports
     , moduleImports = old.moduleImports
@@ -50,6 +71,7 @@ empty moduleName =
     { currentModule = moduleName
     , callStack = []
     , functions = Dict.empty
+    , currentModuleFunctions = Dict.empty
     , values = Dict.empty
     , imports = emptyImports
     , moduleImports = Dict.empty
@@ -66,18 +88,30 @@ emptyImports =
 
 call : ModuleName -> String -> Env -> Env
 call moduleName name env =
-    { currentModule = moduleName
-    , callStack =
-        { moduleName = moduleName, name = name }
-            :: env.callStack
-    , functions = env.functions
-    , values = env.values
-    , imports =
-        if moduleName == env.currentModule then
-            env.imports
+    if moduleName == env.currentModule then
+        { currentModule = moduleName
+        , callStack =
+            { moduleName = moduleName, name = name }
+                :: env.callStack
+        , functions = env.functions
+        , currentModuleFunctions = env.currentModuleFunctions
+        , values = env.values
+        , imports = env.imports
+        , moduleImports = env.moduleImports
+        }
 
-        else
+    else
+        { currentModule = moduleName
+        , callStack =
+            { moduleName = moduleName, name = name }
+                :: env.callStack
+        , functions = env.functions
+        , currentModuleFunctions =
+            Dict.get moduleName env.functions
+                |> Maybe.withDefault Dict.empty
+        , values = env.values
+        , imports =
             Dict.get moduleName env.moduleImports
                 |> Maybe.withDefault env.imports
-    , moduleImports = env.moduleImports
-    }
+        , moduleImports = env.moduleImports
+        }

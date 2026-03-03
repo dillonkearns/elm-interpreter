@@ -184,6 +184,7 @@ buildProjectEnvFromParsed parsedModules =
                         { currentModule = []
                         , callStack = []
                         , functions = Core.functions
+                        , currentModuleFunctions = Dict.empty
                         , values = Dict.empty
                         , imports = emptyImports
                         , moduleImports = Dict.empty
@@ -299,6 +300,9 @@ evalWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         finalEnv =
                             { env
                                 | currentModule = lastModule
+                                , currentModuleFunctions =
+                                    Dict.get lastModule env.functions
+                                        |> Maybe.withDefault Dict.empty
                                 , imports = finalImports
                             }
 
@@ -332,6 +336,7 @@ buildInitialEnv file =
             { currentModule = moduleName
             , callStack = []
             , functions = Core.functions
+            , currentModuleFunctions = Dict.empty
             , values = Dict.empty
             , imports = imports
             , moduleImports = Dict.singleton moduleName imports
@@ -600,6 +605,7 @@ evalProject sources expression =
                                 { currentModule = []
                                 , callStack = []
                                 , functions = Core.functions
+                                , currentModuleFunctions = Dict.empty
                                 , values = Dict.empty
                                 , imports = emptyImports
                                 , moduleImports = Dict.empty
@@ -643,6 +649,9 @@ evalProject sources expression =
                         finalEnv =
                             { env
                                 | currentModule = lastModule
+                                , currentModuleFunctions =
+                                    Dict.get lastModule env.functions
+                                        |> Maybe.withDefault Dict.empty
                                 , imports = finalImports
                             }
 

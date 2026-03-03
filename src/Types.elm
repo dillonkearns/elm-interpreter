@@ -71,6 +71,7 @@ type Value
 type alias Env =
     { currentModule : ModuleName
     , functions : Dict ModuleName (Dict String FunctionImplementation)
+    , currentModuleFunctions : Dict String FunctionImplementation
     , values : EnvValues
     , callStack : List QualifiedNameRef
     , imports : ImportedNames

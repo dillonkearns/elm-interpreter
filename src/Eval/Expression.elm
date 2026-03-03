@@ -214,50 +214,52 @@ evalApplication first rest cfg env =
         inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialResult Value
         inner localEnv oldArgs patterns maybeQualifiedName implementation =
             let
-                ( used, leftover ) =
-                    List.Extra.splitAt (patternsLength - oldArgsLength) rest
+                patternsLength : Int
+                patternsLength =
+                    List.length patterns
 
                 oldArgsLength : Int
                 oldArgsLength =
                     List.length oldArgs
-
-                patternsLength : Int
-                patternsLength =
-                    List.length patterns
             in
-            if not (List.isEmpty leftover) then
-                -- Too many args, we split
-                Recursion.recurse
-                    ( fakeNode <|
-                        Expression.Application
-                            (fakeNode
-                                (Expression.Application (first :: used))
-                                :: leftover
+            case ( oldArgs, rest ) of
+                ( [], [ singleArg ] ) ->
+                    -- Fast path: single argument, no oldArgs, exactly 1 new arg
+                    -- Only when patternsLength >= 1 (no splitting needed)
+                    if patternsLength >= 1 then
+                        Types.recurseThen ( singleArg, cfg, env )
+                            (\argValue ->
+                                if patternsLength > 1 then
+                                    Types.succeedPartial <| PartiallyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation
+
+                                else
+                                    evalFullyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation cfg env
                             )
-                    , cfg
-                    , env
-                    )
 
-            else
-                Types.recurseMapThen ( rest, cfg, env )
-                    (\values ->
-                        let
-                            restLength : Int
-                            restLength =
-                                List.length rest
+                    else
+                        evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env
 
-                            args : List Value
-                            args =
-                                oldArgs ++ values
-                        in
-                        if oldArgsLength + restLength < patternsLength then
-                            -- Still not enough
-                            Types.succeedPartial <| PartiallyApplied localEnv args patterns maybeQualifiedName implementation
+                ( [], [ arg1, arg2 ] ) ->
+                    -- Fast path: two arguments (binary ops, List.map f xs, etc.)
+                    -- Only when patternsLength >= 2 (no splitting needed)
+                    if patternsLength >= 2 then
+                        Types.recurseThen ( arg1, cfg, env )
+                            (\val1 ->
+                                Types.recurseThen ( arg2, cfg, env )
+                                    (\val2 ->
+                                        if patternsLength > 2 then
+                                            Types.succeedPartial <| PartiallyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation
 
-                        else
-                            -- Just right, we special case this for TCO
-                            evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env
-                    )
+                                        else
+                                            evalFullyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation cfg env
+                                    )
+                            )
+
+                    else
+                        evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env
+
+                _ ->
+                    evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env
     in
     Types.recurseThen ( first, cfg, env )
         (\firstValue ->
@@ -276,6 +278,47 @@ evalApplication first rest cfg env =
                                 ++ Value.toString other
                                 ++ ", which is a non-lambda non-variant"
         )
+
+
+evalApplicationGeneral : Node Expression -> List (Node Expression) -> List Value -> Int -> Int -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
+evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env =
+    let
+        ( used, leftover ) =
+            List.Extra.splitAt (patternsLength - oldArgsLength) rest
+    in
+    if not (List.isEmpty leftover) then
+        -- Too many args, we split
+        Recursion.recurse
+            ( fakeNode <|
+                Expression.Application
+                    (fakeNode
+                        (Expression.Application (first :: used))
+                        :: leftover
+                    )
+            , cfg
+            , env
+            )
+
+    else
+        Types.recurseMapThen ( rest, cfg, env )
+            (\values ->
+                let
+                    restLength : Int
+                    restLength =
+                        List.length rest
+
+                    args : List Value
+                    args =
+                        oldArgs ++ values
+                in
+                if oldArgsLength + restLength < patternsLength then
+                    -- Still not enough
+                    Types.succeedPartial <| PartiallyApplied localEnv args patterns maybeQualifiedName implementation
+
+                else
+                    -- Just right, we special case this for TCO
+                    evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env
+            )
 
 
 evalFullyApplied : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
@@ -472,9 +515,17 @@ findRecordAliasConstructor moduleName name env =
 
                 _ ->
                     False
+
+        maybeFunc : Maybe Expression.FunctionImplementation
+        maybeFunc =
+            if List.isEmpty moduleName then
+                Dict.get name env.currentModuleFunctions
+
+            else
+                Dict.get resolvedModule env.functions
+                    |> Maybe.andThen (Dict.get name)
     in
-    Dict.get resolvedModule env.functions
-        |> Maybe.andThen (Dict.get name)
+    maybeFunc
         |> Maybe.andThen
             (\f ->
                 if isRecordExprBody f then
@@ -559,32 +610,17 @@ evalNonVariant moduleName name cfg env =
                     evalKernelFunctionFromAst moduleName name cfg env
 
         _ ->
-            case ( moduleName, Dict.get name env.values ) of
-                ( [], Just (PartiallyApplied localEnv [] [] maybeName implementation) ) ->
-                    call maybeName implementation cfg localEnv
-
-                ( [], Just value ) ->
-                    Types.succeedPartial value
-
-                _ ->
-                    let
-                        fixedModuleName : ModuleName
-                        fixedModuleName =
-                            fixModuleName moduleName env
-
+            -- Note: env.values lookup for moduleName=[] is already done in
+            -- evalFunctionOrValue before calling this function, so skip it here.
+            let
                         maybeFunction : Maybe ( ModuleName, Expression.FunctionImplementation )
                         maybeFunction =
-                            let
-                                fromModule : Maybe ( ModuleName, Expression.FunctionImplementation )
-                                fromModule =
-                                    Dict.get fixedModuleName env.functions
-                                        |> Maybe.andThen (Dict.get name)
-                                        |> Maybe.map (\f -> ( fixedModuleName, f ))
-                            in
                             if List.isEmpty moduleName then
-                                case fromModule of
-                                    Just _ ->
-                                        fromModule
+                                -- Unqualified: use cached currentModuleFunctions to skip
+                                -- the expensive outer Dict.get with List String key
+                                case Dict.get name env.currentModuleFunctions of
+                                    Just f ->
+                                        Just ( env.currentModule, f )
 
                                     Nothing ->
                                         -- Check exposed values from imports
@@ -598,6 +634,17 @@ evalNonVariant moduleName name cfg env =
                                                 Nothing
 
                             else
+                                let
+                                    fixedModuleName : ModuleName
+                                    fixedModuleName =
+                                        fixModuleName moduleName env
+
+                                    fromModule : Maybe ( ModuleName, Expression.FunctionImplementation )
+                                    fromModule =
+                                        Dict.get fixedModuleName env.functions
+                                            |> Maybe.andThen (Dict.get name)
+                                            |> Maybe.map (\f -> ( fixedModuleName, f ))
+                                in
                                 case fromModule of
                                     Just _ ->
                                         fromModule
@@ -634,6 +681,7 @@ evalNonVariant moduleName name cfg env =
                                         { currentModule = env.currentModule
                                         , callStack = env.callStack
                                         , functions = env.functions
+                                        , currentModuleFunctions = env.currentModuleFunctions
                                         , values = Dict.empty
                                         , imports = env.imports
                                         , moduleImports = env.moduleImports
@@ -656,7 +704,7 @@ evalNonVariant moduleName name cfg env =
 
                         Nothing ->
                             Syntax.qualifiedNameToString
-                                { moduleName = fixedModuleName
+                                { moduleName = fixModuleName moduleName env
                                 , name = name
                                 }
                                 |> nameError env
@@ -916,10 +964,7 @@ evalLetBlockFull letBlock cfg env =
         envDefs =
             Set.diff
                 (Set.union
-                    (Dict.get env.currentModule env.functions
-                        |> Maybe.map (Dict.keys >> Set.fromList)
-                        |> Maybe.withDefault Set.empty
-                    )
+                    (Dict.keys env.currentModuleFunctions |> Set.fromList)
                     (Dict.keys env.values |> Set.fromList)
                 )
                 allDefVars
