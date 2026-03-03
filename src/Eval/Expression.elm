@@ -727,10 +727,9 @@ loops with regular custom type constructors.
 findRecordAliasConstructor : ModuleName -> String -> Env -> Maybe ( ModuleName, Expression.FunctionImplementation )
 findRecordAliasConstructor moduleName name env =
     let
-        resolvedModule : ModuleName
-        resolvedModule =
+        ( resolvedModule, resolvedModuleKey ) =
             if List.isEmpty moduleName then
-                env.currentModule
+                ( env.currentModule, env.currentModuleKey )
 
             else
                 fixModuleName moduleName env
@@ -750,7 +749,7 @@ findRecordAliasConstructor moduleName name env =
                 Dict.get name env.currentModuleFunctions
 
             else
-                Dict.get (Environment.moduleKey resolvedModule) env.functions
+                Dict.get resolvedModuleKey env.functions
                     |> Maybe.andThen (Dict.get name)
     in
     maybeFunc
@@ -764,18 +763,23 @@ findRecordAliasConstructor moduleName name env =
             )
 
 
-fixModuleName : ModuleName -> Env -> ModuleName
+fixModuleName : ModuleName -> Env -> ( ModuleName, String )
 fixModuleName moduleName env =
     if List.isEmpty moduleName then
-        env.currentModule
+        ( env.currentModule, env.currentModuleKey )
 
     else
-        case Dict.get (Environment.moduleKey moduleName) env.imports.aliases of
-            Just canonical ->
-                canonical
+        let
+            key : String
+            key =
+                Environment.moduleKey moduleName
+        in
+        case Dict.get key env.imports.aliases of
+            Just canonicalWithKey ->
+                canonicalWithKey
 
             Nothing ->
-                moduleName
+                ( moduleName, key )
 
 
 evalVariant : ModuleName -> Env -> String -> PartialResult Value
@@ -802,14 +806,14 @@ evalVariant moduleName env name =
                     if List.isEmpty moduleName then
                         -- Unqualified constructor: check exposed constructors first
                         case Dict.get name env.imports.exposedConstructors of
-                            Just sourceModule ->
+                            Just ( sourceModule, _ ) ->
                                 sourceModule
 
                             Nothing ->
                                 env.currentModule
 
                     else
-                        fixModuleName moduleName env
+                        Tuple.first (fixModuleName moduleName env)
 
                 qualifiedNameRef : QualifiedNameRef
                 qualifiedNameRef =
@@ -846,16 +850,16 @@ evalNonVariant moduleName name cfg env =
             -- Note: env.values lookup for moduleName=[] is already done in
             -- evalFunctionOrValue before calling this function, so skip it here.
             let
-                        maybeFunction : Maybe ( ModuleName, Expression.FunctionImplementation )
+                        maybeFunction : Maybe ( ModuleName, String, Expression.FunctionImplementation )
                         maybeFunction =
                             if List.isEmpty moduleName then
                                 -- Unqualified: currentModuleFunctions was already checked
                                 -- in evalQualifiedOrVariant, so go straight to imports.
                                 case Dict.get name env.imports.exposedValues of
-                                    Just sourceModule ->
-                                        Dict.get (Environment.moduleKey sourceModule) env.functions
+                                    Just ( sourceModule, sourceModuleKey ) ->
+                                        Dict.get sourceModuleKey env.functions
                                             |> Maybe.andThen (Dict.get name)
-                                            |> Maybe.map (\f -> ( sourceModule, f ))
+                                            |> Maybe.map (\f -> ( sourceModule, sourceModuleKey, f ))
 
                                     Nothing ->
                                         Nothing
@@ -871,16 +875,16 @@ evalNonVariant moduleName name cfg env =
                                     Just moduleDict ->
                                         case Dict.get name moduleDict of
                                             Just f ->
-                                                Just ( moduleName, f )
+                                                Just ( moduleName, moduleNameKey, f )
 
                                             Nothing ->
                                                 -- Module exists but function not found.
                                                 -- Could be aliased to a different module.
                                                 case Dict.get moduleNameKey env.imports.aliases of
-                                                    Just canonical ->
-                                                        Dict.get (Environment.moduleKey canonical) env.functions
+                                                    Just ( canonical, canonicalKey ) ->
+                                                        Dict.get canonicalKey env.functions
                                                             |> Maybe.andThen (Dict.get name)
-                                                            |> Maybe.map (\f -> ( canonical, f ))
+                                                            |> Maybe.map (\f -> ( canonical, canonicalKey, f ))
 
                                                     Nothing ->
                                                         Nothing
@@ -888,16 +892,16 @@ evalNonVariant moduleName name cfg env =
                                     Nothing ->
                                         -- Module not found directly; try alias resolution
                                         case Dict.get moduleNameKey env.imports.aliases of
-                                            Just canonical ->
-                                                Dict.get (Environment.moduleKey canonical) env.functions
+                                            Just ( canonical, canonicalKey ) ->
+                                                Dict.get canonicalKey env.functions
                                                     |> Maybe.andThen (Dict.get name)
-                                                    |> Maybe.map (\f -> ( canonical, f ))
+                                                    |> Maybe.map (\f -> ( canonical, canonicalKey, f ))
 
                                             Nothing ->
                                                 Nothing
                     in
                     case maybeFunction of
-                        Just ( resolvedModule, function ) ->
+                        Just ( resolvedModule, resolvedModuleKey, function ) ->
                             let
                                 qualifiedNameRef : QualifiedNameRef
                                 qualifiedNameRef =
@@ -931,10 +935,6 @@ evalNonVariant moduleName name cfg env =
                                 -- env.currentModule, so we inline the cross-module branch
                                 -- of Environment.call directly.
                                 let
-                                    resolvedModuleKey : String
-                                    resolvedModuleKey =
-                                        Environment.moduleKey resolvedModule
-
                                     callEnv : Env
                                     callEnv =
                                         { currentModule = resolvedModule
@@ -971,7 +971,7 @@ evalNonVariant moduleName name cfg env =
 
                         Nothing ->
                             Syntax.qualifiedNameToString
-                                { moduleName = fixModuleName moduleName env
+                                { moduleName = Tuple.first (fixModuleName moduleName env)
                                 , name = name
                                 }
                                 |> nameError env

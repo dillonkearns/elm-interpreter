@@ -412,17 +412,25 @@ processImport allInterfaces (Node _ imp) acc =
         canonicalName =
             Node.value imp.moduleName
 
+        canonicalKey : String
+        canonicalKey =
+            Environment.moduleKey canonicalName
+
+        canonicalPair : ( ModuleName, String )
+        canonicalPair =
+            ( canonicalName, canonicalKey )
+
         -- Always register the full module name as an alias to itself
         withFullName : ImportedNames
         withFullName =
-            { acc | aliases = Dict.insert (Environment.moduleKey canonicalName) canonicalName acc.aliases }
+            { acc | aliases = Dict.insert canonicalKey canonicalPair acc.aliases }
 
         -- If there's an alias, also register alias -> canonical
         withAlias : ImportedNames
         withAlias =
             case imp.moduleAlias of
                 Just (Node _ alias_) ->
-                    { withFullName | aliases = Dict.insert (Environment.moduleKey alias_) canonicalName withFullName.aliases }
+                    { withFullName | aliases = Dict.insert (Environment.moduleKey alias_) canonicalPair withFullName.aliases }
 
                 Nothing ->
                     withFullName
@@ -438,38 +446,38 @@ processImport allInterfaces (Node _ imp) acc =
                     withAlias
 
                 Just interface ->
-                    List.foldl (exposeFromInterface canonicalName) withAlias interface
+                    List.foldl (exposeFromInterface canonicalPair) withAlias interface
 
         Just (Node _ (Explicit items)) ->
-            List.foldl (exposeExplicitItem allInterfaces canonicalName) withAlias items
+            List.foldl (exposeExplicitItem allInterfaces canonicalPair) withAlias items
 
 
-exposeFromInterface : ModuleName -> Exposed -> ImportedNames -> ImportedNames
-exposeFromInterface moduleName exposed acc =
+exposeFromInterface : ( ModuleName, String ) -> Exposed -> ImportedNames -> ImportedNames
+exposeFromInterface moduleNameWithKey exposed acc =
     case exposed of
         Elm.Interface.Function name ->
-            { acc | exposedValues = Dict.insert name moduleName acc.exposedValues }
+            { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
 
         Elm.Interface.CustomType ( _, constructors ) ->
             let
-                newConstructors : Dict.Dict String ModuleName
+                newConstructors : Dict.Dict String ( ModuleName, String )
                 newConstructors =
-                    List.foldl (\ctor d -> Dict.insert ctor moduleName d) acc.exposedConstructors constructors
+                    List.foldl (\ctor d -> Dict.insert ctor moduleNameWithKey d) acc.exposedConstructors constructors
             in
             { acc | exposedConstructors = newConstructors }
 
         Elm.Interface.Alias name ->
-            { acc | exposedValues = Dict.insert name moduleName acc.exposedValues }
+            { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
 
         Elm.Interface.Operator _ ->
             acc
 
 
-exposeExplicitItem : ElmDict.Dict ModuleName (List Exposed) -> ModuleName -> Node TopLevelExpose -> ImportedNames -> ImportedNames
-exposeExplicitItem allInterfaces moduleName (Node _ item) acc =
+exposeExplicitItem : ElmDict.Dict ModuleName (List Exposed) -> ( ModuleName, String ) -> Node TopLevelExpose -> ImportedNames -> ImportedNames
+exposeExplicitItem allInterfaces (( moduleName, _ ) as moduleNameWithKey) (Node _ item) acc =
     case item of
         FunctionExpose name ->
-            { acc | exposedValues = Dict.insert name moduleName acc.exposedValues }
+            { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
 
         TypeOrAliasExpose _ ->
             -- Type name without constructors - doesn't add values
@@ -507,7 +515,7 @@ exposeExplicitItem allInterfaces moduleName (Node _ item) acc =
                                             )
                                         |> List.concat
                             in
-                            List.foldl (\ctor d -> { d | exposedConstructors = Dict.insert ctor moduleName d.exposedConstructors }) acc constructors
+                            List.foldl (\ctor d -> { d | exposedConstructors = Dict.insert ctor moduleNameWithKey d.exposedConstructors }) acc constructors
 
         InfixExpose _ ->
             acc

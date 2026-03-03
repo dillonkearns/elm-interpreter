@@ -81,9 +81,9 @@ type alias Env =
 
 
 type alias ImportedNames =
-    { aliases : Dict String ModuleName
-    , exposedValues : Dict String ModuleName
-    , exposedConstructors : Dict String ModuleName
+    { aliases : Dict String ( ModuleName, String )
+    , exposedValues : Dict String ( ModuleName, String )
+    , exposedConstructors : Dict String ( ModuleName, String )
     }
 
 
