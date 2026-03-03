@@ -123,15 +123,40 @@ innerCompare l r env =
                 inner lname.moduleName rname.moduleName
 
             else if lname.name /= rname.name then
-                inner lname.name rname.name
+                -- Special case: Dict/Set nodes with different constructors
+                -- (e.g., RBNode vs RBEmpty). Convert to sorted lists for comparison,
+                -- mirroring Elm's _Utils_eqHelp which converts Dict/Set to lists.
+                if isDictNode lname.name && isDictNode rname.name then
+                    innerCompare (dictToSortedList l) (dictToSortedList r) env
+
+                else
+                    inner lname.name rname.name
 
             else
-                case ( Value.toArray l, Value.toArray r ) of
-                    ( Just la, Just ra ) ->
-                        innerCompare (List la) (List ra) env
+                case lname.name of
+                    -- Set_elm_builtin: unwrap to inner Dict and compare
+                    "Set_elm_builtin" ->
+                        case ( lvalues, rvalues ) of
+                            ( [ ldict ], [ rdict ] ) ->
+                                innerCompare (dictToSortedList ldict) (dictToSortedList rdict) env
+
+                            _ ->
+                                innerCompare (List lvalues) (List rvalues) env
+
+                    -- Dict nodes: convert to sorted (key, value) list and compare
+                    "RBNode_elm_builtin" ->
+                        innerCompare (dictToSortedList l) (dictToSortedList r) env
+
+                    "RBEmpty_elm_builtin" ->
+                        Ok EQ
 
                     _ ->
-                        innerCompare (List lvalues) (List rvalues) env
+                        case ( Value.toArray l, Value.toArray r ) of
+                            ( Just la, Just ra ) ->
+                                innerCompare (List la) (List ra) env
+
+                            _ ->
+                                innerCompare (List lvalues) (List rvalues) env
 
         ( Custom _ _, _ ) ->
             uncomparable ()
@@ -204,6 +229,46 @@ compareListHelp ll rl env =
 
                 ok ->
                     ok
+
+
+{-| Check if a constructor name is a Dict internal node type.
+-}
+isDictNode : String -> Bool
+isDictNode name =
+    name == "RBNode_elm_builtin" || name == "RBEmpty_elm_builtin"
+
+
+{-| Convert a Dict Value (RBNode_elm_builtin/RBEmpty_elm_builtin tree) to a sorted
+List of (key, value) Tuple Values. This mirrors Elm's \_Utils\_eqHelp which converts
+Dict/Set to lists before comparing, ensuring that structurally different red-black
+trees with the same elements compare as equal.
+-}
+dictToSortedList : Value -> Value
+dictToSortedList value =
+    List (dictToSortedListHelp value [])
+
+
+dictToSortedListHelp : Value -> List Value -> List Value
+dictToSortedListHelp value acc =
+    case value of
+        Custom { name } args ->
+            case name of
+                "RBNode_elm_builtin" ->
+                    case args of
+                        [ _, key, val, left, right ] ->
+                            dictToSortedListHelp left (Tuple key val :: dictToSortedListHelp right acc)
+
+                        _ ->
+                            acc
+
+                "RBEmpty_elm_builtin" ->
+                    acc
+
+                _ ->
+                    acc
+
+        _ ->
+            acc
 
 
 comparison : List Order -> ModuleName -> ( Int, List Value -> Eval Value )

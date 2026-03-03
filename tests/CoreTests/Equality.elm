@@ -18,6 +18,60 @@ suite =
         , recordTests
         , listTests
         , boolComparisonTests
+        , dictSetEqualityTests
+        ]
+
+
+{-| Tests for Dict/Set equality.
+Elm's runtime converts Dict/Set to sorted lists before comparing,
+so two trees with the same elements but different internal structure
+(e.g., different red-black node colors) should still be equal.
+These tests exercise operations that produce structurally different
+red-black trees compared to Set.fromList/Dict.fromList.
+-}
+dictSetEqualityTests : Test
+dictSetEqualityTests =
+    describe "Dict/Set structural equality"
+        [ -- These two tests exercise the fix: Set.union and Set.remove produce
+          -- red-black trees with different internal structure (node colors/rotations)
+          -- than Set.fromList. Without converting to sorted lists before comparing,
+          -- structural equality would incorrectly return False.
+          evalTest "set union equality"
+            "Set.union (Set.fromList [1, 2]) (Set.fromList [3, 4]) == Set.fromList [1, 2, 3, 4]"
+            Bool
+            True
+        , evalTest "set remove equality"
+            "Set.remove 3 (Set.fromList [1, 2, 3, 4, 5]) == Set.fromList [1, 2, 4, 5]"
+            Bool
+            True
+
+        -- Additional coverage for other Set/Dict operations
+        , evalTest "set diff equality"
+            "Set.diff (Set.fromList [1, 2, 3, 4]) (Set.fromList [2, 4]) == Set.fromList [1, 3]"
+            Bool
+            True
+        , evalTest "set intersect equality"
+            "Set.intersect (Set.fromList [1, 2, 3, 4]) (Set.fromList [2, 3, 5]) == Set.fromList [2, 3]"
+            Bool
+            True
+        , evalTest "dict union equality"
+            "Dict.union (Dict.fromList [(1, \"a\")]) (Dict.fromList [(2, \"b\")]) == Dict.fromList [(1, \"a\"), (2, \"b\")]"
+            Bool
+            True
+        , evalTest "dict remove equality"
+            "Dict.remove 2 (Dict.fromList [(1, \"a\"), (2, \"b\"), (3, \"c\")]) == Dict.fromList [(1, \"a\"), (3, \"c\")]"
+            Bool
+            True
+
+        -- Negative cases: sets/dicts with different elements should not be equal
+        , evalTest "set not equal"
+            "Set.fromList [1, 2, 3] == Set.fromList [1, 2, 4]"
+            Bool
+            False
+        , evalTest "dict not equal"
+            "Dict.fromList [(1, \"a\")] == Dict.fromList [(1, \"b\")]"
+            Bool
+            False
         ]
 
 
