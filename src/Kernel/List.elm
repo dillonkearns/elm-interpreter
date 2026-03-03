@@ -44,8 +44,8 @@ insertionSort compare sorted unsorted cfg env =
                             insertionSort compare newSorted rest cfg env
                     in
                     ( result
-                    , Rope.appendTo trees trees2
-                    , Rope.appendTo logs logs2
+                    , EvalResult.appendRopes trees trees2
+                    , EvalResult.appendRopes logs logs2
                     )
 
 
@@ -70,17 +70,17 @@ insert compare x sorted cfg env =
                     case compareWithY y cfg env of
                         ( Err e, trees2, logs2 ) ->
                             ( Err e
-                            , Rope.appendTo trees1 trees2
-                            , Rope.appendTo logs1 logs2
+                            , EvalResult.appendRopes trees1 trees2
+                            , EvalResult.appendRopes logs1 logs2
                             )
 
                         ( Ok ord, trees2, logs2 ) ->
                             let
                                 mergedTrees =
-                                    Rope.appendTo trees1 trees2
+                                    EvalResult.appendRopes trees1 trees2
 
                                 mergedLogs =
-                                    Rope.appendTo logs1 logs2
+                                    EvalResult.appendRopes logs1 logs2
                             in
                             case ord of
                                 LT ->
@@ -97,6 +97,6 @@ insert compare x sorted cfg env =
                                             insert compare x rest cfg env
                                     in
                                     ( Result.map (\inserted -> y :: inserted) result
-                                    , Rope.appendTo mergedTrees trees3
-                                    , Rope.appendTo mergedLogs logs3
+                                    , EvalResult.appendRopes mergedTrees trees3
+                                    , EvalResult.appendRopes mergedLogs logs3
                                     )
