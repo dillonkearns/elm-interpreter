@@ -420,7 +420,7 @@ boolResult b =
 
 
 comparisonEq : List Value -> Eval Value
-comparisonEq args cfg env =
+comparisonEq args _ env =
     case args of
         [ Int li, Int ri ] ->
             boolResult (li == ri)
@@ -429,15 +429,19 @@ comparisonEq args cfg env =
             boolResult (ls == rs)
 
         [ l, r ] ->
-            Kernel.Utils.compare l r cfg env
-                |> EvalResult.map (\order -> Bool (order == EQ))
+            case Kernel.Utils.innerCompare l r env of
+                Ok order ->
+                    boolResult (order == EQ)
+
+                Err e ->
+                    EvErr e
 
         _ ->
             EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
 
 
 comparisonNeq : List Value -> Eval Value
-comparisonNeq args cfg env =
+comparisonNeq args _ env =
     case args of
         [ Int li, Int ri ] ->
             boolResult (li /= ri)
@@ -446,15 +450,19 @@ comparisonNeq args cfg env =
             boolResult (ls /= rs)
 
         [ l, r ] ->
-            Kernel.Utils.compare l r cfg env
-                |> EvalResult.map (\order -> Bool (order /= EQ))
+            case Kernel.Utils.innerCompare l r env of
+                Ok order ->
+                    boolResult (order /= EQ)
+
+                Err e ->
+                    EvErr e
 
         _ ->
             EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
 
 
 comparisonLt : List Value -> Eval Value
-comparisonLt args cfg env =
+comparisonLt args _ env =
     case args of
         [ Int li, Int ri ] ->
             boolResult (li < ri)
@@ -463,15 +471,19 @@ comparisonLt args cfg env =
             boolResult (ls < rs)
 
         [ l, r ] ->
-            Kernel.Utils.compare l r cfg env
-                |> EvalResult.map (\order -> Bool (order == LT))
+            case Kernel.Utils.innerCompare l r env of
+                Ok order ->
+                    boolResult (order == LT)
+
+                Err e ->
+                    EvErr e
 
         _ ->
             EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
 
 
 comparisonGt : List Value -> Eval Value
-comparisonGt args cfg env =
+comparisonGt args _ env =
     case args of
         [ Int li, Int ri ] ->
             boolResult (li > ri)
@@ -480,15 +492,19 @@ comparisonGt args cfg env =
             boolResult (ls > rs)
 
         [ l, r ] ->
-            Kernel.Utils.compare l r cfg env
-                |> EvalResult.map (\order -> Bool (order == GT))
+            case Kernel.Utils.innerCompare l r env of
+                Ok order ->
+                    boolResult (order == GT)
+
+                Err e ->
+                    EvErr e
 
         _ ->
             EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
 
 
 comparisonLe : List Value -> Eval Value
-comparisonLe args cfg env =
+comparisonLe args _ env =
     case args of
         [ Int li, Int ri ] ->
             boolResult (li <= ri)
@@ -497,15 +513,19 @@ comparisonLe args cfg env =
             boolResult (ls <= rs)
 
         [ l, r ] ->
-            Kernel.Utils.compare l r cfg env
-                |> EvalResult.map (\order -> Bool (order /= GT))
+            case Kernel.Utils.innerCompare l r env of
+                Ok order ->
+                    boolResult (order /= GT)
+
+                Err e ->
+                    EvErr e
 
         _ ->
             EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
 
 
 comparisonGe : List Value -> Eval Value
-comparisonGe args cfg env =
+comparisonGe args _ env =
     case args of
         [ Int li, Int ri ] ->
             boolResult (li >= ri)
@@ -514,8 +534,12 @@ comparisonGe args cfg env =
             boolResult (ls >= rs)
 
         [ l, r ] ->
-            Kernel.Utils.compare l r cfg env
-                |> EvalResult.map (\order -> Bool (order /= LT))
+            case Kernel.Utils.innerCompare l r env of
+                Ok order ->
+                    boolResult (order /= LT)
+
+                Err e ->
+                    EvErr e
 
         _ ->
             EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
