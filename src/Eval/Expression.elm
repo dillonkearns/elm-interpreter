@@ -12,6 +12,7 @@ import Eval.Types as Types
 import EvalResult
 import FastDict as Dict exposing (Dict)
 import Kernel
+import Kernel.Utils
 import List.Extra
 import Recursion
 import Result.MyExtra
@@ -306,7 +307,7 @@ operatorKernelFunctions =
 
 evalOperatorApplication : String -> Node Expression -> Node Expression -> PartialEval Value
 evalOperatorApplication opName l r cfg env =
-    case Dict.get opName operatorKernelFunctions of
+    case resolveOperator opName of
         Just ( kernelModuleName, kernelFn ) ->
             evalOrRecurse ( l, cfg, env )
                 (\lValue ->
@@ -358,6 +359,119 @@ evalOperatorApplication opName l r cfg env =
                     fakeNode <| Expression.Operator opName
             in
             evalApplication first [ l, r ] cfg env
+
+
+utilsKernelModuleName : ModuleName
+utilsKernelModuleName =
+    [ "Elm", "Kernel", "Utils" ]
+
+
+resolveOperator : String -> Maybe ( ModuleName, List Value -> Eval Value )
+resolveOperator opName =
+    case opName of
+        -- Comparison operators: dispatch directly to Kernel.Utils
+        -- instead of going through evalApplication → Basics.eq/neq/lt/gt/le/ge → kernel
+        "==" ->
+            Just ( utilsKernelModuleName, comparisonEq )
+
+        "/=" ->
+            Just ( utilsKernelModuleName, comparisonNeq )
+
+        "<" ->
+            Just ( utilsKernelModuleName, comparisonLt )
+
+        ">" ->
+            Just ( utilsKernelModuleName, comparisonGt )
+
+        "<=" ->
+            Just ( utilsKernelModuleName, comparisonLe )
+
+        ">=" ->
+            Just ( utilsKernelModuleName, comparisonGe )
+
+        -- Append: dispatch directly to Kernel.Utils.append
+        "++" ->
+            Just ( utilsKernelModuleName, kernelAppend )
+
+        -- All other operators: use the pre-built Dict
+        _ ->
+            Dict.get opName operatorKernelFunctions
+
+
+comparisonEq : List Value -> Eval Value
+comparisonEq args cfg env =
+    case args of
+        [ l, r ] ->
+            Kernel.Utils.compare l r cfg env
+                |> EvalResult.map (\order -> Bool (order == EQ))
+
+        _ ->
+            EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
+
+
+comparisonNeq : List Value -> Eval Value
+comparisonNeq args cfg env =
+    case args of
+        [ l, r ] ->
+            Kernel.Utils.compare l r cfg env
+                |> EvalResult.map (\order -> Bool (order /= EQ))
+
+        _ ->
+            EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
+
+
+comparisonLt : List Value -> Eval Value
+comparisonLt args cfg env =
+    case args of
+        [ l, r ] ->
+            Kernel.Utils.compare l r cfg env
+                |> EvalResult.map (\order -> Bool (order == LT))
+
+        _ ->
+            EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
+
+
+comparisonGt : List Value -> Eval Value
+comparisonGt args cfg env =
+    case args of
+        [ l, r ] ->
+            Kernel.Utils.compare l r cfg env
+                |> EvalResult.map (\order -> Bool (order == GT))
+
+        _ ->
+            EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
+
+
+comparisonLe : List Value -> Eval Value
+comparisonLe args cfg env =
+    case args of
+        [ l, r ] ->
+            Kernel.Utils.compare l r cfg env
+                |> EvalResult.map (\order -> Bool (order /= GT))
+
+        _ ->
+            EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
+
+
+comparisonGe : List Value -> Eval Value
+comparisonGe args cfg env =
+    case args of
+        [ l, r ] ->
+            Kernel.Utils.compare l r cfg env
+                |> EvalResult.map (\order -> Bool (order /= LT))
+
+        _ ->
+            EvalResult.fail <| typeError env "Comparison needs exactly two arguments"
+
+
+kernelAppend : List Value -> Eval Value
+kernelAppend args cfg env =
+    case args of
+        [ l, r ] ->
+            Kernel.Utils.append l r cfg env
+
+        _ ->
+            EvalResult.fail <| typeError env "Append needs exactly two arguments"
 
 
 evalApplication : Node Expression -> List (Node Expression) -> PartialEval Value
