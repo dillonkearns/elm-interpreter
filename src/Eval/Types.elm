@@ -5,7 +5,6 @@ import Elm.Syntax.Node exposing (Node)
 import EvalResult
 import Parser
 import Recursion exposing (Rec)
-import Recursion.Traverse
 import Rope exposing (Rope)
 import Syntax
 import Types exposing (Config, Env, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), PartialResult)
@@ -164,19 +163,57 @@ recurseMapThen :
     -> (List out -> PartialResult out)
     -> PartialResult out
 recurseMapThen ( exprs, cfg, env ) f =
-    Recursion.Traverse.sequenceListThen (List.map (\e -> ( e, cfg, env )) exprs)
-        (\results ->
-            case EvalResult.combine results of
-                EvOk vs ->
-                    f vs
+    recurseMapPlain (List.reverse exprs) cfg env [] f
 
-                EvErr e ->
-                    Recursion.base (EvErr e)
 
-                EvOkTrace vs trees logs ->
-                    f vs
-                        |> Recursion.map (mergeTraceInto trees logs)
+{-| Fast path: no trace data seen yet. Unwraps EvOk immediately during fold.
+-}
+recurseMapPlain : List (Node Expression) -> Config -> Env -> List out -> (List out -> PartialResult out) -> PartialResult out
+recurseMapPlain items cfg env vacc f =
+    case items of
+        [] ->
+            f vacc
 
-                EvErrTrace e trees logs ->
-                    Recursion.base (EvErrTrace e trees logs)
-        )
+        item :: rest ->
+            Recursion.recurseThen ( item, cfg, env )
+                (\result ->
+                    case result of
+                        EvOk v ->
+                            recurseMapPlain rest cfg env (v :: vacc) f
+
+                        EvErr e ->
+                            Recursion.base (EvErr e)
+
+                        EvOkTrace v trees logs ->
+                            recurseMapTraced rest cfg env (v :: vacc) trees logs f
+
+                        EvErrTrace e trees logs ->
+                            Recursion.base (EvErrTrace e trees logs)
+                )
+
+
+{-| Traced path: accumulates trace data alongside values.
+-}
+recurseMapTraced : List (Node Expression) -> Config -> Env -> List out -> Rope Types.CallTree -> Rope String -> (List out -> PartialResult out) -> PartialResult out
+recurseMapTraced items cfg env vacc tacc lacc f =
+    case items of
+        [] ->
+            f vacc
+                |> Recursion.map (mergeTraceInto tacc lacc)
+
+        item :: rest ->
+            Recursion.recurseThen ( item, cfg, env )
+                (\result ->
+                    case result of
+                        EvOk v ->
+                            recurseMapTraced rest cfg env (v :: vacc) tacc lacc f
+
+                        EvErr e ->
+                            Recursion.base (EvErrTrace e tacc lacc)
+
+                        EvOkTrace v trees logs ->
+                            recurseMapTraced rest cfg env (v :: vacc) (Rope.appendTo tacc trees) (Rope.appendTo lacc logs) f
+
+                        EvErrTrace e trees logs ->
+                            Recursion.base (EvErrTrace e (Rope.appendTo tacc trees) (Rope.appendTo lacc logs))
+                )
