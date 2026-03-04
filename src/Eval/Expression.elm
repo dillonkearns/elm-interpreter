@@ -905,7 +905,7 @@ evalNonVariant moduleName name cfg env =
                                 qualifiedNameRef =
                                     { moduleName = resolvedModule, name = name }
                             in
-                            if resolvedModule == env.currentModule then
+                            if resolvedModuleKey == env.currentModuleKey then
                                 -- Same module: keep local values, use existing caches
                                 if List.isEmpty function.arguments then
                                     call (Just qualifiedNameRef) function.expression cfg env
