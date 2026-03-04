@@ -187,7 +187,32 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                     continuation value
 
                 Nothing ->
-                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                    -- Check currentModuleFunctions before trampoline
+                    case Dict.get name env.currentModuleFunctions of
+                        Just function ->
+                            if List.isEmpty function.arguments then
+                                -- Zero-arg thunk, needs trampoline for body eval
+                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                            else
+                                -- Has args, return PartiallyApplied directly
+                                continuation
+                                    (PartiallyApplied
+                                        (if cfg.trace then
+                                            Environment.call env.currentModule name env
+
+                                         else
+                                            Environment.callNoStack env.currentModule name env
+                                        )
+                                        []
+                                        function.arguments
+                                        (Just { moduleName = env.currentModule, name = name })
+                                        function.expression
+                                    )
+
+                        Nothing ->
+                            -- Need full resolution (imports, aliases, variants, etc.)
+                            Types.recurseThen ( fullExpr, cfg, env ) continuation
 
         Expression.ParenthesizedExpression inner ->
             evalOrRecurse ( inner, cfg, env ) continuation
@@ -198,20 +223,214 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
         Expression.RecordAccessFunction field ->
             continuation (evalRecordAccessFunction field)
 
-        Expression.Negation (Node _ (Expression.Integer i)) ->
-            continuation (Int -i)
+        Expression.Negation child ->
+            case evalSimple child env of
+                Just value ->
+                    case value of
+                        Int i ->
+                            continuation (Int -i)
 
-        Expression.Negation (Node _ (Expression.Floatable f)) ->
-            continuation (Float -f)
+                        Float f ->
+                            continuation (Float -f)
+
+                        _ ->
+                            Types.failPartial <| typeError env "Trying to negate a non-number"
+
+                Nothing ->
+                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+        Expression.OperatorApplication opName _ l r ->
+            if cfg.trace then
+                Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+            else
+                case opName of
+                    "<|" ->
+                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                    "|>" ->
+                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                    "||" ->
+                        case evalSimple l env of
+                            Just (Bool True) ->
+                                continuation (Bool True)
+
+                            Just (Bool False) ->
+                                Types.recurseThen ( r, cfg, env ) continuation
+
+                            Just v ->
+                                Types.failPartial <| typeError env <| "|| applied to non-Bool " ++ Value.toString v
+
+                            Nothing ->
+                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                    "&&" ->
+                        case evalSimple l env of
+                            Just (Bool False) ->
+                                continuation (Bool False)
+
+                            Just (Bool True) ->
+                                Types.recurseThen ( r, cfg, env ) continuation
+
+                            Just v ->
+                                Types.failPartial <| typeError env <| "&& applied to non-Bool " ++ Value.toString v
+
+                            Nothing ->
+                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                    _ ->
+                        case resolveOperator opName of
+                            Just ( _, kernelFn ) ->
+                                case evalSimple l env of
+                                    Just lValue ->
+                                        case evalSimple r env of
+                                            Just rValue ->
+                                                case kernelFn [ lValue, rValue ] cfg env of
+                                                    EvOk v ->
+                                                        continuation v
+
+                                                    err ->
+                                                        Recursion.base err
+
+                                            Nothing ->
+                                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                                    Nothing ->
+                                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                            Nothing ->
+                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+        Expression.RecordAccess recordExpr (Node _ field) ->
+            case evalSimple recordExpr env of
+                Just (Record fields) ->
+                    case Dict.get field fields of
+                        Just fieldValue ->
+                            continuation fieldValue
+
+                        Nothing ->
+                            Types.failPartial <| typeError env <| "Field " ++ field ++ " not found [record access]"
+
+                Just _ ->
+                    Types.failPartial <| typeError env "Trying to access a field on a non-record value"
+
+                Nothing ->
+                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+        Expression.TupledExpression exprs ->
+            case exprs of
+                [] ->
+                    continuation Unit
+
+                [ c ] ->
+                    case evalSimple c env of
+                        Just v ->
+                            continuation v
+
+                        Nothing ->
+                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                [ l, r ] ->
+                    case evalSimple l env of
+                        Just lValue ->
+                            case evalSimple r env of
+                                Just rValue ->
+                                    continuation (Tuple lValue rValue)
+
+                                Nothing ->
+                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                        Nothing ->
+                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                [ l, m, r ] ->
+                    case evalSimple l env of
+                        Just lValue ->
+                            case evalSimple m env of
+                                Just mValue ->
+                                    case evalSimple r env of
+                                        Just rValue ->
+                                            continuation (Triple lValue mValue rValue)
+
+                                        Nothing ->
+                                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                                Nothing ->
+                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                        Nothing ->
+                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                _ ->
+                    Types.failPartial <| typeError env "Tuples with more than three elements are not supported"
+
+        Expression.IfBlock cond true false ->
+            if cfg.trace then
+                Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+            else
+                case evalSimple cond env of
+                    Just (Bool True) ->
+                        Types.recurseThen ( true, cfg, env ) continuation
+
+                    Just (Bool False) ->
+                        Types.recurseThen ( false, cfg, env ) continuation
+
+                    Just _ ->
+                        Types.failPartial <| typeError env "ifThenElse condition was not a boolean"
+
+                    Nothing ->
+                        Types.recurseThen ( fullExpr, cfg, env ) continuation
 
         Expression.ListExpr [] ->
             continuation (List [])
 
-        Expression.TupledExpression [] ->
-            continuation Unit
-
         _ ->
             Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+
+{-| Try to evaluate a simple expression without recursion.
+Returns Just value for literals and variable lookups, Nothing otherwise.
+This is used to avoid stack-depth issues with recursive evalOrRecurse calls.
+-}
+evalSimple : Node Expression -> Env -> Maybe Value
+evalSimple (Node _ expr) env =
+    case expr of
+        Expression.Integer i ->
+            Just (Int i)
+
+        Expression.Hex i ->
+            Just (Int i)
+
+        Expression.Floatable f ->
+            Just (Float f)
+
+        Expression.Literal s ->
+            Just (String s)
+
+        Expression.CharLiteral c ->
+            Just (Char c)
+
+        Expression.UnitExpr ->
+            Just Unit
+
+        Expression.FunctionOrValue [] name ->
+            case Dict.get name env.values of
+                Just (PartiallyApplied _ [] [] _ _) ->
+                    Nothing
+
+                Just value ->
+                    Just value
+
+                Nothing ->
+                    Nothing
+
+        Expression.ParenthesizedExpression inner ->
+            evalSimple inner env
+
+        _ ->
+            Nothing
 
 
 evalShortCircuitAnd : Node Expression -> Node Expression -> PartialEval Value
