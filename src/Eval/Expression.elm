@@ -369,8 +369,7 @@ utilsKernelModuleName =
 resolveOperator : String -> Maybe ( ModuleName, List Value -> Eval Value )
 resolveOperator opName =
     case opName of
-        -- Comparison operators: dispatch directly to Kernel.Utils
-        -- instead of going through evalApplication → Basics.eq/neq/lt/gt/le/ge → kernel
+        -- Comparison operators
         "==" ->
             Just ( utilsKernelModuleName, comparisonEq )
 
@@ -389,7 +388,7 @@ resolveOperator opName =
         ">=" ->
             Just ( utilsKernelModuleName, comparisonGe )
 
-        -- Append: dispatch directly to Kernel.Utils.append
+        -- Append
         "++" ->
             Just ( utilsKernelModuleName, kernelAppend )
 
@@ -398,14 +397,36 @@ resolveOperator opName =
             Dict.get opName operatorKernelFunctions
 
 
+{-| Pre-computed EvalResult values for Bool True/False.
+Avoids allocating both the Bool wrapper and EvOk wrapper on every comparison.
+-}
+evalResultTrue : EvalResult Value
+evalResultTrue =
+    EvOk (Bool True)
+
+
+evalResultFalse : EvalResult Value
+evalResultFalse =
+    EvOk (Bool False)
+
+
+boolResult : Bool -> EvalResult Value
+boolResult b =
+    if b then
+        evalResultTrue
+
+    else
+        evalResultFalse
+
+
 comparisonEq : List Value -> Eval Value
 comparisonEq args cfg env =
     case args of
         [ Int li, Int ri ] ->
-            EvalResult.succeed (Bool (li == ri))
+            boolResult (li == ri)
 
         [ String ls, String rs ] ->
-            EvalResult.succeed (Bool (ls == rs))
+            boolResult (ls == rs)
 
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
@@ -419,10 +440,10 @@ comparisonNeq : List Value -> Eval Value
 comparisonNeq args cfg env =
     case args of
         [ Int li, Int ri ] ->
-            EvalResult.succeed (Bool (li /= ri))
+            boolResult (li /= ri)
 
         [ String ls, String rs ] ->
-            EvalResult.succeed (Bool (ls /= rs))
+            boolResult (ls /= rs)
 
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
@@ -436,10 +457,10 @@ comparisonLt : List Value -> Eval Value
 comparisonLt args cfg env =
     case args of
         [ Int li, Int ri ] ->
-            EvalResult.succeed (Bool (li < ri))
+            boolResult (li < ri)
 
         [ String ls, String rs ] ->
-            EvalResult.succeed (Bool (ls < rs))
+            boolResult (ls < rs)
 
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
@@ -453,10 +474,10 @@ comparisonGt : List Value -> Eval Value
 comparisonGt args cfg env =
     case args of
         [ Int li, Int ri ] ->
-            EvalResult.succeed (Bool (li > ri))
+            boolResult (li > ri)
 
         [ String ls, String rs ] ->
-            EvalResult.succeed (Bool (ls > rs))
+            boolResult (ls > rs)
 
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
@@ -470,10 +491,10 @@ comparisonLe : List Value -> Eval Value
 comparisonLe args cfg env =
     case args of
         [ Int li, Int ri ] ->
-            EvalResult.succeed (Bool (li <= ri))
+            boolResult (li <= ri)
 
         [ String ls, String rs ] ->
-            EvalResult.succeed (Bool (ls <= rs))
+            boolResult (ls <= rs)
 
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
@@ -487,10 +508,10 @@ comparisonGe : List Value -> Eval Value
 comparisonGe args cfg env =
     case args of
         [ Int li, Int ri ] ->
-            EvalResult.succeed (Bool (li >= ri))
+            boolResult (li >= ri)
 
         [ String ls, String rs ] ->
-            EvalResult.succeed (Bool (ls >= rs))
+            boolResult (ls >= rs)
 
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
