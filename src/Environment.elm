@@ -152,9 +152,14 @@ callKernel moduleName name env =
 
 call : ModuleName -> String -> Env -> Env
 call moduleName name env =
-    if moduleName == env.currentModule then
+    let
+        key : String
+        key =
+            moduleKey moduleName
+    in
+    if key == env.currentModuleKey then
         { currentModule = moduleName
-        , currentModuleKey = env.currentModuleKey
+        , currentModuleKey = key
         , callStack =
             { moduleName = moduleName, name = name }
                 :: env.callStack
@@ -166,11 +171,6 @@ call moduleName name env =
         }
 
     else
-        let
-            key : String
-            key =
-                moduleKey moduleName
-        in
         { currentModule = moduleName
         , currentModuleKey = key
         , callStack =
@@ -214,15 +214,15 @@ callKernelNoStack moduleName _ env =
 -}
 callNoStack : ModuleName -> String -> Env -> Env
 callNoStack moduleName _ env =
-    if moduleName == env.currentModule then
+    let
+        key : String
+        key =
+            moduleKey moduleName
+    in
+    if key == env.currentModuleKey then
         env
 
     else
-        let
-            key : String
-            key =
-                moduleKey moduleName
-        in
         { currentModule = moduleName
         , currentModuleKey = key
         , callStack = env.callStack
