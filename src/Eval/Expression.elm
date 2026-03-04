@@ -20,7 +20,7 @@ import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
-import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalResult(..), PartialEval, PartialResult, Value(..))
+import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalResult(..), Implementation(..), PartialEval, PartialResult, Value(..))
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -99,7 +99,7 @@ evalExpression initExpression initCfg initEnv =
                             evalCase caseExpr cfg env
 
                         Expression.LambdaExpression lambda ->
-                            Types.succeedPartial <| PartiallyApplied env [] lambda.args Nothing lambda.expression
+                            Types.succeedPartial <| PartiallyApplied env [] lambda.args Nothing (AstImpl lambda.expression)
 
                         Expression.RecordExpr fields ->
                             evalRecord fields cfg env
@@ -207,7 +207,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                         []
                                         function.arguments
                                         (Just { moduleName = env.currentModule, name = name })
-                                        function.expression
+                                        (AstImpl function.expression)
                                     )
 
                         Nothing ->
@@ -218,7 +218,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
             evalOrRecurse ( inner, cfg, env ) continuation
 
         Expression.LambdaExpression lambda ->
-            continuation (PartiallyApplied env [] lambda.args Nothing lambda.expression)
+            continuation (PartiallyApplied env [] lambda.args Nothing (AstImpl lambda.expression))
 
         Expression.RecordAccessFunction field ->
             continuation (evalRecordAccessFunction field)
@@ -263,7 +263,19 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                 Types.failPartial <| typeError env <| "|| applied to non-Bool " ++ Value.toString v
 
                             Nothing ->
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                -- Left complex: trampoline left, then short-circuit
+                                Types.recurseThen ( l, cfg, env )
+                                    (\lValue ->
+                                        case lValue of
+                                            Bool True ->
+                                                continuation (Bool True)
+
+                                            Bool False ->
+                                                Types.recurseThen ( r, cfg, env ) continuation
+
+                                            v ->
+                                                Types.failPartial <| typeError env <| "|| applied to non-Bool " ++ Value.toString v
+                                    )
 
                     "&&" ->
                         case evalSimple l env of
@@ -277,7 +289,19 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                 Types.failPartial <| typeError env <| "&& applied to non-Bool " ++ Value.toString v
 
                             Nothing ->
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                -- Left complex: trampoline left, then short-circuit
+                                Types.recurseThen ( l, cfg, env )
+                                    (\lValue ->
+                                        case lValue of
+                                            Bool False ->
+                                                continuation (Bool False)
+
+                                            Bool True ->
+                                                Types.recurseThen ( r, cfg, env ) continuation
+
+                                            v ->
+                                                Types.failPartial <| typeError env <| "&& applied to non-Bool " ++ Value.toString v
+                                    )
 
                     _ ->
                         case resolveOperator opName of
@@ -286,6 +310,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                     Just lValue ->
                                         case evalSimple r env of
                                             Just rValue ->
+                                                -- Both simple: fully inline
                                                 case kernelFn [ lValue, rValue ] cfg env of
                                                     EvOk v ->
                                                         continuation v
@@ -294,10 +319,34 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                                         Recursion.base err
 
                                             Nothing ->
-                                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                                -- Left simple, right complex: trampoline right only
+                                                Types.recurseThen ( r, cfg, env )
+                                                    (\rValue ->
+                                                        case kernelFn [ lValue, rValue ] cfg env of
+                                                            EvOk v ->
+                                                                continuation v
+
+                                                            err ->
+                                                                Recursion.base err
+                                                    )
 
                                     Nothing ->
-                                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                        case evalSimple r env of
+                                            Just rValue ->
+                                                -- Left complex, right simple: trampoline left only
+                                                Types.recurseThen ( l, cfg, env )
+                                                    (\lValue ->
+                                                        case kernelFn [ lValue, rValue ] cfg env of
+                                                            EvOk v ->
+                                                                continuation v
+
+                                                            err ->
+                                                                Recursion.base err
+                                                    )
+
+                                            Nothing ->
+                                                -- Both complex: full trampoline
+                                                Types.recurseThen ( fullExpr, cfg, env ) continuation
 
                             Nothing ->
                                 Types.recurseThen ( fullExpr, cfg, env ) continuation
@@ -777,7 +826,7 @@ kernelAppend args cfg env =
 evalApplication : Node Expression -> List (Node Expression) -> PartialEval Value
 evalApplication first rest cfg env =
     let
-        inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialResult Value
+        inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialResult Value
         inner localEnv oldArgs patterns maybeQualifiedName implementation =
             case ( oldArgs, rest ) of
                 ( [], [ singleArg ] ) ->
@@ -851,12 +900,12 @@ evalApplication first rest cfg env =
         )
 
 
-evalApplicationGeneralCompute : Node Expression -> List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
+evalApplicationGeneralCompute : Node Expression -> List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
 evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env =
     evalApplicationGeneral first rest oldArgs (List.length oldArgs) (List.length patterns) localEnv patterns maybeQualifiedName implementation cfg env
 
 
-evalApplicationGeneral : Node Expression -> List (Node Expression) -> List Value -> Int -> Int -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
+evalApplicationGeneral : Node Expression -> List (Node Expression) -> List Value -> Int -> Int -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
 evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env =
     let
         ( used, leftover ) =
@@ -902,7 +951,7 @@ evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv 
             )
 
 
-evalFullyApplied : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
+evalFullyApplied : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
 evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env =
     -- Fast path: if all patterns are simple VarPatterns or AllPatterns,
     -- bind directly via addValue instead of building an intermediate Dict.
@@ -960,10 +1009,52 @@ bindSimplePatternsHelp patterns args values =
             Nothing
 
 
-evalFullyAppliedWithEnv : Env -> List Value -> Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
+evalFullyAppliedWithEnv : Env -> List Value -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
 evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env =
     case implementation of
-        Node range (FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
+        KernelImpl moduleName name f ->
+            if cfg.trace then
+                let
+                    childEnv : Env
+                    childEnv =
+                        Environment.callKernel moduleName name env
+
+                    kernelEvalResult : EvalResult Value
+                    kernelEvalResult =
+                        f args cfg childEnv
+
+                    ( kernelResult, children, logLines ) =
+                        EvalResult.toTriple kernelEvalResult
+
+                    callTree : Rope CallTree
+                    callTree =
+                        Rope.singleton
+                            (CallNode
+                                { env = childEnv
+                                , expression =
+                                    fakeNode <|
+                                        Application <|
+                                            fakeNode (FunctionOrValue moduleName name)
+                                                :: List.map Value.toExpression args
+                                , result = kernelResult
+                                , children = children
+                                }
+                            )
+                in
+                (case kernelResult of
+                    Ok v ->
+                        EvOkTrace v callTree logLines
+
+                    Err e ->
+                        EvErrTrace e callTree logLines
+                )
+                    |> Recursion.base
+
+            else
+                Recursion.base (f args cfg env)
+
+        AstImpl (Node range (FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name)) ->
+            -- Fallback for AST-based kernel references (shouldn't happen often with KernelImpl)
             let
                 key : String
                 key =
@@ -1027,26 +1118,40 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                 boundEnv
 
 
-call : Maybe QualifiedNameRef -> Node Expression -> PartialEval Value
+call : Maybe QualifiedNameRef -> Implementation -> PartialEval Value
 call maybeQualifiedName implementation cfg env =
-    case maybeQualifiedName of
-        Just qualifiedName ->
-            let
-                callFn =
-                    if cfg.trace then
-                        Environment.call
+    case implementation of
+        AstImpl expr ->
+            case maybeQualifiedName of
+                Just qualifiedName ->
+                    let
+                        callFn =
+                            if cfg.trace then
+                                Environment.call
 
-                    else
-                        Environment.callNoStack
-            in
-            Recursion.recurse
-                ( implementation
-                , cfg
-                , callFn qualifiedName.moduleName qualifiedName.name env
-                )
+                            else
+                                Environment.callNoStack
+                    in
+                    Recursion.recurse
+                        ( expr
+                        , cfg
+                        , callFn qualifiedName.moduleName qualifiedName.name env
+                        )
 
-        Nothing ->
-            Recursion.recurse ( implementation, cfg, env )
+                Nothing ->
+                    Recursion.recurse ( expr, cfg, env )
+
+        KernelImpl moduleName name f ->
+            if cfg.trace then
+                let
+                    childEnv : Env
+                    childEnv =
+                        Environment.callKernel moduleName name env
+                in
+                Recursion.base (f [] cfg childEnv)
+
+            else
+                Recursion.base (f [] cfg env)
 
 
 evalFunctionOrValue : ModuleName -> String -> PartialEval Value
@@ -1090,7 +1195,7 @@ evalQualifiedOrVariant moduleName name cfg env =
                                 Environment.callNoStack
                     in
                     if List.isEmpty function.arguments then
-                        call (Just qualifiedNameRef) function.expression cfg env
+                        call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
 
                     else
                         PartiallyApplied
@@ -1098,7 +1203,7 @@ evalQualifiedOrVariant moduleName name cfg env =
                             []
                             function.arguments
                             (Just qualifiedNameRef)
-                            function.expression
+                            (AstImpl function.expression)
                             |> Types.succeedPartial
 
                 Nothing ->
@@ -1114,7 +1219,7 @@ evalQualifiedOrVariantSlow moduleName name cfg env =
         case findRecordAliasConstructor moduleName name env of
             Just ( resolvedModule, function ) ->
                 if List.isEmpty function.arguments then
-                    call (Just { moduleName = resolvedModule, name = name }) function.expression cfg env
+                    call (Just { moduleName = resolvedModule, name = name }) (AstImpl function.expression) cfg env
 
                 else
                     PartiallyApplied
@@ -1122,7 +1227,7 @@ evalQualifiedOrVariantSlow moduleName name cfg env =
                         []
                         function.arguments
                         (Just { moduleName = resolvedModule, name = name })
-                        function.expression
+                        (AstImpl function.expression)
                         |> Types.succeedPartial
 
             Nothing ->
@@ -1322,7 +1427,7 @@ evalNonVariant moduleName name cfg env =
                             if resolvedModuleKey == env.currentModuleKey then
                                 -- Same module: keep local values, use existing caches
                                 if List.isEmpty function.arguments then
-                                    call (Just qualifiedNameRef) function.expression cfg env
+                                    call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
 
                                 else
                                     let
@@ -1338,7 +1443,7 @@ evalNonVariant moduleName name cfg env =
                                         []
                                         function.arguments
                                         (Just qualifiedNameRef)
-                                        function.expression
+                                        (AstImpl function.expression)
                                         |> Types.succeedPartial
 
                             else
@@ -1378,7 +1483,7 @@ evalNonVariant moduleName name cfg env =
                                         []
                                         function.arguments
                                         (Just qualifiedNameRef)
-                                        function.expression
+                                        (AstImpl function.expression)
                                         |> Types.succeedPartial
 
                         Nothing ->
@@ -1461,32 +1566,17 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
         case bindSimplePatterns patterns oldArgs localEnv of
             Just boundEnv ->
                 case implementation of
-                    Node _ (Expression.FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
-                        let
-                            key : String
-                            key =
-                                Environment.moduleKey moduleName
-                        in
-                        case Dict.get key kernelFunctions of
-                            Nothing ->
-                                EvalResult.fail <| nameError localEnv (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
+                    KernelImpl moduleName name f ->
+                        if cfg.trace then
+                            f oldArgs
+                                cfg
+                                (Environment.callKernel moduleName name localEnv)
 
-                            Just kernelModule ->
-                                case Dict.get name kernelModule of
-                                    Nothing ->
-                                        EvalResult.fail <| nameError localEnv (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
+                        else
+                            f oldArgs cfg localEnv
 
-                                    Just ( _, f ) ->
-                                        if cfg.trace then
-                                            f oldArgs
-                                                cfg
-                                                (Environment.callKernel moduleName name localEnv)
-
-                                        else
-                                            f oldArgs cfg localEnv
-
-                    _ ->
-                        evalExpression implementation cfg boundEnv
+                    AstImpl expr ->
+                        evalExpression expr cfg boundEnv
 
             Nothing ->
                 let
@@ -1505,33 +1595,18 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
 
                     Ok (Just newBindings) ->
                         case implementation of
-                            Node _ (Expression.FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
-                                let
-                                    key : String
-                                    key =
-                                        Environment.moduleKey moduleName
-                                in
-                                case Dict.get key kernelFunctions of
-                                    Nothing ->
-                                        EvalResult.fail <| nameError localEnv (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
+                            KernelImpl moduleName name f ->
+                                if cfg.trace then
+                                    f oldArgs
+                                        cfg
+                                        (Environment.callKernel moduleName name localEnv)
 
-                                    Just kernelModule ->
-                                        case Dict.get name kernelModule of
-                                            Nothing ->
-                                                EvalResult.fail <| nameError localEnv (Syntax.qualifiedNameToString { moduleName = moduleName, name = name })
+                                else
+                                    f oldArgs cfg localEnv
 
-                                            Just ( _, f ) ->
-                                                if cfg.trace then
-                                                    f oldArgs
-                                                        cfg
-                                                        (Environment.callKernel moduleName name localEnv)
-
-                                                else
-                                                    f oldArgs cfg localEnv
-
-                            _ ->
+                            AstImpl expr ->
                                 -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
-                                evalExpression implementation
+                                evalExpression expr
                                     cfg
                                     (localEnv |> Environment.withBindings newBindings)
 
@@ -1591,7 +1666,7 @@ evalKernelFunctionWithKey key moduleName name cfg env =
                             []
                             (List.repeat argCount (fakeNode AllPattern))
                             (Just { moduleName = moduleName, name = name })
-                            (fakeNode <| Expression.FunctionOrValue moduleName name)
+                            (KernelImpl moduleName name f)
                             |> Types.succeedPartial
 
 
@@ -1627,7 +1702,7 @@ evalKernelFunctionFromAstWithKey key moduleName name cfg env =
                         []
                         function.arguments
                         (Just { moduleName = moduleName, name = name })
-                        function.expression
+                        (AstImpl function.expression)
                         |> Types.succeedPartial
 
 
@@ -1944,10 +2019,11 @@ evalRecordAccessFunction field =
         []
         [ fakeNode (VarPattern "$r") ]
         Nothing
-        (fakeNode <|
-            Expression.RecordAccess
-                (fakeNode <| Expression.FunctionOrValue [] "$r")
-                (fakeNode <| String.dropLeft 1 field)
+        (AstImpl <|
+            fakeNode <|
+                Expression.RecordAccess
+                    (fakeNode <| Expression.FunctionOrValue [] "$r")
+                    (fakeNode <| String.dropLeft 1 field)
         )
 
 
@@ -2006,12 +2082,13 @@ evalOperator opName cfg env =
                 []
                 [ fakeNode <| VarPattern "$l", fakeNode <| VarPattern "$r" ]
                 Nothing
-                (fakeNode <|
-                    Expression.Application
-                        [ fakeNode <| Expression.FunctionOrValue kernelFunction.moduleName kernelFunction.name
-                        , fakeNode <| Expression.FunctionOrValue [] "$l"
-                        , fakeNode <| Expression.FunctionOrValue [] "$r"
-                        ]
+                (AstImpl <|
+                    fakeNode <|
+                        Expression.Application
+                            [ fakeNode <| Expression.FunctionOrValue kernelFunction.moduleName kernelFunction.name
+                            , fakeNode <| Expression.FunctionOrValue [] "$l"
+                            , fakeNode <| Expression.FunctionOrValue [] "$r"
+                            ]
                 )
                 |> Types.succeedPartial
 

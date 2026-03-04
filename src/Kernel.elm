@@ -24,7 +24,7 @@ import Kernel.String
 import Kernel.Utils
 import Maybe.Extra
 import Syntax exposing (fakeNode)
-import Types exposing (Eval, EvalErrorData, EvalResult, Value(..))
+import Types exposing (Eval, EvalErrorData, EvalResult, Implementation(..), Value(..))
 import Value exposing (typeError)
 
 
@@ -32,7 +32,7 @@ type alias EvalFunction =
     List Value
     -> List (Node Pattern)
     -> Maybe QualifiedNameRef
-    -> Node Expression
+    -> Implementation
     -> Eval Value
 
 
@@ -705,7 +705,7 @@ partiallyApply moduleName args implementation =
                     , name = Node.value implementation.name
                     }
                 )
-                implementation.expression
+                (AstImpl implementation.expression)
 
 
 twoNumbers :

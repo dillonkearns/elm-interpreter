@@ -5,7 +5,7 @@ import Elm.Syntax.Expression as Expression exposing (Expression)
 import Elm.Syntax.Node exposing (Node)
 import FastDict as Dict
 import Syntax exposing (fakeNode)
-import Types exposing (Env, EvalErrorData, EvalErrorKind(..), Value(..))
+import Types exposing (Env, EvalErrorData, EvalErrorKind(..), Implementation(..), Value(..))
 
 
 typeError : Env -> String -> EvalErrorData
@@ -113,21 +113,34 @@ toExpression value =
                     |> Expression.Application
 
             PartiallyApplied _ [] patterns Nothing implementation ->
-                Expression.LambdaExpression
-                    { args = patterns
-                    , expression = implementation
-                    }
+                case implementation of
+                    AstImpl expr ->
+                        Expression.LambdaExpression
+                            { args = patterns
+                            , expression = expr
+                            }
+
+                    KernelImpl moduleName name _ ->
+                        Expression.FunctionOrValue moduleName name
 
             PartiallyApplied _ args patterns Nothing implementation ->
-                (fakeNode
-                    (Expression.LambdaExpression
-                        { args = patterns
-                        , expression = implementation
-                        }
-                    )
-                    :: List.map toExpression args
-                )
-                    |> Expression.Application
+                case implementation of
+                    AstImpl expr ->
+                        (fakeNode
+                            (Expression.LambdaExpression
+                                { args = patterns
+                                , expression = expr
+                                }
+                            )
+                            :: List.map toExpression args
+                        )
+                            |> Expression.Application
+
+                    KernelImpl moduleName name _ ->
+                        (fakeNode (Expression.FunctionOrValue moduleName name)
+                            :: List.map toExpression args
+                        )
+                            |> Expression.Application
 
 
 arrayToExpression : String -> List Value -> Expression

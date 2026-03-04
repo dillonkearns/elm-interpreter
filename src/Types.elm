@@ -1,4 +1,4 @@
-module Types exposing (CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), ImportedNames, PartialEval, PartialResult, Value(..))
+module Types exposing (CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, PartialEval, PartialResult, Value(..))
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -63,9 +63,17 @@ type Value
     | Triple Value Value Value
     | Record (Dict String Value)
     | Custom QualifiedNameRef (List Value)
-    | PartiallyApplied Env (List Value) (List (Node Pattern)) (Maybe QualifiedNameRef) (Node Expression)
+    | PartiallyApplied Env (List Value) (List (Node Pattern)) (Maybe QualifiedNameRef) Implementation
     | JsArray (Array Value)
     | List (List Value)
+
+
+{-| Function implementation: either an AST expression to evaluate,
+or a pre-resolved kernel function that can be called directly.
+-}
+type Implementation
+    = AstImpl (Node Expression)
+    | KernelImpl ModuleName String (List Value -> Eval Value)
 
 
 type alias Env =
