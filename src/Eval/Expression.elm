@@ -401,6 +401,12 @@ resolveOperator opName =
 comparisonEq : List Value -> Eval Value
 comparisonEq args cfg env =
     case args of
+        [ Int li, Int ri ] ->
+            EvalResult.succeed (Bool (li == ri))
+
+        [ String ls, String rs ] ->
+            EvalResult.succeed (Bool (ls == rs))
+
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
                 |> EvalResult.map (\order -> Bool (order == EQ))
@@ -412,6 +418,12 @@ comparisonEq args cfg env =
 comparisonNeq : List Value -> Eval Value
 comparisonNeq args cfg env =
     case args of
+        [ Int li, Int ri ] ->
+            EvalResult.succeed (Bool (li /= ri))
+
+        [ String ls, String rs ] ->
+            EvalResult.succeed (Bool (ls /= rs))
+
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
                 |> EvalResult.map (\order -> Bool (order /= EQ))
@@ -423,6 +435,12 @@ comparisonNeq args cfg env =
 comparisonLt : List Value -> Eval Value
 comparisonLt args cfg env =
     case args of
+        [ Int li, Int ri ] ->
+            EvalResult.succeed (Bool (li < ri))
+
+        [ String ls, String rs ] ->
+            EvalResult.succeed (Bool (ls < rs))
+
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
                 |> EvalResult.map (\order -> Bool (order == LT))
@@ -434,6 +452,12 @@ comparisonLt args cfg env =
 comparisonGt : List Value -> Eval Value
 comparisonGt args cfg env =
     case args of
+        [ Int li, Int ri ] ->
+            EvalResult.succeed (Bool (li > ri))
+
+        [ String ls, String rs ] ->
+            EvalResult.succeed (Bool (ls > rs))
+
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
                 |> EvalResult.map (\order -> Bool (order == GT))
@@ -445,6 +469,12 @@ comparisonGt args cfg env =
 comparisonLe : List Value -> Eval Value
 comparisonLe args cfg env =
     case args of
+        [ Int li, Int ri ] ->
+            EvalResult.succeed (Bool (li <= ri))
+
+        [ String ls, String rs ] ->
+            EvalResult.succeed (Bool (ls <= rs))
+
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
                 |> EvalResult.map (\order -> Bool (order /= GT))
@@ -456,6 +486,12 @@ comparisonLe args cfg env =
 comparisonGe : List Value -> Eval Value
 comparisonGe args cfg env =
     case args of
+        [ Int li, Int ri ] ->
+            EvalResult.succeed (Bool (li >= ri))
+
+        [ String ls, String rs ] ->
+            EvalResult.succeed (Bool (ls >= rs))
+
         [ l, r ] ->
             Kernel.Utils.compare l r cfg env
                 |> EvalResult.map (\order -> Bool (order /= LT))
