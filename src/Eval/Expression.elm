@@ -498,21 +498,21 @@ evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg en
 
         Nothing ->
             let
-                maybeNewEnvValues : Result EvalErrorData (Maybe EnvValues)
-                maybeNewEnvValues =
+                maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
+                maybeNewBindings =
                     match env
                         (fakeNode <| ListPattern patterns)
                         (List args)
             in
-            case maybeNewEnvValues of
+            case maybeNewBindings of
                 Err e ->
                     Types.failPartial e
 
                 Ok Nothing ->
                     Types.failPartial <| typeError env "Could not match lambda patterns"
 
-                Ok (Just newEnvValues) ->
-                    evalFullyAppliedWithEnv (Environment.with newEnvValues localEnv) args maybeQualifiedName implementation cfg env
+                Ok (Just newBindings) ->
+                    evalFullyAppliedWithEnv (Environment.withBindings newBindings localEnv) args maybeQualifiedName implementation cfg env
 
 
 {-| Try to bind all patterns directly via addValue. Returns Just the new env
@@ -1076,20 +1076,20 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
 
             Nothing ->
                 let
-                    maybeNewEnvValues : Result EvalErrorData (Maybe EnvValues)
-                    maybeNewEnvValues =
+                    maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
+                    maybeNewBindings =
                         match localEnv
                             (Node (Range.combine (List.map Node.range patterns)) <| ListPattern patterns)
                             (List oldArgs)
                 in
-                case maybeNewEnvValues of
+                case maybeNewBindings of
                     Err e ->
                         EvalResult.fail e
 
                     Ok Nothing ->
                         EvalResult.fail <| typeError localEnv "Could not match lambda patterns"
 
-                    Ok (Just newEnvValues) ->
+                    Ok (Just newBindings) ->
                         case implementation of
                             Node _ (Expression.FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name) ->
                                 let
@@ -1119,7 +1119,7 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                 -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
                                 evalExpression implementation
                                     cfg
-                                    (localEnv |> Environment.with newEnvValues)
+                                    (localEnv |> Environment.withBindings newBindings)
 
 
 evalKernelFunction : ModuleName -> String -> PartialEval Value
@@ -1375,8 +1375,8 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                             Ok Nothing ->
                                 Err <| typeError env "Could not match pattern inside let"
 
-                            Ok (Just patternEnv) ->
-                                Ok (Environment.with patternEnv env)
+                            Ok (Just patternBindings) ->
+                                Ok (Environment.withBindings patternBindings env)
                     )
 
 
@@ -1621,7 +1621,7 @@ evalCase { expression, cases } cfg env =
     evalOrRecurse ( expression, cfg, env )
         (\exprValue ->
             let
-                maybePartial : Result EvalErrorData (Maybe ( EnvValues, Node Expression ))
+                maybePartial : Result EvalErrorData (Maybe ( List ( String, Value ), Node Expression ))
                 maybePartial =
                     Result.MyExtra.combineFoldl
                         (\( pattern, branchExpression ) acc ->
@@ -1647,16 +1647,17 @@ evalCase { expression, cases } cfg env =
                 Ok Nothing ->
                     Types.failPartial <| typeError env <| "Missing case branch for " ++ Value.toString exprValue
 
-                Ok (Just ( additionalEnv, branchExpression )) ->
-                    if Dict.isEmpty additionalEnv then
-                        Recursion.recurse ( branchExpression, cfg, env )
+                Ok (Just ( additionalBindings, branchExpression )) ->
+                    case additionalBindings of
+                        [] ->
+                            Recursion.recurse ( branchExpression, cfg, env )
 
-                    else
-                        Recursion.recurse
-                            ( branchExpression
-                            , cfg
-                            , Environment.with additionalEnv env
-                            )
+                        _ ->
+                            Recursion.recurse
+                                ( branchExpression
+                                , cfg
+                                , Environment.withBindings additionalBindings env
+                                )
 
                 Err e ->
                     Types.failPartial e
@@ -1686,31 +1687,31 @@ matchAndThen f v =
             f w
 
 
-match : Env -> Node Pattern -> Value -> Result EvalErrorData (Maybe EnvValues)
+match : Env -> Node Pattern -> Value -> Result EvalErrorData (Maybe (List ( String, Value )))
 match env (Node _ pattern) value =
     case ( pattern, value ) of
         ( UnitPattern, Unit ) ->
-            matchOk Dict.empty
+            matchOkEmpty
 
         ( UnitPattern, _ ) ->
             matchNoMatch
 
         ( AllPattern, _ ) ->
-            matchOk Dict.empty
+            matchOkEmpty
 
         ( ParenthesizedPattern subPattern, _ ) ->
             match env subPattern value
 
         ( NamedPattern { name } [], Bool True ) ->
             if name == "True" then
-                matchOk Dict.empty
+                matchOkEmpty
 
             else
                 matchNoMatch
 
         ( NamedPattern { name } [], Bool False ) ->
             if name == "False" then
-                matchOk Dict.empty
+                matchOkEmpty
 
             else
                 matchNoMatch
@@ -1722,7 +1723,7 @@ match env (Node _ pattern) value =
                 case ( argsPatterns, args ) of
                     ( [], [] ) ->
                         -- Zero-arg constructor like True, False, Nothing
-                        matchOk Dict.empty
+                        matchOkEmpty
 
                     ( [ singlePattern ], [ singleArg ] ) ->
                         -- Single-arg constructor like Just x, Ok x — very common
@@ -1731,25 +1732,25 @@ match env (Node _ pattern) value =
                     _ ->
                         let
                             matchNamedPatternHelper :
-                                EnvValues
+                                List ( String, Value )
                                 -> ( List (Node Pattern), List Value )
-                                -> Result EvalErrorData (Maybe EnvValues)
-                            matchNamedPatternHelper envValues queue =
+                                -> Result EvalErrorData (Maybe (List ( String, Value )))
+                            matchNamedPatternHelper bindings queue =
                                 case queue of
                                     ( [], [] ) ->
-                                        matchOk envValues
+                                        matchOk bindings
 
                                     ( patternHead :: patternTail, argHead :: argTail ) ->
                                         match env patternHead argHead
                                             |> matchAndThen
-                                                (\newEnvValues ->
-                                                    matchNamedPatternHelper (Dict.union newEnvValues envValues) ( patternTail, argTail )
+                                                (\newBindings ->
+                                                    matchNamedPatternHelper (newBindings ++ bindings) ( patternTail, argTail )
                                                 )
 
                                     _ ->
                                         Err <| typeError env "Mismatched number of arguments to variant"
                         in
-                        matchNamedPatternHelper Dict.empty ( argsPatterns, args )
+                        matchNamedPatternHelper [] ( argsPatterns, args )
 
             else
                 matchNoMatch
@@ -1758,21 +1759,20 @@ match env (Node _ pattern) value =
             matchNoMatch
 
         ( ListPattern patterns, List values ) ->
-            matchListHelp env Dict.empty patterns values
+            matchListHelp env [] patterns values
 
         ( UnConsPattern (Node _ (VarPattern headName)) (Node _ (VarPattern tailName)), List (listHead :: listTail) ) ->
             -- Fast path: x :: xs with VarPatterns — avoid match calls
-            matchOk <| Dict.insert tailName (List listTail) (Dict.singleton headName listHead)
+            matchOk [ ( headName, listHead ), ( tailName, List listTail ) ]
 
         ( UnConsPattern patternHead patternTail, List (listHead :: listTail) ) ->
             match env patternHead listHead
                 |> matchAndThen
-                    (\headEnv ->
+                    (\headBindings ->
                         match env patternTail (List listTail)
                             |> matchAndThen
-                                (\tailEnv ->
-                                    matchOk
-                                        (Dict.union headEnv tailEnv)
+                                (\tailBindings ->
+                                    matchOk (headBindings ++ tailBindings)
                                 )
                     )
 
@@ -1780,14 +1780,14 @@ match env (Node _ pattern) value =
             matchNoMatch
 
         ( VarPattern name, _ ) ->
-            matchOk <| Dict.singleton name value
+            matchOk [ ( name, value ) ]
 
         ( ListPattern _, _ ) ->
             matchNoMatch
 
         ( CharPattern c, Char d ) ->
             if c == d then
-                matchOk Dict.empty
+                matchOkEmpty
 
             else
                 matchNoMatch
@@ -1797,7 +1797,7 @@ match env (Node _ pattern) value =
 
         ( StringPattern c, String d ) ->
             if c == d then
-                matchOk Dict.empty
+                matchOkEmpty
 
             else
                 matchNoMatch
@@ -1807,7 +1807,7 @@ match env (Node _ pattern) value =
 
         ( IntPattern c, Int d ) ->
             if c == d then
-                matchOk Dict.empty
+                matchOkEmpty
 
             else
                 matchNoMatch
@@ -1817,7 +1817,7 @@ match env (Node _ pattern) value =
 
         ( HexPattern c, Int d ) ->
             if c == d then
-                matchOk Dict.empty
+                matchOkEmpty
 
             else
                 matchNoMatch
@@ -1827,7 +1827,7 @@ match env (Node _ pattern) value =
 
         ( FloatPattern c, Float d ) ->
             if c == d then
-                matchOk Dict.empty
+                matchOkEmpty
 
             else
                 matchNoMatch
@@ -1837,34 +1837,34 @@ match env (Node _ pattern) value =
 
         ( TuplePattern [ Node _ (VarPattern lname), Node _ (VarPattern rname) ], Tuple lvalue rvalue ) ->
             -- Fast path: two VarPatterns — avoid match calls entirely
-            matchOk <| Dict.insert rname rvalue (Dict.singleton lname lvalue)
+            matchOk [ ( lname, lvalue ), ( rname, rvalue ) ]
 
         ( TuplePattern [ lpattern, rpattern ], Tuple lvalue rvalue ) ->
             match env lpattern lvalue
                 |> matchAndThen
-                    (\lenv ->
+                    (\lbindings ->
                         match env rpattern rvalue
                             |> matchAndThen
-                                (\renv ->
-                                    matchOk <| Dict.union lenv renv
+                                (\rbindings ->
+                                    matchOk (lbindings ++ rbindings)
                                 )
                     )
 
         ( TuplePattern [ Node _ (VarPattern lname), Node _ (VarPattern mname), Node _ (VarPattern rname) ], Triple lvalue mvalue rvalue ) ->
             -- Fast path: three VarPatterns — avoid match calls entirely
-            matchOk <| Dict.insert rname rvalue (Dict.insert mname mvalue (Dict.singleton lname lvalue))
+            matchOk [ ( lname, lvalue ), ( mname, mvalue ), ( rname, rvalue ) ]
 
         ( TuplePattern [ lpattern, mpattern, rpattern ], Triple lvalue mvalue rvalue ) ->
             match env lpattern lvalue
                 |> matchAndThen
-                    (\lenv ->
+                    (\lbindings ->
                         match env mpattern mvalue
                             |> matchAndThen
-                                (\menv ->
+                                (\mbindings ->
                                     match env rpattern rvalue
                                         |> matchAndThen
-                                            (\renv ->
-                                                matchOk <| Dict.union lenv (Dict.union menv renv)
+                                            (\rbindings ->
+                                                matchOk (lbindings ++ mbindings ++ rbindings)
                                             )
                                 )
                     )
@@ -1875,7 +1875,7 @@ match env (Node _ pattern) value =
         ( AsPattern childPattern (Node _ asName), _ ) ->
             match env childPattern value
                 |> matchAndThen
-                    (\e -> matchOk <| Dict.insert asName value e)
+                    (\bindings -> matchOk (( asName, value ) :: bindings))
 
         ( RecordPattern fields, Record fieldValues ) ->
             List.foldl
@@ -1887,17 +1887,25 @@ match env (Node _ pattern) value =
                                     Err <| typeError env <| "Field " ++ fieldName ++ " not found in record"
 
                                 Just fieldValue ->
-                                    matchOk <| Dict.insert fieldName fieldValue acc
+                                    matchOk (( fieldName, fieldValue ) :: acc)
                         )
                 )
-                (matchOk Dict.empty)
+                matchOkEmpty
                 fields
 
         ( RecordPattern _, _ ) ->
             matchNoMatch
 
 
-matchListHelp : Env -> EnvValues -> List (Node Pattern) -> List Value -> Result EvalErrorData (Maybe EnvValues)
+{-| Cached constant for pattern matches with no bindings.
+Avoids allocating Ok(Just []) on every literal/unit/wildcard match.
+-}
+matchOkEmpty : Result error (Maybe (List a))
+matchOkEmpty =
+    Ok (Just [])
+
+
+matchListHelp : Env -> List ( String, Value ) -> List (Node Pattern) -> List Value -> Result EvalErrorData (Maybe (List ( String, Value )))
 matchListHelp env acc patterns values =
     case ( patterns, values ) of
         ( [], [] ) ->
@@ -1911,8 +1919,8 @@ matchListHelp env acc patterns values =
                 Ok Nothing ->
                     Ok Nothing
 
-                Ok (Just headEnv) ->
-                    matchListHelp env (Dict.union headEnv acc) patternTail valueTail
+                Ok (Just headBindings) ->
+                    matchListHelp env (headBindings ++ acc) patternTail valueTail
 
         _ ->
             Ok Nothing

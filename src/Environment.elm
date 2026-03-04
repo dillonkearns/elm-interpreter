@@ -1,4 +1,4 @@
-module Environment exposing (addFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, replaceValues, with)
+module Environment exposing (addFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, replaceValues, with, withBindings)
 
 import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -98,6 +98,22 @@ with newValues old =
     , functions = old.functions
     , currentModuleFunctions = old.currentModuleFunctions
     , values = Dict.union newValues old.values
+    , imports = old.imports
+    , moduleImports = old.moduleImports
+    }
+
+
+{-| Add a list of bindings to env.values. Used by match results to avoid
+building an intermediate Dict that would just be unioned into values anyway.
+-}
+withBindings : List ( String, Value ) -> Env -> Env
+withBindings bindings old =
+    { currentModule = old.currentModule
+    , currentModuleKey = old.currentModuleKey
+    , callStack = old.callStack
+    , functions = old.functions
+    , currentModuleFunctions = old.currentModuleFunctions
+    , values = List.foldl (\( k, v ) acc -> Dict.insert k v acc) old.values bindings
     , imports = old.imports
     , moduleImports = old.moduleImports
     }
