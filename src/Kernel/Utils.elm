@@ -206,6 +206,12 @@ innerCompare l r env =
         ( PartiallyApplied _ _ _ _ _, _ ) ->
             uncomparable ()
 
+        ( JsonValue _, _ ) ->
+            Err <| typeError env "Cannot compare JSON values"
+
+        ( JsonDecoderValue _, _ ) ->
+            Err <| typeError env "Cannot compare JSON decoders"
+
 
 compareListHelp : List Value -> List Value -> Env -> Result EvalErrorData Order
 compareListHelp ll rl env =
