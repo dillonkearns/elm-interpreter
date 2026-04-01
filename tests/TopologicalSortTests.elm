@@ -68,6 +68,9 @@ cyclicGraphTest =
         , sortTest "Illegal cycle"
             [ ( "a()", "b" ), ( "b", "c" ), ( "c()", "a" ) ]
             (Err TopologicalSort.IllegalCycle)
+        , sortTest "Illegal cycle hidden behind function in path"
+            [ ( "a()", "b" ), ( "b()", "c" ), ( "c", "a" ) ]
+            (Err TopologicalSort.IllegalCycle)
         ]
 
 
