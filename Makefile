@@ -28,8 +28,8 @@ build/src/%/elm.json: build/%.tar.gz
 	tar -xf $< --strip-components=1 -C $(@D) -m
 
 $(KERNEL_PATH)/src/Elm/Kernel/List.elm: $(wildcard codegen/Elm/Kernel/*.elm)
-	mkdir -p $(KERNEL_PATH)/src
-	cp -r codegen/Elm $(KERNEL_PATH)/src
+	mkdir -p $(KERNEL_PATH)/src/Elm
+	cp -r codegen/Elm/Kernel $(KERNEL_PATH)/src/Elm/
 
 ALL_GENERATED = $(shell find generated -type f -name '*.elm')
 ALL_SRC = $(shell find src -type f -name '*.elm')

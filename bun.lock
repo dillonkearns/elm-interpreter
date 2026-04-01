@@ -4,7 +4,7 @@
   "workspaces": {
     "": {
       "devDependencies": {
-        "elm-codegen": "^0.6.1",
+        "elm-codegen": "^0.6.3",
         "elm-pages": "^3.0.27",
         "elm-review": "^2.13.5",
         "elm-test-rs": "^3.0.1-0",
@@ -331,7 +331,7 @@
 
     "ee-first": ["ee-first@1.1.1", "", {}, "sha512-WMwm9LhRUo+WUaRN+vRuETqG89IgZphVSNkdFgeb6sS/E4OrDIN7t48CAewSHXc6C8lefD8KKfr5vY61brQlow=="],
 
-    "elm-codegen": ["elm-codegen@0.6.1", "", { "dependencies": { "chalk": "^4.1.1", "chokidar": "^3.5.1", "commander": "^8.3.0", "node-elm-compiler": "^5.0.6" }, "bin": { "elm-codegen": "bin/elm-codegen" } }, "sha512-mbVmK4fqW+wtYzTZhJSuT42KrQZMRTueYerCvo09sO5v7QdDGw3qeG/rL1vLH0q2GJF44lXhyBo4lv6azSBOQQ=="],
+    "elm-codegen": ["elm-codegen@0.6.3", "", { "dependencies": { "chalk": "^4.1.1", "chokidar": "^3.5.1", "commander": "^8.3.0", "node-elm-compiler": "^5.0.6" }, "bin": { "elm-codegen": "bin/elm-codegen" } }, "sha512-X9S7ltwF78gjOmL5Rl79sMszMJlsBh44VwSXBgUah8vkobkRog2yfyMmMzyZmac/hzoRTP6Z98FFJY4A/xtUpQ=="],
 
     "elm-doc-preview": ["elm-doc-preview@6.0.1", "", { "dependencies": { "chalk": "^5.3.0", "chokidar": "^3.6.0", "commander": "^12.1.0", "cross-spawn": "^7.0.6", "express": "^4.21.2", "express-ws": "^5.0.2", "glob": "^11.0.0", "latest-version": "^9.0.0", "open": "^10.1.0", "serve-index": "^1.9.1", "serve-static": "^1.16.2", "tmp": "0.2.3", "ws": "^8.18.0" }, "bin": { "edp": "cli.js", "elm-doc-preview": "cli.js" } }, "sha512-G/xgVRKpbLuqliQmBINQFE6I0YAwqET2+SabiyXE47kaVChkhIz91HlZudUvCzTG/CV2ci7AERtAwYzQ4bjOKA=="],
 
