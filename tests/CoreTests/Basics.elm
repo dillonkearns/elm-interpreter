@@ -2,8 +2,10 @@ module CoreTests.Basics exposing (suite)
 
 import Array
 import Dict
+import Eval
+import Expect
 import Set
-import Test exposing (Test, describe)
+import Test exposing (Test, describe, test)
 import TestUtils exposing (evalTest, evalTest_, list)
 import Types exposing (Value(..))
 import Value
@@ -96,6 +98,18 @@ suite =
                 , evalTest_ "-1 |> remainderBy 4" Int <| (-1 |> remainderBy 4)
                 , evalTest_ "modBy 2 7" Int <| modBy 2 7
                 , evalTest_ "modBy 4 -1" Int <| modBy 4 -1
+                , test "modBy 0 crashes" <|
+                    \_ ->
+                        Eval.eval "modBy 0 5"
+                            |> Expect.err
+                , test "remainderBy 0 crashes" <|
+                    \_ ->
+                        Eval.eval "remainderBy 0 5"
+                            |> Expect.err
+                , test "integer division by zero crashes" <|
+                    \_ ->
+                        Eval.eval "5 // 0"
+                            |> Expect.err
                 , evalTest_ "3 ^ 2" Float <| 3 ^ 2
                 , evalTest_ "sqrt 81" Float <| sqrt 81
                 , evalTest_ "negate 42" Float <| negate 42

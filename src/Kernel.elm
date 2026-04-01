@@ -17,6 +17,7 @@ import Elm.Syntax.Pattern exposing (Pattern(..), QualifiedNameRef)
 import Environment
 import EvalResult
 import FastDict as Dict exposing (Dict)
+import Kernel.Basics
 import Kernel.Debug
 import Kernel.JsArray
 import Kernel.List
@@ -51,17 +52,17 @@ functions evalFunction =
         , ( "e", constant float e )
         , ( "fdiv", two float float to float (/) Core.Basics.fdiv )
         , ( "floor", one float to int floor Core.Basics.floor )
-        , ( "idiv", two int int to int (//) Core.Basics.idiv )
+        , ( "idiv", twoWithError int int to int Kernel.Basics.idiv Core.Basics.idiv )
         , ( "isInfinite", one float to bool isInfinite Core.Basics.isInfinite )
         , ( "isNaN", one float to bool isNaN Core.Basics.isNaN )
         , ( "log", one float to float (logBase e) log )
-        , ( "modBy", two int int to int modBy Core.Basics.modBy )
+        , ( "modBy", twoWithError int int to int Kernel.Basics.modBy Core.Basics.modBy )
         , ( "mul", twoNumbers (*) (*) Core.Basics.mul )
         , ( "not", one bool to bool not Core.Basics.not )
         , ( "or", two bool bool to bool (||) Core.Basics.or )
         , ( "pi", constant float pi )
         , ( "pow", twoNumbers (^) (^) Core.Basics.pow )
-        , ( "remainderBy", two int int to int remainderBy Core.Basics.remainderBy )
+        , ( "remainderBy", twoWithError int int to int Kernel.Basics.remainderBy Core.Basics.remainderBy )
         , ( "round", one float to int round Core.Basics.round )
         , ( "sin", one float to float sin Core.Basics.sin )
         , ( "sqrt", one float to float sqrt Core.Basics.sqrt )
