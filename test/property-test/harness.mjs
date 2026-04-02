@@ -8,6 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const generatedDir = path.join(__dirname, 'generated');
 const manifestPath = path.join(generatedDir, 'manifest.json');
 const interpreterJsPath = path.join(__dirname, 'runner', 'interpreter.js');
+const multiRunnerJsPath = path.join(__dirname, 'runner', 'multi-runner.js');
 
 async function main() {
   if (!fs.existsSync(manifestPath)) {
@@ -20,26 +21,39 @@ async function main() {
     process.exit(1);
   }
 
-  const moduleNames = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   const interpreterJs = fs.readFileSync(interpreterJsPath, 'utf8');
   const interpreterScript = new vm.Script(interpreterJs, { filename: 'interpreter.js' });
 
-  console.log(`Running property tests for ${moduleNames.length} generated programs...\n`);
+  // Load multi-module runner if available
+  let multiRunnerScript = null;
+  if (fs.existsSync(multiRunnerJsPath)) {
+    const multiRunnerJs = fs.readFileSync(multiRunnerJsPath, 'utf8');
+    multiRunnerScript = new vm.Script(multiRunnerJs, { filename: 'multi-runner.js' });
+  }
+
+  console.log(`Running property tests for ${manifest.length} generated programs...\n`);
 
   let passed = 0;
   let failed = 0;
   const failures = [];
 
-  for (const moduleName of moduleNames) {
+  for (const entry of manifest) {
+    const isMulti = typeof entry === 'object' && entry.main;
+    const displayName = isMulti ? `${entry.main} (multi)` : entry;
+
     try {
-      const result = await runPropertyTest(moduleName, interpreterScript);
+      const result = isMulti
+        ? await runMultiModuleTest(entry, interpreterScript, multiRunnerScript)
+        : await runPropertyTest(entry, interpreterScript);
+
       if (result.match) {
         passed++;
-        process.stdout.write(`  ${moduleName}: PASS\n`);
+        process.stdout.write(`  ${displayName}: PASS\n`);
       } else {
         failed++;
         failures.push(result);
-        process.stdout.write(`  ${moduleName}: FAIL\n`);
+        process.stdout.write(`  ${displayName}: FAIL\n`);
         if (result.compileError) {
           console.log(`    Compile error: ${result.compileError}`);
         }
@@ -56,12 +70,12 @@ async function main() {
       }
     } catch (e) {
       failed++;
-      failures.push({ moduleName, error: e.message });
-      process.stdout.write(`  ${moduleName}: ERROR - ${e.message}\n`);
+      failures.push({ moduleName: displayName, error: e.message });
+      process.stdout.write(`  ${displayName}: ERROR - ${e.message}\n`);
     }
   }
 
-  console.log(`\nResults: ${passed} passed, ${failed} failed out of ${moduleNames.length} total`);
+  console.log(`\nResults: ${passed} passed, ${failed} failed out of ${manifest.length} total`);
 
   if (failed > 0) {
     console.log('\nFailures:');
@@ -149,6 +163,95 @@ async function runPropertyTest(moduleName, interpreterScript) {
   };
 }
 
+async function runMultiModuleTest(entry, interpreterScript, multiRunnerScript) {
+  const { main: mainModuleName, helpers } = entry;
+  const moduleName = mainModuleName;
+  const mainFile = path.join(generatedDir, 'src', `${mainModuleName}.elm`);
+  const distDir = path.join(generatedDir, 'dist');
+
+  fs.mkdirSync(distDir, { recursive: true });
+
+  // 1. Compile main module with elm make (it will find helpers automatically)
+  const compiledJsPath = path.join(distDir, `${mainModuleName}.js`);
+  try {
+    execSync(
+      `elm make ${mainFile} --output=${compiledJsPath}`,
+      { cwd: path.join(__dirname), stdio: 'pipe' }
+    );
+  } catch (e) {
+    return {
+      moduleName,
+      match: false,
+      compileError: e.stderr ? e.stderr.toString().slice(0, 500) : e.message,
+    };
+  }
+
+  // 2. Run compiled Elm
+  let elmOutput;
+  let elmError;
+  try {
+    const compiledJs = fs.readFileSync(compiledJsPath, 'utf8');
+    elmOutput = await runElmInSandbox(compiledJs, mainModuleName);
+  } catch (e) {
+    elmError = e.message;
+  }
+
+  // 3. Run through multi-module interpreter
+  let interpreterOutput;
+  let interpreterError;
+
+  if (!multiRunnerScript) {
+    interpreterError = 'Multi-module runner not compiled';
+  } else {
+    try {
+      // Read all source files: helpers first, then main
+      const sources = [];
+      for (const helper of helpers) {
+        sources.push(fs.readFileSync(path.join(generatedDir, 'src', `${helper}.elm`), 'utf8'));
+      }
+      sources.push(fs.readFileSync(mainFile, 'utf8'));
+
+      interpreterOutput = await runMultiInterpreter(multiRunnerScript, sources);
+    } catch (e) {
+      interpreterError = e.message;
+    }
+  }
+
+  // 4. Clean up
+  try { fs.unlinkSync(compiledJsPath); } catch (_) {}
+
+  // 5. Compare
+  if (elmError || interpreterError) {
+    return {
+      moduleName,
+      match: false,
+      elmOutput,
+      interpreterOutput,
+      elmError,
+      interpreterError,
+    };
+  }
+
+  if (interpreterOutput && interpreterOutput.startsWith('INTERPRETER_')) {
+    return {
+      moduleName,
+      match: false,
+      elmOutput,
+      interpreterOutput,
+      interpreterError: interpreterOutput,
+    };
+  }
+
+  const match = elmOutput === interpreterOutput;
+  return {
+    moduleName,
+    match,
+    elmOutput,
+    interpreterOutput,
+    mismatch: !match,
+  };
+}
+
 function runElmInSandbox(jsSource, moduleName) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -206,6 +309,37 @@ function runInterpreter(interpreterScript, source) {
       interpreterScript.runInContext(context);
 
       const app = sandbox.Elm.InterpreterRunner.init({ flags: source });
+      app.ports.output.subscribe((value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      });
+    } catch (e) {
+      clearTimeout(timeout);
+      reject(e);
+    }
+  });
+}
+
+function runMultiInterpreter(multiRunnerScript, sources) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Multi-module interpreter timeout'));
+    }, 30000);
+
+    try {
+      const sandbox = {
+        setTimeout: globalThis.setTimeout,
+        clearTimeout: globalThis.clearTimeout,
+        setInterval: globalThis.setInterval,
+        clearInterval: globalThis.clearInterval,
+        console: { log() {}, warn() {}, error() {} },
+      };
+
+      const context = vm.createContext(sandbox);
+      multiRunnerScript.runInContext(context);
+
+      const flagsJson = JSON.stringify(sources);
+      const app = sandbox.Elm.MultiModuleRunner.init({ flags: flagsJson });
       app.ports.output.subscribe((value) => {
         clearTimeout(timeout);
         resolve(value);
