@@ -1,6 +1,7 @@
 module EndToEnd exposing (suite)
 
 import Elm.Syntax.Expression as Expression
+import Eval
 import Eval.Module
 import Expect
 import Array
@@ -39,6 +40,7 @@ suite =
         , sortStabilityTests
         , debugToStringTests
         , parserEdgeCaseTests
+        , stepLimitTests
         ]
 
 
@@ -733,4 +735,25 @@ parserEdgeCaseTests =
             "List.sum [5, -3, -1]"
             Int
             1
+        ]
+
+
+stepLimitTests : Test
+stepLimitTests =
+    describe "step limits"
+        [ test "evaluation fails when step limit is exceeded" <|
+            \_ ->
+                Eval.evalWithMaxSteps (Just 10)
+                    "let loop n = if n <= 0 then 0 else loop (n - 1) in loop 100"
+                    |> Expect.err
+        , test "evaluation succeeds within step limit" <|
+            \_ ->
+                Eval.evalWithMaxSteps (Just 100000)
+                    "let loop n = if n <= 0 then 0 else loop (n - 1) in loop 10"
+                    |> Expect.equal (Ok (Int 0))
+        , test "no step limit allows large computations" <|
+            \_ ->
+                Eval.evalWithMaxSteps Nothing
+                    "let loop n = if n <= 0 then 0 else loop (n - 1) in loop 100"
+                    |> Expect.equal (Ok (Int 0))
         ]

@@ -27,127 +27,142 @@ import Value exposing (nameError, typeError, unsupported)
 evalExpression : Node Expression -> Eval Value
 evalExpression initExpression initCfg initEnv =
     Recursion.runRecursion
-        (\( Node range expression, cfg, env ) ->
-            let
-                result : PartialResult Value
-                result =
-                    case expression of
-                        Expression.UnitExpr ->
-                            Types.succeedPartial Unit
-
-                        Expression.Integer i ->
-                            Types.succeedPartial <| Int i
-
-                        Expression.Hex i ->
-                            Types.succeedPartial <| Int i
-
-                        Expression.Floatable f ->
-                            Types.succeedPartial <| Float f
-
-                        Expression.Literal string ->
-                            Types.succeedPartial <| String string
-
-                        Expression.CharLiteral c ->
-                            Types.succeedPartial <| Char c
-
-                        Expression.OperatorApplication "||" _ l r ->
-                            evalShortCircuitOr l r cfg env
-
-                        Expression.OperatorApplication "&&" _ l r ->
-                            evalShortCircuitAnd l r cfg env
-
-                        Expression.OperatorApplication "<|" _ l r ->
-                            evalApplication l [ r ] cfg env
-
-                        Expression.OperatorApplication "|>" _ l r ->
-                            evalApplication r [ l ] cfg env
-
-                        Expression.OperatorApplication opName _ l r ->
-                            evalOperatorApplication opName l r cfg env
-
-                        Expression.Application [] ->
-                            Types.failPartial <| typeError env "Empty application"
-
-                        Expression.Application (first :: rest) ->
-                            evalApplication first rest cfg env
-
-                        Expression.FunctionOrValue moduleName name ->
-                            evalFunctionOrValue moduleName name cfg env
-
-                        Expression.IfBlock cond true false ->
-                            evalIfBlock cond true false cfg env
-
-                        Expression.PrefixOperator opName ->
-                            evalOperator opName cfg env
-
-                        Expression.Operator opName ->
-                            evalOperator opName cfg env
-
-                        Expression.Negation child ->
-                            evalNegation child cfg env
-
-                        Expression.TupledExpression exprs ->
-                            evalTuple exprs cfg env
-
-                        Expression.ParenthesizedExpression child ->
-                            Recursion.recurse ( child, cfg, env )
-
-                        Expression.LetExpression letBlock ->
-                            evalLetBlock letBlock cfg env
-
-                        Expression.CaseExpression caseExpr ->
-                            evalCase caseExpr cfg env
-
-                        Expression.LambdaExpression lambda ->
-                            Types.succeedPartial <| PartiallyApplied env [] lambda.args Nothing (AstImpl lambda.expression)
-
-                        Expression.RecordExpr fields ->
-                            evalRecord fields cfg env
-
-                        Expression.ListExpr elements ->
-                            evalList elements cfg env
-
-                        Expression.RecordAccess recordExpr field ->
-                            evalRecordAccess recordExpr field cfg env
-
-                        Expression.RecordAccessFunction field ->
-                            Types.succeedPartial <| evalRecordAccessFunction field
-
-                        Expression.RecordUpdateExpression name setters ->
-                            evalRecordUpdate name setters cfg env
-
-                        Expression.GLSLExpression _ ->
-                            Types.failPartial <| unsupported env "GLSL not supported"
-            in
-            if cfg.trace then
-                result
-                    |> Recursion.map
-                        (\evalResult ->
-                            let
-                                ( value, trees, logs ) =
-                                    EvalResult.toTriple evalResult
-
-                                callTree : Rope CallTree
-                                callTree =
-                                    Rope.singleton
-                                        (CallNode
-                                            { env = env
-                                            , expression = Node range expression
-                                            , children = trees
-                                            , result = value
-                                            }
-                                        )
-                            in
-                            case value of
-                                Ok v ->
-                                    EvOkTrace v callTree logs
-
-                                Err e ->
-                                    EvErrTrace e callTree logs
+        (\( Node range expression, cfg0, env ) ->
+            case cfg0.maxSteps of
+                Just 0 ->
+                    Recursion.base
+                        (EvErr
+                            { currentModule = env.currentModule
+                            , callStack = env.callStack
+                            , error = Types.Unsupported "Step limit exceeded"
+                            }
                         )
 
-            else
-                result
+                _ ->
+                    let
+                        cfg : Config
+                        cfg =
+                            { cfg0 | maxSteps = Maybe.map (\n -> n - 1) cfg0.maxSteps }
+
+                        result : PartialResult Value
+                        result =
+                            case expression of
+                                Expression.UnitExpr ->
+                                    Types.succeedPartial Unit
+
+                                Expression.Integer i ->
+                                    Types.succeedPartial <| Int i
+
+                                Expression.Hex i ->
+                                    Types.succeedPartial <| Int i
+
+                                Expression.Floatable f ->
+                                    Types.succeedPartial <| Float f
+
+                                Expression.Literal string ->
+                                    Types.succeedPartial <| String string
+
+                                Expression.CharLiteral c ->
+                                    Types.succeedPartial <| Char c
+
+                                Expression.OperatorApplication "||" _ l r ->
+                                    evalShortCircuitOr l r cfg env
+
+                                Expression.OperatorApplication "&&" _ l r ->
+                                    evalShortCircuitAnd l r cfg env
+
+                                Expression.OperatorApplication "<|" _ l r ->
+                                    evalApplication l [ r ] cfg env
+
+                                Expression.OperatorApplication "|>" _ l r ->
+                                    evalApplication r [ l ] cfg env
+
+                                Expression.OperatorApplication opName _ l r ->
+                                    evalOperatorApplication opName l r cfg env
+
+                                Expression.Application [] ->
+                                    Types.failPartial <| typeError env "Empty application"
+
+                                Expression.Application (first :: rest) ->
+                                    evalApplication first rest cfg env
+
+                                Expression.FunctionOrValue moduleName name ->
+                                    evalFunctionOrValue moduleName name cfg env
+
+                                Expression.IfBlock cond true false ->
+                                    evalIfBlock cond true false cfg env
+
+                                Expression.PrefixOperator opName ->
+                                    evalOperator opName cfg env
+
+                                Expression.Operator opName ->
+                                    evalOperator opName cfg env
+
+                                Expression.Negation child ->
+                                    evalNegation child cfg env
+
+                                Expression.TupledExpression exprs ->
+                                    evalTuple exprs cfg env
+
+                                Expression.ParenthesizedExpression child ->
+                                    Recursion.recurse ( child, cfg, env )
+
+                                Expression.LetExpression letBlock ->
+                                    evalLetBlock letBlock cfg env
+
+                                Expression.CaseExpression caseExpr ->
+                                    evalCase caseExpr cfg env
+
+                                Expression.LambdaExpression lambda ->
+                                    Types.succeedPartial <| PartiallyApplied env [] lambda.args Nothing (AstImpl lambda.expression)
+
+                                Expression.RecordExpr fields ->
+                                    evalRecord fields cfg env
+
+                                Expression.ListExpr elements ->
+                                    evalList elements cfg env
+
+                                Expression.RecordAccess recordExpr field ->
+                                    evalRecordAccess recordExpr field cfg env
+
+                                Expression.RecordAccessFunction field ->
+                                    Types.succeedPartial <| evalRecordAccessFunction field
+
+                                Expression.RecordUpdateExpression name setters ->
+                                    evalRecordUpdate name setters cfg env
+
+                                Expression.GLSLExpression _ ->
+                                    Types.failPartial <| unsupported env "GLSL not supported"
+                    in
+                    if cfg.trace then
+                        result
+                            |> Recursion.map
+                                (\evalResult ->
+                                    let
+                                        ( value, trees, logs ) =
+                                            EvalResult.toTriple evalResult
+
+                                        callTree : Rope CallTree
+                                        callTree =
+                                            Rope.singleton
+                                                (CallNode
+                                                    { env = env
+                                                    , expression = Node range expression
+                                                    , children = trees
+                                                    , result = value
+                                                    }
+                                                )
+                                    in
+                                    case value of
+                                        Ok v ->
+                                            EvOkTrace v callTree logs
+
+                                        Err e ->
+                                            EvErrTrace e callTree logs
+                                )
+
+                    else
+                        result
         )
         ( initExpression, initCfg, initEnv )
 

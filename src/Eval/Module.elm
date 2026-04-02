@@ -43,17 +43,17 @@ eval : String -> Expression -> Result Error Value
 eval source expression =
     let
         ( result, _, _ ) =
-            traceOrEvalModule { trace = False } source expression
+            traceOrEvalModule { trace = False, maxSteps = Nothing } source expression
     in
     result
 
 
 trace : String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 trace source expression =
-    traceOrEvalModule { trace = True } source expression
+    traceOrEvalModule { trace = True, maxSteps = Nothing } source expression
 
 
-traceOrEvalModule : { trace : Bool } -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
+traceOrEvalModule : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 traceOrEvalModule cfg source expression =
     let
         maybeEnv : Result Error Env
@@ -98,7 +98,7 @@ traceOrEvalModule cfg source expression =
                 evalResult =
                     Eval.Expression.evalExpression
                         (maybeNode expression)
-                        { trace = cfg.trace }
+                        cfg
                         env
 
                 ( result, callTrees, logLines ) =
@@ -331,7 +331,7 @@ evalWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False }
+                                { trace = False, maxSteps = Nothing }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -430,7 +430,7 @@ evalWithEnvFromFiles (ProjectEnv projectEnv) additionalFiles expression =
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False }
+                        { trace = False, maxSteps = Nothing }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -527,7 +527,7 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         evalResult =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = True }
+                                { trace = True, maxSteps = Nothing }
                                 finalEnv
 
                         ( result, callTrees, logLines ) =
@@ -898,7 +898,7 @@ evalProject sources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False }
+                                { trace = False, maxSteps = Nothing }
                                 finalEnv
                                 |> EvalResult.toResult
                     in

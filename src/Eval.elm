@@ -1,26 +1,35 @@
-module Eval exposing (eval, indent, toModule, trace)
+module Eval exposing (eval, evalWithMaxSteps, indent, toModule, trace)
 
 import Elm.Syntax.Expression as Expression exposing (Expression)
 import Eval.Module
 import Rope exposing (Rope)
-import Types exposing (CallTree, Error, Value)
+import Types exposing (CallTree, Config, Error, Value)
 
 
 eval : String -> Result Error Value
 eval expressionSource =
     let
         ( result, _, _ ) =
-            traceOrEval { trace = True } expressionSource
+            traceOrEval { trace = True, maxSteps = Nothing } expressionSource
+    in
+    result
+
+
+evalWithMaxSteps : Maybe Int -> String -> Result Error Value
+evalWithMaxSteps maxSteps expressionSource =
+    let
+        ( result, _, _ ) =
+            traceOrEval { trace = False, maxSteps = maxSteps } expressionSource
     in
     result
 
 
 trace : String -> ( Result Error Value, Rope CallTree, Rope String )
 trace expressionSource =
-    traceOrEval { trace = True } expressionSource
+    traceOrEval { trace = True, maxSteps = Nothing } expressionSource
 
 
-traceOrEval : { trace : Bool } -> String -> ( Result Error Value, Rope CallTree, Rope String )
+traceOrEval : Config -> String -> ( Result Error Value, Rope CallTree, Rope String )
 traceOrEval cfg expressionSource =
     let
         source : String

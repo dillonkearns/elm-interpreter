@@ -36,6 +36,7 @@ type EvalResult out
 
 type alias Config =
     { trace : Bool
+    , maxSteps : Maybe Int
     }
 
 
