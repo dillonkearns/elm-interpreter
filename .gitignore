@@ -1,7 +1,6 @@
-
 elm-stuff
 node_modules
-elm-stuff
 dist
 generated
 build
+package-lock.json
