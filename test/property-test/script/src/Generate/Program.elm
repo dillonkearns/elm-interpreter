@@ -22,11 +22,32 @@ import Elm.Let
 import Elm.Op
 import Gen.Basics
 import Gen.List
+import Gen.Maybe
 import Gen.Platform
+import Gen.Result
 import Gen.Platform.Cmd
 import Gen.Platform.Sub
 import Gen.String
+import Gen.Tuple
 import Random
+
+
+type alias ModuleParts =
+    { declarations : List Elm.Declaration
+    , testExprs : List Elm.Expression
+    }
+
+
+emptyParts : ModuleParts
+emptyParts =
+    { declarations = [], testExprs = [] }
+
+
+combineParts : List ModuleParts -> ModuleParts
+combineParts parts =
+    { declarations = List.concatMap .declarations parts
+    , testExprs = List.concatMap .testExprs parts
+    }
 
 
 programGenerator : Int -> Random.Generator Elm.File
@@ -35,24 +56,182 @@ programGenerator index =
         moduleName =
             "Test" ++ String.fromInt index
     in
-    Random.map3
-        (\arithmeticTests stringTests listTests ->
-            let
-                allTestExprs =
-                    arithmeticTests ++ stringTests ++ listTests
-            in
-            Elm.file [ moduleName ]
-                [ Elm.portOutgoing "output" Type.string
-                , Elm.declaration "computeResult"
-                    (Gen.String.call_.join (Elm.string "|")
-                        (Elm.list allTestExprs)
+    allTestGenerators
+        |> Random.map
+            (\parts ->
+                Elm.file [ moduleName ]
+                    ([ Elm.portOutgoing "output" Type.string ]
+                        ++ parts.declarations
+                        ++ [ Elm.declaration "computeResult"
+                                (Gen.String.call_.join (Elm.string "|")
+                                    (Elm.list parts.testExprs)
+                                )
+                           , mainDeclaration
+                           ]
                     )
-                , mainDeclaration
-                ]
+            )
+
+
+allTestGenerators : Random.Generator ModuleParts
+allTestGenerators =
+    Random.map5
+        (\arithmetic strings lists advanced custom ->
+            combineParts [ arithmetic, strings, lists, advanced, custom ]
         )
-        arithmeticTestGenerator
-        stringTestGenerator
-        listTestGenerator
+        (Random.map (\exprs -> { emptyParts | testExprs = exprs }) arithmeticTestGenerator)
+        (Random.map (\exprs -> { emptyParts | testExprs = exprs }) stringTestGenerator)
+        (Random.map (\exprs -> { emptyParts | testExprs = exprs }) listTestGenerator)
+        advancedTestGenerator2
+        customTypeTestGenerator
+
+
+{-| Extended advanced tests: wraps original advancedTestGenerator + adds
+recursive functions, List.foldl with string accumulators, record updates, etc.
+-}
+advancedTestGenerator2 : Random.Generator ModuleParts
+advancedTestGenerator2 =
+    Random.map2
+        (\baseExprs extraParts ->
+            { declarations = extraParts.declarations
+            , testExprs = baseExprs ++ extraParts.testExprs
+            }
+        )
+        advancedTestGenerator
+        recursiveAndRecordGenerator
+
+
+recursiveAndRecordGenerator : Random.Generator ModuleParts
+recursiveAndRecordGenerator =
+    Random.int 0 4
+        |> Random.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        -- List.foldl with string accumulator
+                        randomIntList 2 6
+                            |> Random.map
+                                (\items ->
+                                    { emptyParts
+                                        | testExprs =
+                                            [ Gen.List.call_.foldl
+                                                (Elm.fn2 (Elm.Arg.var "n") (Elm.Arg.var "acc")
+                                                    (\n acc ->
+                                                        Elm.Op.append acc
+                                                            (Elm.Op.append (Elm.string ",")
+                                                                (Gen.String.call_.fromInt n)
+                                                            )
+                                                    )
+                                                    |> Elm.withType
+                                                        (Type.function [ Type.int, Type.string ] Type.string)
+                                                )
+                                                (Elm.string "start")
+                                                (Elm.list (List.map Elm.int items))
+                                            ]
+                                    }
+                                )
+
+                    1 ->
+                        -- Record update syntax via let
+                        Random.map3
+                            (\a b c ->
+                                { emptyParts
+                                    | testExprs =
+                                        [ Elm.Let.letIn
+                                            (\rec ->
+                                                let
+                                                    updated =
+                                                        Elm.updateRecord [ ( "x", Elm.int c ) ] rec
+                                                in
+                                                Gen.String.call_.fromInt
+                                                    (Elm.Op.plus
+                                                        (Elm.get "x" updated)
+                                                        (Elm.get "y" updated)
+                                                    )
+                                            )
+                                            |> Elm.Let.value "rec"
+                                                (Elm.record
+                                                    [ ( "x", Elm.int a )
+                                                    , ( "y", Elm.int b )
+                                                    ]
+                                                )
+                                            |> Elm.Let.toExpression
+                                        ]
+                                }
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+
+                    2 ->
+                        -- Shadowing in let expressions
+                        Random.map3
+                            (\a b c ->
+                                { emptyParts
+                                    | testExprs =
+                                        [ Elm.Let.letIn
+                                            (\x ->
+                                                Elm.Let.letIn
+                                                    (\x2 ->
+                                                        Gen.String.call_.fromInt (Elm.Op.plus x x2)
+                                                    )
+                                                    |> Elm.Let.value "x2" (Elm.Op.multiply x (Elm.int c))
+                                                    |> Elm.Let.toExpression
+                                            )
+                                            |> Elm.Let.value "x" (Elm.Op.plus (Elm.int a) (Elm.int b))
+                                            |> Elm.Let.toExpression
+                                        ]
+                                }
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    3 ->
+                        -- List.map with complex lambda
+                        randomIntList 3 6
+                            |> Random.map
+                                (\items ->
+                                    { emptyParts
+                                        | testExprs =
+                                            [ Gen.String.call_.join (Elm.string ",")
+                                                (Gen.List.call_.map
+                                                    (Elm.fn (Elm.Arg.var "n")
+                                                        (\n ->
+                                                            Elm.ifThen (Elm.Op.gt n (Elm.int 0))
+                                                                (Elm.Op.append (Elm.string "+") (Gen.String.call_.fromInt n))
+                                                                (Gen.String.call_.fromInt n)
+                                                        )
+                                                        |> Elm.withType (Type.function [ Type.int ] Type.string)
+                                                    )
+                                                    (Elm.list (List.map Elm.int items))
+                                                )
+                                            ]
+                                    }
+                                )
+
+                    _ ->
+                        -- List.filterMap
+                        randomIntList 4 8
+                            |> Random.map
+                                (\items ->
+                                    { emptyParts
+                                        | testExprs =
+                                            [ Gen.String.call_.join (Elm.string ",")
+                                                (Gen.List.call_.filterMap
+                                                    (Elm.fn (Elm.Arg.var "n")
+                                                        (\n ->
+                                                            Elm.ifThen (Elm.Op.gt n (Elm.int 0))
+                                                                (Gen.Maybe.make_.just (Gen.String.call_.fromInt n))
+                                                                Gen.Maybe.make_.nothing
+                                                        )
+                                                        |> Elm.withType (Type.function [ Type.int ] (Type.maybe Type.string))
+                                                    )
+                                                    (Elm.list (List.map Elm.int items))
+                                                )
+                                            ]
+                                    }
+                                )
+            )
 
 
 {-| Generate `main` that outputs computeResult via the port.
@@ -98,114 +277,82 @@ mainDeclaration =
 
 arithmeticTestGenerator : Random.Generator (List Elm.Expression)
 arithmeticTestGenerator =
-    Random.int 3 8
-        |> Random.andThen
-            (\count ->
-                Random.list count singleArithmeticTest
-            )
+    Random.int 2 5
+        |> Random.andThen (\count -> Random.list count singleArithmeticTest)
 
 
 singleArithmeticTest : Random.Generator Elm.Expression
 singleArithmeticTest =
-    Random.int 0 7
+    Random.int 0 9
         |> Random.andThen
             (\tag ->
                 case tag of
                     0 ->
-                        -- Simple addition
                         Random.map2
-                            (\a b ->
-                                Gen.String.call_.fromInt
-                                    (Elm.Op.plus (Elm.int a) (Elm.int b))
-                            )
+                            (\a b -> Gen.String.call_.fromInt (Elm.Op.plus (Elm.int a) (Elm.int b)))
                             (Random.int -100 100)
                             (Random.int -100 100)
 
                     1 ->
-                        -- Multiplication
                         Random.map2
-                            (\a b ->
-                                Gen.String.call_.fromInt
-                                    (Elm.Op.multiply (Elm.int a) (Elm.int b))
-                            )
+                            (\a b -> Gen.String.call_.fromInt (Elm.Op.multiply (Elm.int a) (Elm.int b)))
                             (Random.int -50 50)
                             (Random.int -50 50)
 
                     2 ->
-                        -- Nested arithmetic
                         Random.map3
                             (\a b c ->
                                 Gen.String.call_.fromInt
-                                    (Elm.Op.plus
-                                        (Elm.Op.multiply (Elm.int a) (Elm.int b))
-                                        (Elm.int c)
-                                    )
+                                    (Elm.Op.plus (Elm.Op.multiply (Elm.int a) (Elm.int b)) (Elm.int c))
                             )
                             (Random.int -20 20)
                             (Random.int -20 20)
                             (Random.int -20 20)
 
                     3 ->
-                        -- Integer division
                         Random.map2
                             (\a b ->
-                                let
-                                    divisor =
-                                        if b == 0 then
-                                            1
-
-                                        else
-                                            b
-                                in
                                 Gen.String.call_.fromInt
-                                    (Elm.Op.intDivide (Elm.int a) (Elm.int divisor))
+                                    (Elm.Op.intDivide (Elm.int a) (Elm.int (max 1 (abs b))))
                             )
                             (Random.int -100 100)
                             (Random.int 1 20)
 
                     4 ->
-                        -- Negate
                         Random.map
-                            (\a ->
-                                Gen.String.call_.fromInt
-                                    (Gen.Basics.call_.negate (Elm.int a))
-                            )
+                            (\a -> Gen.String.call_.fromInt (Gen.Basics.call_.negate (Elm.int a)))
                             (Random.int -100 100)
 
                     5 ->
-                        -- abs
                         Random.map
-                            (\a ->
-                                Gen.String.call_.fromInt
-                                    (Gen.Basics.call_.abs (Elm.int a))
-                            )
+                            (\a -> Gen.String.call_.fromInt (Gen.Basics.call_.abs (Elm.int a)))
                             (Random.int -100 100)
 
                     6 ->
-                        -- modBy
                         Random.map2
                             (\a b ->
-                                let
-                                    divisor =
-                                        if b == 0 then
-                                            1
-
-                                        else
-                                            abs b
-                                in
                                 Gen.String.call_.fromInt
-                                    (Gen.Basics.call_.modBy (Elm.int divisor) (Elm.int a))
+                                    (Gen.Basics.call_.modBy (Elm.int (max 1 (abs b))) (Elm.int a))
                             )
                             (Random.int -100 100)
                             (Random.int 1 20)
 
-                    _ ->
-                        -- min/max
+                    7 ->
                         Random.map2
-                            (\a b ->
-                                Gen.String.call_.fromInt
-                                    (Gen.Basics.call_.min (Elm.int a) (Elm.int b))
-                            )
+                            (\a b -> Gen.String.call_.fromInt (Gen.Basics.call_.min (Elm.int a) (Elm.int b)))
+                            (Random.int -100 100)
+                            (Random.int -100 100)
+
+                    8 ->
+                        Random.map2
+                            (\a b -> Gen.String.call_.fromInt (Gen.Basics.call_.max (Elm.int a) (Elm.int b)))
+                            (Random.int -100 100)
+                            (Random.int -100 100)
+
+                    _ ->
+                        -- Subtraction
+                        Random.map2
+                            (\a b -> Gen.String.call_.fromInt (Elm.Op.minus (Elm.int a) (Elm.int b)))
                             (Random.int -100 100)
                             (Random.int -100 100)
             )
@@ -217,11 +364,8 @@ singleArithmeticTest =
 
 stringTestGenerator : Random.Generator (List Elm.Expression)
 stringTestGenerator =
-    Random.int 2 6
-        |> Random.andThen
-            (\count ->
-                Random.list count singleStringTest
-            )
+    Random.int 2 4
+        |> Random.andThen (\count -> Random.list count singleStringTest)
 
 
 singleStringTest : Random.Generator Elm.Expression
@@ -231,72 +375,37 @@ singleStringTest =
             (\tag ->
                 case tag of
                     0 ->
-                        -- String.append
                         Random.map2
-                            (\a b ->
-                                Gen.String.call_.append
-                                    (Elm.string (randomWord a))
-                                    (Elm.string (randomWord b))
-                            )
+                            (\a b -> Gen.String.call_.append (Elm.string (randomWord a)) (Elm.string (randomWord b)))
                             (Random.int 0 9)
                             (Random.int 0 9)
 
                     1 ->
-                        -- String.length
                         Random.map
-                            (\a ->
-                                Gen.String.call_.fromInt
-                                    (Gen.String.call_.length (Elm.string (randomWord a)))
-                            )
+                            (\a -> Gen.String.call_.fromInt (Gen.String.call_.length (Elm.string (randomWord a))))
                             (Random.int 0 9)
 
                     2 ->
-                        -- String.reverse
-                        Random.map
-                            (\a ->
-                                Gen.String.call_.reverse (Elm.string (randomWord a))
-                            )
-                            (Random.int 0 9)
+                        Random.map (\a -> Gen.String.call_.reverse (Elm.string (randomWord a))) (Random.int 0 9)
 
                     3 ->
-                        -- String.toUpper
-                        Random.map
-                            (\a ->
-                                Gen.String.call_.toUpper (Elm.string (randomWord a))
-                            )
-                            (Random.int 0 9)
+                        Random.map (\a -> Gen.String.call_.toUpper (Elm.string (randomWord a))) (Random.int 0 9)
 
                     4 ->
-                        -- String.toLower
-                        Random.map
-                            (\a ->
-                                Gen.String.call_.toLower (Elm.string (randomWord a))
-                            )
-                            (Random.int 0 9)
+                        Random.map (\a -> Gen.String.call_.toLower (Elm.string (randomWord a))) (Random.int 0 9)
 
                     5 ->
-                        -- String.fromInt
-                        Random.map
-                            (\a ->
-                                Gen.String.call_.fromInt (Elm.int a)
-                            )
-                            (Random.int -1000 1000)
+                        Random.map (\a -> Gen.String.call_.fromInt (Elm.int a)) (Random.int -1000 1000)
 
                     6 ->
-                        -- String.left
                         Random.map2
-                            (\a n ->
-                                Gen.String.call_.left (Elm.int n) (Elm.string (randomWord a))
-                            )
+                            (\a n -> Gen.String.call_.left (Elm.int n) (Elm.string (randomWord a)))
                             (Random.int 0 9)
                             (Random.int 0 5)
 
                     _ ->
-                        -- String.repeat
                         Random.map2
-                            (\a n ->
-                                Gen.String.call_.repeat (Elm.int n) (Elm.string (randomWord a))
-                            )
+                            (\a n -> Gen.String.call_.repeat (Elm.int n) (Elm.string (randomWord a)))
                             (Random.int 0 9)
                             (Random.int 0 4)
             )
@@ -305,35 +414,16 @@ singleStringTest =
 randomWord : Int -> String
 randomWord index =
     case modBy 10 index of
-        0 ->
-            "hello"
-
-        1 ->
-            "world"
-
-        2 ->
-            "foo"
-
-        3 ->
-            "bar"
-
-        4 ->
-            "elm"
-
-        5 ->
-            "test"
-
-        6 ->
-            "alpha"
-
-        7 ->
-            "beta"
-
-        8 ->
-            "gamma"
-
-        _ ->
-            "delta"
+        0 -> "hello"
+        1 -> "world"
+        2 -> "foo"
+        3 -> "bar"
+        4 -> "elm"
+        5 -> "test"
+        6 -> "alpha"
+        7 -> "beta"
+        8 -> "gamma"
+        _ -> "delta"
 
 
 
@@ -342,11 +432,8 @@ randomWord index =
 
 listTestGenerator : Random.Generator (List Elm.Expression)
 listTestGenerator =
-    Random.int 2 5
-        |> Random.andThen
-            (\count ->
-                Random.list count singleListTest
-            )
+    Random.int 2 4
+        |> Random.andThen (\count -> Random.list count singleListTest)
 
 
 singleListTest : Random.Generator Elm.Expression
@@ -356,66 +443,44 @@ singleListTest =
             (\tag ->
                 case tag of
                     0 ->
-                        -- List.map with String.fromInt
                         randomIntList 3 7
                             |> Random.map
                                 (\items ->
                                     Gen.String.call_.join (Elm.string ",")
-                                        (Gen.List.call_.map
-                                            (Gen.String.values_.fromInt)
-                                            (Elm.list (List.map Elm.int items))
-                                        )
+                                        (Gen.List.call_.map Gen.String.values_.fromInt (Elm.list (List.map Elm.int items)))
                                 )
 
                     1 ->
-                        -- List.length
                         randomIntList 2 8
                             |> Random.map
                                 (\items ->
-                                    Gen.String.call_.fromInt
-                                        (Gen.List.call_.length
-                                            (Elm.list (List.map Elm.int items))
-                                        )
+                                    Gen.String.call_.fromInt (Gen.List.call_.length (Elm.list (List.map Elm.int items)))
                                 )
 
                     2 ->
-                        -- List.reverse then show
                         randomIntList 3 6
                             |> Random.map
                                 (\items ->
                                     Gen.String.call_.join (Elm.string ",")
-                                        (Gen.List.call_.map
-                                            (Gen.String.values_.fromInt)
-                                            (Gen.List.call_.reverse
-                                                (Elm.list (List.map Elm.int items))
-                                            )
+                                        (Gen.List.call_.map Gen.String.values_.fromInt
+                                            (Gen.List.call_.reverse (Elm.list (List.map Elm.int items)))
                                         )
                                 )
 
                     3 ->
-                        -- List.sum
                         randomIntList 3 8
                             |> Random.map
                                 (\items ->
-                                    Gen.String.call_.fromInt
-                                        (Gen.List.sum
-                                            (List.map Elm.int items)
-                                        )
+                                    Gen.String.call_.fromInt (Gen.List.sum (List.map Elm.int items))
                                 )
 
                     4 ->
-                        -- List.filter (> threshold)
                         Random.map2
                             (\items threshold ->
                                 Gen.String.call_.join (Elm.string ",")
-                                    (Gen.List.call_.map
-                                        (Gen.String.values_.fromInt)
+                                    (Gen.List.call_.map Gen.String.values_.fromInt
                                         (Gen.List.call_.filter
-                                            (Elm.fn (Elm.Arg.var "x")
-                                                (\x ->
-                                                    Elm.Op.gt x (Elm.int threshold)
-                                                )
-                                            )
+                                            (Elm.fn (Elm.Arg.var "x") (\x -> Elm.Op.gt x (Elm.int threshold)))
                                             (Elm.list (List.map Elm.int items))
                                         )
                                     )
@@ -424,26 +489,568 @@ singleListTest =
                             (Random.int -10 10)
 
                     _ ->
-                        -- List.head
                         randomIntList 1 5
                             |> Random.map
                                 (\items ->
                                     Elm.Case.maybe
                                         (Gen.List.call_.head (Elm.list (List.map Elm.int items)))
                                         { nothing = Elm.string "Nothing"
-                                        , just =
-                                            ( "x"
-                                            , \x -> Gen.String.call_.fromInt x
-                                            )
+                                        , just = ( "x", \x -> Gen.String.call_.fromInt x )
                                         }
                                 )
             )
 
 
+
+-- ADVANCED TEST GENERATOR (custom types, records, let, if/else, tuples, closures)
+
+
+advancedTestGenerator : Random.Generator (List Elm.Expression)
+advancedTestGenerator =
+    Random.int 3 6
+        |> Random.andThen (\count -> Random.list count singleAdvancedTest)
+
+
+singleAdvancedTest : Random.Generator Elm.Expression
+singleAdvancedTest =
+    Random.int 0 11
+        |> Random.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        -- Let expression with binding
+                        Random.map2
+                            (\a b ->
+                                Elm.Let.letIn
+                                    (\x ->
+                                        Gen.String.call_.fromInt (Elm.Op.plus x (Elm.int b))
+                                    )
+                                    |> Elm.Let.value "x" (Elm.int a)
+                                    |> Elm.Let.toExpression
+                            )
+                            (Random.int -50 50)
+                            (Random.int -50 50)
+
+                    1 ->
+                        -- Nested let expressions
+                        Random.map3
+                            (\a b c ->
+                                Elm.Let.letIn
+                                    (\x ->
+                                        Elm.Let.letIn
+                                            (\y ->
+                                                Gen.String.call_.fromInt
+                                                    (Elm.Op.plus x (Elm.Op.multiply y (Elm.int c)))
+                                            )
+                                            |> Elm.Let.value "y" (Elm.Op.plus (Elm.int b) x)
+                                            |> Elm.Let.toExpression
+                                    )
+                                    |> Elm.Let.value "x" (Elm.int a)
+                                    |> Elm.Let.toExpression
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+
+                    2 ->
+                        -- If/else
+                        Random.map3
+                            (\a b c ->
+                                Elm.ifThen (Elm.Op.gt (Elm.int a) (Elm.int b))
+                                    (Gen.String.call_.fromInt (Elm.int c))
+                                    (Gen.String.call_.fromInt (Gen.Basics.call_.negate (Elm.int c)))
+                            )
+                            (Random.int -50 50)
+                            (Random.int -50 50)
+                            (Random.int 0 100)
+
+                    3 ->
+                        -- Nested if/else
+                        Random.map3
+                            (\a b c ->
+                                Elm.ifThen (Elm.Op.gt (Elm.int a) (Elm.int 0))
+                                    (Elm.ifThen (Elm.Op.gt (Elm.int b) (Elm.int 0))
+                                        (Elm.string "both-pos")
+                                        (Elm.string "a-pos")
+                                    )
+                                    (Elm.ifThen (Elm.Op.gt (Elm.int b) (Elm.int 0))
+                                        (Elm.string "b-pos")
+                                        (Elm.string "neither-pos")
+                                    )
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    4 ->
+                        -- Tuple access
+                        Random.map2
+                            (\a b ->
+                                Gen.String.call_.fromInt
+                                    (Elm.Op.plus
+                                        (Gen.Tuple.call_.first (Elm.tuple (Elm.int a) (Elm.int b)))
+                                        (Gen.Tuple.call_.second (Elm.tuple (Elm.int a) (Elm.int b)))
+                                    )
+                            )
+                            (Random.int -50 50)
+                            (Random.int -50 50)
+
+                    5 ->
+                        -- Record creation and field access
+                        Random.map2
+                            (\a s ->
+                                Elm.Op.append
+                                    (Elm.get "name" (Elm.record [ ( "name", Elm.string (randomWord s) ), ( "value", Elm.int a ) ]))
+                                    (Gen.String.call_.fromInt (Elm.get "value" (Elm.record [ ( "name", Elm.string (randomWord s) ), ( "value", Elm.int a ) ])))
+                            )
+                            (Random.int -100 100)
+                            (Random.int 0 9)
+
+                    6 ->
+                        -- Lambda application
+                        Random.map2
+                            (\a b ->
+                                Gen.String.call_.fromInt
+                                    (Elm.apply
+                                        (Elm.fn (Elm.Arg.var "n")
+                                            (\n -> Elm.Op.plus n (Elm.int b))
+                                        )
+                                        [ Elm.int a ]
+                                    )
+                            )
+                            (Random.int -50 50)
+                            (Random.int -50 50)
+
+                    7 ->
+                        -- Multi-arg lambda
+                        Random.map3
+                            (\a b c ->
+                                Gen.String.call_.fromInt
+                                    (Elm.apply
+                                        (Elm.fn2 (Elm.Arg.var "x") (Elm.Arg.var "y")
+                                            (\x y -> Elm.Op.plus (Elm.Op.multiply x y) (Elm.int c))
+                                        )
+                                        [ Elm.int a, Elm.int b ]
+                                    )
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    8 ->
+                        -- Let with function binding (closure)
+                        Random.map2
+                            (\a b ->
+                                Elm.Let.letIn
+                                    (\addN ->
+                                        Gen.String.call_.fromInt
+                                            (Elm.apply addN [ Elm.int b ])
+                                    )
+                                    |> Elm.Let.value "addN"
+                                        (Elm.fn (Elm.Arg.var "x")
+                                            (\x -> Elm.Op.plus x (Elm.int a))
+                                        )
+                                    |> Elm.Let.toExpression
+                            )
+                            (Random.int -30 30)
+                            (Random.int -30 30)
+
+                    9 ->
+                        -- Maybe.map
+                        Random.map2
+                            (\a useJust ->
+                                let
+                                    maybeVal =
+                                        if useJust then
+                                            Gen.Maybe.make_.just (Elm.int a)
+
+                                        else
+                                            Gen.Maybe.make_.nothing
+                                in
+                                Elm.Case.maybe
+                                    (Gen.Maybe.call_.map
+                                        (Elm.fn (Elm.Arg.var "n")
+                                            (\n -> Elm.Op.multiply n (Elm.int 2))
+                                        )
+                                        maybeVal
+                                    )
+                                    { nothing = Elm.string "Nothing"
+                                    , just = ( "v", \v -> Gen.String.call_.fromInt v )
+                                    }
+                            )
+                            (Random.int -50 50)
+                            (Random.map (\n -> n > 0) (Random.int 0 1))
+
+                    10 ->
+                        -- Result.map
+                        Random.map2
+                            (\a useOk ->
+                                let
+                                    resultVal =
+                                        if useOk then
+                                            Gen.Result.make_.ok (Elm.int a)
+
+                                        else
+                                            Gen.Result.make_.err (Elm.string "oops")
+                                in
+                                Elm.Case.result resultVal
+                                    { err = ( "e", \e -> Elm.Op.append (Elm.string "Err:") e )
+                                    , ok = ( "v", \v -> Elm.Op.append (Elm.string "Ok:") (Gen.String.call_.fromInt v) )
+                                    }
+                            )
+                            (Random.int -50 50)
+                            (Random.map (\n -> n > 0) (Random.int 0 1))
+
+                    _ ->
+                        -- Piping (|>)
+                        Random.map2
+                            (\a b ->
+                                Gen.String.call_.fromInt
+                                    (Elm.Op.pipe
+                                        (Elm.fn (Elm.Arg.var "n")
+                                            (\n -> Elm.Op.plus n (Elm.int b))
+                                        )
+                                        (Elm.int a)
+                                    )
+                            )
+                            (Random.int -50 50)
+                            (Random.int -50 50)
+            )
+
+
+
+-- CUSTOM TYPE + HELPER FUNCTION GENERATOR
+
+
+customTypeTestGenerator : Random.Generator ModuleParts
+customTypeTestGenerator =
+    Random.map2
+        (\helperParts miscExprs ->
+            { declarations = helperParts.declarations
+            , testExprs = helperParts.testExprs ++ miscExprs
+            }
+        )
+        helperFunctionGenerator
+        miscExprGenerator
+
+
+{-| Generate top-level helper functions and test expressions that call them.
+Exercises: function declarations, partial application, recursion, closures.
+-}
+helperFunctionGenerator : Random.Generator ModuleParts
+helperFunctionGenerator =
+    Random.int 0 4
+        |> Random.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        -- Helper function with 2 args (typed as Int -> Int -> Int)
+                        Random.map3
+                            (\a b op ->
+                                let
+                                    fnName = "helper"
+                                    body x y =
+                                        case op of
+                                            0 -> Elm.Op.plus x y
+                                            1 -> Elm.Op.multiply x y
+                                            _ -> Elm.Op.minus x y
+                                in
+                                { declarations =
+                                    [ Elm.declaration fnName
+                                        (Elm.fn2 (Elm.Arg.var "x") (Elm.Arg.var "y") (\x y -> body x y)
+                                            |> Elm.withType (Type.function [ Type.int, Type.int ] Type.int)
+                                        )
+                                    ]
+                                , testExprs =
+                                    [ Gen.String.call_.fromInt
+                                        (Elm.apply (Elm.val fnName) [ Elm.int a, Elm.int b ])
+                                    ]
+                                }
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+                            (Random.int 0 2)
+
+                    1 ->
+                        -- Partial application of helper function
+                        Random.map3
+                            (\a b c ->
+                                { declarations =
+                                    [ Elm.declaration "add3"
+                                        (Elm.fn2 (Elm.Arg.var "x") (Elm.Arg.var "y")
+                                            (\x y -> Elm.Op.plus x y)
+                                            |> Elm.withType (Type.function [ Type.int, Type.int ] Type.int)
+                                        )
+                                    , Elm.declaration "addTo"
+                                        (Elm.apply (Elm.val "add3") [ Elm.int a ]
+                                            |> Elm.withType (Type.function [ Type.int ] Type.int)
+                                        )
+                                    ]
+                                , testExprs =
+                                    [ Gen.String.call_.fromInt
+                                        (Elm.apply (Elm.val "addTo") [ Elm.int b ])
+                                    , Gen.String.call_.fromInt
+                                        (Elm.apply (Elm.val "add3") [ Elm.int a, Elm.int c ])
+                                    ]
+                                }
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+
+                    2 ->
+                        -- Function with conditional (typed as Int -> String)
+                        Random.map2
+                            (\a b ->
+                                { declarations =
+                                    [ Elm.declaration "describeSign"
+                                        (Elm.fn (Elm.Arg.var "n")
+                                            (\n ->
+                                                Elm.ifThen (Elm.Op.gt n (Elm.int 0))
+                                                    (Elm.string "positive")
+                                                    (Elm.ifThen (Elm.Op.lt n (Elm.int 0))
+                                                        (Elm.string "negative")
+                                                        (Elm.string "zero")
+                                                    )
+                                            )
+                                            |> Elm.withType (Type.function [ Type.int ] Type.string)
+                                        )
+                                    ]
+                                , testExprs =
+                                    [ Elm.apply (Elm.val "describeSign") [ Elm.int a ]
+                                    , Elm.apply (Elm.val "describeSign") [ Elm.int b ]
+                                    , Elm.apply (Elm.val "describeSign") [ Elm.int 0 ]
+                                    ]
+                                }
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    3 ->
+                        -- Record-returning function
+                        Random.map2
+                            (\a s ->
+                                { declarations =
+                                    [ Elm.declaration "makeRecord"
+                                        (Elm.fn2 (Elm.Arg.var "name") (Elm.Arg.var "val")
+                                            (\name val ->
+                                                Elm.record
+                                                    [ ( "label", name )
+                                                    , ( "score", val )
+                                                    ]
+                                            )
+                                            |> Elm.withType
+                                                (Type.function [ Type.string, Type.int ]
+                                                    (Type.record [ ( "label", Type.string ), ( "score", Type.int ) ])
+                                                )
+                                        )
+                                    ]
+                                , testExprs =
+                                    [ Elm.Op.append
+                                        (Elm.get "label"
+                                            (Elm.apply (Elm.val "makeRecord")
+                                                [ Elm.string (randomWord s), Elm.int a ]
+                                            )
+                                        )
+                                        (Gen.String.call_.fromInt
+                                            (Elm.get "score"
+                                                (Elm.apply (Elm.val "makeRecord")
+                                                    [ Elm.string (randomWord s), Elm.int a ]
+                                                )
+                                            )
+                                        )
+                                    ]
+                                }
+                            )
+                            (Random.int -50 50)
+                            (Random.int 0 9)
+
+                    _ ->
+                        -- Higher-order function (takes Int -> Int function)
+                        Random.map2
+                            (\a b ->
+                                { declarations =
+                                    [ Elm.declaration "applyTwice"
+                                        (Elm.fn2 (Elm.Arg.var "f") (Elm.Arg.var "x")
+                                            (\f x ->
+                                                Elm.apply f [ Elm.apply f [ x ] ]
+                                            )
+                                            |> Elm.withType
+                                                (Type.function
+                                                    [ Type.function [ Type.int ] Type.int
+                                                    , Type.int
+                                                    ]
+                                                    Type.int
+                                                )
+                                        )
+                                    ]
+                                , testExprs =
+                                    [ Gen.String.call_.fromInt
+                                        (Elm.apply (Elm.val "applyTwice")
+                                            [ Elm.fn (Elm.Arg.var "n")
+                                                (\n -> Elm.Op.plus n (Elm.int a))
+                                            , Elm.int b
+                                            ]
+                                        )
+                                    ]
+                                }
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+            )
+
+
+{-| Miscellaneous expressions (boolean, comparison, string ops, list ops).
+-}
+miscExprGenerator : Random.Generator (List Elm.Expression)
+miscExprGenerator =
+    Random.int 2 4
+        |> Random.andThen (\count -> Random.list count singleMiscExpr)
+
+
+singleMiscExpr : Random.Generator Elm.Expression
+singleMiscExpr =
+    Random.int 0 8
+        |> Random.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        -- Boolean and/or
+                        Random.map2
+                            (\a b ->
+                                let
+                                    boolA = Elm.Op.gt (Elm.int a) (Elm.int 0)
+                                    boolB = Elm.Op.gt (Elm.int b) (Elm.int 0)
+                                in
+                                Elm.ifThen (Elm.Op.and boolA boolB)
+                                    (Elm.string "both")
+                                    (Elm.ifThen (Elm.Op.or boolA boolB)
+                                        (Elm.string "one")
+                                        (Elm.string "none")
+                                    )
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    1 ->
+                        -- String.contains
+                        Random.map2
+                            (\a b ->
+                                Elm.ifThen
+                                    (Gen.String.call_.contains
+                                        (Elm.string (randomWord a))
+                                        (Elm.string (randomWord a ++ randomWord b))
+                                    )
+                                    (Elm.string "yes")
+                                    (Elm.string "no")
+                            )
+                            (Random.int 0 9)
+                            (Random.int 0 9)
+
+                    2 ->
+                        -- Equality check
+                        Random.map2
+                            (\a b ->
+                                Elm.ifThen (Elm.Op.equal (Elm.int a) (Elm.int b))
+                                    (Elm.string "eq")
+                                    (Elm.string "neq")
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    3 ->
+                        -- String.slice
+                        Random.map3
+                            (\s start end ->
+                                Gen.String.call_.slice (Elm.int start) (Elm.int end) (Elm.string (randomWord s))
+                            )
+                            (Random.int 0 9)
+                            (Random.int 0 3)
+                            (Random.int 2 5)
+
+                    4 ->
+                        -- String.split and List.length
+                        Random.map
+                            (\s ->
+                                Gen.String.call_.fromInt
+                                    (Gen.List.call_.length
+                                        (Gen.String.call_.split (Elm.string "l")
+                                            (Elm.string (randomWord s))
+                                        )
+                                    )
+                            )
+                            (Random.int 0 9)
+
+                    5 ->
+                        -- List.concat
+                        Random.map2
+                            (\items1 items2 ->
+                                Gen.String.call_.join (Elm.string ",")
+                                    (Gen.List.call_.map Gen.String.values_.fromInt
+                                        (Gen.List.call_.concat
+                                            (Elm.list
+                                                [ Elm.list (List.map Elm.int items1)
+                                                , Elm.list (List.map Elm.int items2)
+                                                ]
+                                            )
+                                        )
+                                    )
+                            )
+                            (randomIntList 1 3)
+                            (randomIntList 1 3)
+
+                    6 ->
+                        -- List.take
+                        Random.map2
+                            (\items n ->
+                                Gen.String.call_.join (Elm.string ",")
+                                    (Gen.List.call_.map Gen.String.values_.fromInt
+                                        (Gen.List.call_.take (Elm.int n) (Elm.list (List.map Elm.int items)))
+                                    )
+                            )
+                            (randomIntList 3 7)
+                            (Random.int 0 5)
+
+                    7 ->
+                        -- List.drop
+                        Random.map2
+                            (\items n ->
+                                Gen.String.call_.join (Elm.string ",")
+                                    (Gen.List.call_.map Gen.String.values_.fromInt
+                                        (Gen.List.call_.drop (Elm.int n) (Elm.list (List.map Elm.int items)))
+                                    )
+                            )
+                            (randomIntList 3 7)
+                            (Random.int 0 5)
+
+                    _ ->
+                        -- Comparison with compare
+                        Random.map2
+                            (\a b ->
+                                Elm.Case.custom
+                                    (Gen.Basics.call_.compare (Elm.int a) (Elm.int b))
+                                    (Type.named [ "Basics" ] "Order")
+                                    [ Elm.Case.branch (Elm.Arg.customType "LT" ()) (\_ -> Elm.string "LT")
+                                    , Elm.Case.branch (Elm.Arg.customType "EQ" ()) (\_ -> Elm.string "EQ")
+                                    , Elm.Case.branch (Elm.Arg.customType "GT" ()) (\_ -> Elm.string "GT")
+                                    ]
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+            )
+
+
+
+-- HELPERS
+
+
 randomIntList : Int -> Int -> Random.Generator (List Int)
 randomIntList minLen maxLen =
     Random.int minLen maxLen
-        |> Random.andThen
-            (\len ->
-                Random.list len (Random.int -50 50)
-            )
+        |> Random.andThen (\len -> Random.list len (Random.int -50 50))
+
+
+{-| Combine 5 generators into a single generator of lists.
+-}
+map5 =
+    Random.map5
