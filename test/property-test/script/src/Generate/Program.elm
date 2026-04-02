@@ -829,7 +829,7 @@ Exercises: function declarations, partial application, recursion, closures.
 -}
 helperFunctionGenerator : Random.Generator ModuleParts
 helperFunctionGenerator =
-    Random.int 0 4
+    Random.int 0 7
         |> Random.andThen
             (\tag ->
                 case tag of
@@ -955,7 +955,7 @@ helperFunctionGenerator =
                             (Random.int -50 50)
                             (Random.int 0 9)
 
-                    _ ->
+                    4 ->
                         -- Higher-order function (takes Int -> Int function)
                         Random.map2
                             (\a b ->
@@ -987,6 +987,102 @@ helperFunctionGenerator =
                             )
                             (Random.int -10 10)
                             (Random.int -10 10)
+
+                    5 ->
+                        -- 3-arg partial application chain
+                        Random.map3
+                            (\a b c ->
+                                { declarations =
+                                    [ Elm.declaration "add3args"
+                                        (Elm.fn2 (Elm.Arg.var "x") (Elm.Arg.var "y")
+                                            (\x y ->
+                                                Elm.fn (Elm.Arg.var "z")
+                                                    (\z -> Elm.Op.plus x (Elm.Op.plus y z))
+                                            )
+                                            |> Elm.withType (Type.function [ Type.int, Type.int ] (Type.function [ Type.int ] Type.int))
+                                        )
+                                    , Elm.declaration "partial1"
+                                        (Elm.apply (Elm.val "add3args") [ Elm.int a ])
+                                    , Elm.declaration "partial2"
+                                        (Elm.apply (Elm.val "partial1") [ Elm.int b ])
+                                    ]
+                                , testExprs =
+                                    [ Gen.String.call_.fromInt
+                                        (Elm.apply (Elm.val "partial2") [ Elm.int c ])
+                                    , Gen.String.call_.fromInt
+                                        (Elm.apply (Elm.val "add3args") [ Elm.int a, Elm.int b, Elm.int c ])
+                                    ]
+                                }
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    6 ->
+                        -- String.filter and String.map
+                        Random.map
+                            (\idx ->
+                                let
+                                    word = randomWord idx
+                                in
+                                { declarations =
+                                    [ Elm.declaration "filterVowels"
+                                        (Elm.fn (Elm.Arg.var "s")
+                                            (\s ->
+                                                Gen.String.call_.filter
+                                                    (Elm.fn (Elm.Arg.var "c")
+                                                        (\c ->
+                                                            Gen.Basics.call_.not
+                                                                (Gen.List.call_.member c
+                                                                    (Elm.list [ Elm.char 'a', Elm.char 'e', Elm.char 'i', Elm.char 'o', Elm.char 'u' ])
+                                                                )
+                                                        )
+                                                    )
+                                                    s
+                                            )
+                                            |> Elm.withType (Type.function [ Type.string ] Type.string)
+                                        )
+                                    ]
+                                , testExprs =
+                                    [ Elm.apply (Elm.val "filterVowels") [ Elm.string word ]
+                                    ]
+                                }
+                            )
+                            (Random.int 0 9)
+
+                    _ ->
+                        -- Complex let with dependency chain
+                        Random.map3
+                            (\a b c ->
+                                { emptyParts
+                                    | testExprs =
+                                        [ Elm.Let.letIn
+                                            (\w ->
+                                                Elm.Let.letIn
+                                                    (\z ->
+                                                        Elm.Let.letIn
+                                                            (\y ->
+                                                                Elm.Let.letIn
+                                                                    (\x ->
+                                                                        Gen.String.call_.fromInt x
+                                                                    )
+                                                                    |> Elm.Let.value "x" (Elm.Op.plus y (Elm.int 1))
+                                                                    |> Elm.Let.toExpression
+                                                            )
+                                                            |> Elm.Let.value "y" (Elm.Op.plus z (Elm.int 2))
+                                                            |> Elm.Let.toExpression
+                                                    )
+                                                    |> Elm.Let.value "z" (Elm.Op.plus w (Elm.int 3))
+                                                    |> Elm.Let.toExpression
+                                            )
+                                            |> Elm.Let.value "w" (Elm.int a)
+                                            |> Elm.Let.toExpression
+                                        ]
+                                }
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+                            (Random.int -20 20)
             )
 
 
