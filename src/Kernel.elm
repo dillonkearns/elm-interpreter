@@ -10,6 +10,7 @@ import Core.Debug
 import Core.Elm.JsArray
 import Core.Json.Decode
 import Core.Json.Encode
+import Core.Regex
 import Core.List
 import Core.String
 import Elm.Syntax.Expression as Expression exposing (Expression(..), FunctionImplementation)
@@ -24,6 +25,7 @@ import Kernel.Debug
 import Kernel.JsArray
 import Kernel.Json
 import Kernel.List
+import Kernel.Regex
 import Kernel.String
 import Kernel.Utils
 import Maybe.Extra
@@ -222,6 +224,18 @@ functions evalFunction =
           -- Decode runners (need evalFunction)
         , ( "runOnString", jsonRunOnString evalFunction )
         , ( "run", jsonRun evalFunction )
+        ]
+      )
+
+    -- Elm.Kernel.Regex
+    , ( [ "Elm", "Kernel", "Regex" ]
+      , [ ( "never", constant anything Kernel.Regex.never )
+        , ( "infinity", constant anything Kernel.Regex.infinity )
+        , ( "fromStringWith", two anything string to anything Kernel.Regex.fromStringWith Core.Regex.fromStringWith )
+        , ( "contains", two anything string to anything Kernel.Regex.contains Core.Regex.contains )
+        , ( "findAtMost", three int anything string to anything Kernel.Regex.findAtMost Core.Regex.findAtMost )
+        , ( "splitAtMost", three int anything string to anything Kernel.Regex.splitAtMost Core.Regex.splitAtMost )
+        , ( "replaceAtMost", regexReplaceAtMost evalFunction )
         ]
       )
     ]
@@ -860,4 +874,31 @@ jsonMapNEntry arity _ =
 
             _ ->
                 EvalResult.fail <| typeError env ("Expected " ++ String.fromInt arity ++ " arguments for mapN")
+    )
+
+
+{-| Custom kernel entry for Regex.replaceAtMost.
+Takes n, regex, replacer (function), string. Needs evalFunction for the replacer callback.
+-}
+regexReplaceAtMost : EvalFunction -> ModuleName -> ( Int, List Value -> Eval Value )
+regexReplaceAtMost evalFn _ =
+    ( 4
+    , \args cfg env ->
+        case args of
+            [ Int n, regexVal, replacerVal, String str ] ->
+                case replacerVal of
+                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation ->
+                        let
+                            applyReplacer : Value -> Eval Value
+                            applyReplacer matchVal c _ =
+                                evalFn (oldArgs ++ [ matchVal ]) patterns maybeName implementation c closureEnv
+                        in
+                        Kernel.Regex.replaceAtMost n regexVal applyReplacer str cfg env
+                            |> EvalResult.map String
+
+                    _ ->
+                        EvalResult.fail <| typeError env "Regex.replace: third argument must be a function"
+
+            _ ->
+                EvalResult.fail <| typeError env "Regex.replaceAtMost: expected Int, Regex, function, String"
     )

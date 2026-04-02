@@ -3,6 +3,7 @@ module Types exposing (CallTree(..), Config, Env, EnvValues, Error(..), Eval, Ev
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
+import Regex
 import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (Pattern, QualifiedNameRef)
 import FastDict exposing (Dict)
@@ -68,6 +69,7 @@ type Value
     | List (List Value)
     | JsonValue JsonVal
     | JsonDecoderValue JsonDecoder
+    | RegexValue Regex.Regex
 
 
 {-| JSON value representation for Json.Encode.Value / Json.Decode.Value.

@@ -212,6 +212,9 @@ innerCompare l r env =
         ( JsonDecoderValue _, _ ) ->
             Err <| typeError env "Cannot compare JSON decoders"
 
+        ( RegexValue _, _ ) ->
+            Err <| typeError env "Cannot compare Regex values"
+
 
 compareListHelp : List Value -> List Value -> Env -> Result EvalErrorData Order
 compareListHelp ll rl env =

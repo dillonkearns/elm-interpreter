@@ -106,6 +106,9 @@ toExpression value =
             JsonDecoderValue _ ->
                 Expression.FunctionOrValue [ "Json", "Decode" ] "decoder"
 
+            RegexValue _ ->
+                Expression.FunctionOrValue [ "Regex" ] "regex"
+
             PartiallyApplied _ [] _ (Just qualifiedName) _ ->
                 Expression.FunctionOrValue qualifiedName.moduleName qualifiedName.name
 
@@ -339,6 +342,9 @@ toString value =
 
         JsonDecoderValue _ ->
             "<decoder>"
+
+        RegexValue _ ->
+            "<regex>"
 
         PartiallyApplied _ _ _ _ _ ->
             "<function>"
