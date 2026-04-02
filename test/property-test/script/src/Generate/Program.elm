@@ -22,12 +22,14 @@ import Elm.Let
 import Elm.Op
 import Gen.Basics
 import Gen.Char
+import Gen.Json.Decode
+import Gen.Json.Encode
 import Gen.List
 import Gen.Maybe
 import Gen.Platform
-import Gen.Result
 import Gen.Platform.Cmd
 import Gen.Platform.Sub
+import Gen.Result
 import Gen.String
 import Gen.Tuple
 import Random
@@ -92,16 +94,17 @@ allTestGenerators =
         patternAndEdgeCaseGenerator
 
 
-{-| Combines custom type tests with pattern matching edge case tests.
+{-| Combines custom type tests, pattern matching edge cases, and JSON tests.
 -}
 patternAndEdgeCaseGenerator : Random.Generator ModuleParts
 patternAndEdgeCaseGenerator =
-    Random.map2
-        (\custom patterns ->
-            combineParts [ custom, patterns ]
+    Random.map3
+        (\custom patterns json ->
+            combineParts [ custom, patterns, json ]
         )
         customTypeTestGenerator
         (Random.map (\exprs -> { emptyParts | testExprs = exprs }) patternMatchExprGenerator)
+        (Random.map (\exprs -> { emptyParts | testExprs = exprs }) jsonTestGenerator)
 
 
 {-| Extended advanced tests: wraps original advancedTestGenerator + adds
@@ -1436,6 +1439,203 @@ randomChar idx =
         7 -> '!'
         8 -> 'x'
         _ -> 'q'
+
+
+
+-- JSON ENCODE/DECODE ROUNDTRIP GENERATOR
+
+
+jsonTestGenerator : Random.Generator (List Elm.Expression)
+jsonTestGenerator =
+    Random.int 2 5
+        |> Random.andThen (\count -> Random.list count singleJsonTest)
+
+
+singleJsonTest : Random.Generator Elm.Expression
+singleJsonTest =
+    Random.int 0 8
+        |> Random.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        -- Int encode/decode roundtrip
+                        Random.map
+                            (\n ->
+                                let
+                                    encoded = Gen.Json.Encode.call_.encode (Elm.int 0) (Gen.Json.Encode.call_.int (Elm.int n))
+                                in
+                                Elm.Case.result
+                                    (Gen.Json.Decode.call_.decodeString Gen.Json.Decode.int encoded)
+                                    { err = ( "e", \_ -> Elm.string "Err" )
+                                    , ok = ( "v", \v -> Elm.Op.append (Elm.string "Ok:") (Gen.String.call_.fromInt v) )
+                                    }
+                            )
+                            (Random.int -1000 1000)
+
+                    1 ->
+                        -- String encode/decode roundtrip
+                        Random.map
+                            (\idx ->
+                                let
+                                    word = randomWord idx
+                                    encoded = Gen.Json.Encode.call_.encode (Elm.int 0) (Gen.Json.Encode.call_.string (Elm.string word))
+                                in
+                                Elm.Case.result
+                                    (Gen.Json.Decode.call_.decodeString Gen.Json.Decode.string encoded)
+                                    { err = ( "e", \_ -> Elm.string "Err" )
+                                    , ok = ( "v", \v -> Elm.Op.append (Elm.string "Ok:") v )
+                                    }
+                            )
+                            (Random.int 0 9)
+
+                    2 ->
+                        -- Bool encode/decode roundtrip
+                        Random.map
+                            (\b ->
+                                let
+                                    boolVal = b > 0
+                                    encoded = Gen.Json.Encode.call_.encode (Elm.int 0) (Gen.Json.Encode.call_.bool (Elm.bool boolVal))
+                                in
+                                Elm.Case.result
+                                    (Gen.Json.Decode.call_.decodeString Gen.Json.Decode.bool encoded)
+                                    { err = ( "e", \_ -> Elm.string "Err" )
+                                    , ok = ( "v", \v -> Elm.ifThen v (Elm.string "Ok:T") (Elm.string "Ok:F") )
+                                    }
+                            )
+                            (Random.int 0 1)
+
+                    3 ->
+                        -- List of ints encode/decode roundtrip
+                        randomIntList 2 5
+                            |> Random.map
+                                (\items ->
+                                    let
+                                        encoded =
+                                            Gen.Json.Encode.call_.encode (Elm.int 0)
+                                                (Gen.Json.Encode.call_.list Gen.Json.Encode.values_.int
+                                                    (Elm.list (List.map Elm.int items))
+                                                )
+                                    in
+                                    Elm.Case.result
+                                        (Gen.Json.Decode.call_.decodeString
+                                            (Gen.Json.Decode.call_.list Gen.Json.Decode.int)
+                                            encoded
+                                        )
+                                        { err = ( "e", \_ -> Elm.string "Err" )
+                                        , ok = ( "vs", \vs ->
+                                            Elm.Op.append (Elm.string "Ok:")
+                                                (Gen.String.call_.join (Elm.string ",")
+                                                    (Gen.List.call_.map Gen.String.values_.fromInt vs)
+                                                )
+                                            )
+                                        }
+                                )
+
+                    4 ->
+                        -- Object with field decode
+                        Random.map2
+                            (\idx n ->
+                                let
+                                    name = randomWord idx
+                                    encoded =
+                                        Gen.Json.Encode.call_.encode (Elm.int 0)
+                                            (Gen.Json.Encode.call_.object
+                                                (Elm.list
+                                                    [ Elm.tuple (Elm.string "name") (Gen.Json.Encode.call_.string (Elm.string name))
+                                                    , Elm.tuple (Elm.string "value") (Gen.Json.Encode.call_.int (Elm.int n))
+                                                    ]
+                                                )
+                                            )
+                                in
+                                Elm.Case.result
+                                    (Gen.Json.Decode.call_.decodeString
+                                        (Gen.Json.Decode.call_.field (Elm.string "name") Gen.Json.Decode.string)
+                                        encoded
+                                    )
+                                    { err = ( "e", \_ -> Elm.string "Err" )
+                                    , ok = ( "v", \v -> Elm.Op.append (Elm.string "Ok:") v )
+                                    }
+                            )
+                            (Random.int 0 9)
+                            (Random.int -100 100)
+
+                    5 ->
+                        -- Decode.map
+                        Random.map
+                            (\n ->
+                                let
+                                    encoded = Gen.Json.Encode.call_.encode (Elm.int 0) (Gen.Json.Encode.call_.int (Elm.int n))
+                                    decoder =
+                                        Gen.Json.Decode.call_.map
+                                            (Elm.fn (Elm.Arg.var "x")
+                                                (\x -> Elm.Op.multiply x (Elm.int 2))
+                                                |> Elm.withType (Type.function [ Type.int ] Type.int)
+                                            )
+                                            Gen.Json.Decode.int
+                                in
+                                Elm.Case.result
+                                    (Gen.Json.Decode.call_.decodeString decoder encoded)
+                                    { err = ( "e", \_ -> Elm.string "Err" )
+                                    , ok = ( "v", \v -> Elm.Op.append (Elm.string "Ok:") (Gen.String.call_.fromInt v) )
+                                    }
+                            )
+                            (Random.int -50 50)
+
+                    6 ->
+                        -- Decode.null
+                        Random.map
+                            (\n ->
+                                Elm.Case.result
+                                    (Gen.Json.Decode.call_.decodeString
+                                        (Gen.Json.Decode.call_.null (Elm.int n))
+                                        (Elm.string "null")
+                                    )
+                                    { err = ( "e", \_ -> Elm.string "Err" )
+                                    , ok = ( "v", \v -> Elm.Op.append (Elm.string "Ok:") (Gen.String.call_.fromInt v) )
+                                    }
+                            )
+                            (Random.int -50 50)
+
+                    7 ->
+                        -- Decode.succeed always succeeds
+                        Random.map
+                            (\idx ->
+                                let
+                                    word = randomWord idx
+                                in
+                                Elm.Case.result
+                                    (Gen.Json.Decode.call_.decodeString
+                                        (Gen.Json.Decode.call_.succeed (Elm.string word))
+                                        (Elm.string "42")
+                                    )
+                                    { err = ( "e", \_ -> Elm.string "Err" )
+                                    , ok = ( "v", \v -> Elm.Op.append (Elm.string "Ok:") v )
+                                    }
+                            )
+                            (Random.int 0 9)
+
+                    _ ->
+                        -- Decode.index
+                        Random.map
+                            (\n ->
+                                let
+                                    encoded =
+                                        Gen.Json.Encode.call_.encode (Elm.int 0)
+                                            (Gen.Json.Encode.call_.list Gen.Json.Encode.values_.int
+                                                (Elm.list [ Elm.int 10, Elm.int 20, Elm.int 30 ])
+                                            )
+                                in
+                                Elm.Case.result
+                                    (Gen.Json.Decode.call_.decodeString
+                                        (Gen.Json.Decode.call_.index (Elm.int 1) Gen.Json.Decode.int)
+                                        encoded
+                                    )
+                                    { err = ( "e", \_ -> Elm.string "Err" )
+                                    , ok = ( "v", \v -> Elm.Op.append (Elm.string "Ok:") (Gen.String.call_.fromInt v) )
+                                    }
+                            )
+                            (Random.int 0 2)
+            )
 
 
 
