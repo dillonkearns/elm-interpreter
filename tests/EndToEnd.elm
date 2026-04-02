@@ -41,6 +41,7 @@ suite =
         , debugToStringTests
         , parserEdgeCaseTests
         , stepLimitTests
+        , taskTests
         ]
 
 
@@ -756,4 +757,45 @@ stepLimitTests =
                 Eval.evalWithMaxSteps Nothing
                     "let loop n = if n <= 0 then 0 else loop (n - 1) in loop 100"
                     |> Expect.equal (Ok (Int 0))
+        ]
+
+
+taskTests : Test
+taskTests =
+    describe "Task module"
+        [ evalTestModule "Task.succeed produces a value"
+            """module Temp exposing (main)
+import Task
+main = Task.succeed 42 == Task.succeed 42
+"""
+            Bool
+            True
+        , evalTestModule "Task.fail produces a value"
+            """module Temp exposing (main)
+import Task
+main = Task.fail "oops" == Task.fail "oops"
+"""
+            Bool
+            True
+        , evalTestModule "Task.succeed and Task.fail are different"
+            """module Temp exposing (main)
+import Task
+main = Task.succeed 1 == Task.fail 1
+"""
+            Bool
+            False
+        , evalTestModule "Task.map transforms succeed value"
+            """module Temp exposing (main)
+import Task
+main = Task.map ((+) 1) (Task.succeed 3) == Task.succeed 4
+"""
+            Bool
+            True
+        , evalTestModule "Task.andThen chains succeed"
+            """module Temp exposing (main)
+import Task
+main = Task.andThen (\\x -> Task.succeed (x + 1)) (Task.succeed 3) == Task.succeed 4
+"""
+            Bool
+            True
         ]

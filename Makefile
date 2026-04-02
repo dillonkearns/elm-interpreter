@@ -5,7 +5,9 @@ all: generated/Core/Basics.elm
 
 KERNEL_PATH = build/src/elm/kernel/0.0.0
 
-generated/Core/Basics.elm: codegen/Gen/Basics.elm codegen/Generate.elm node_modules/elm-codegen/bin/elm-codegen $(patsubst %,build/src/%/elm.json,$(LIBRARIES)) $(KERNEL_PATH)/src/Elm/Kernel/List.elm
+CORE_SRC_OVERRIDES = build/src/elm/core/1.0.5/src/Task.elm
+
+generated/Core/Basics.elm: codegen/Gen/Basics.elm codegen/Generate.elm node_modules/elm-codegen/bin/elm-codegen $(patsubst %,build/src/%/elm.json,$(LIBRARIES)) $(KERNEL_PATH)/src/Elm/Kernel/List.elm $(CORE_SRC_OVERRIDES)
 	yarn elm-codegen run --flags-from build/src
 
 codegen/Gen/Basics.elm: codegen/elm.codegen.json node_modules/elm-codegen/bin/elm-codegen $(wildcard helpers/*.elm)
@@ -30,6 +32,11 @@ build/src/%/elm.json: build/%.tar.gz
 $(KERNEL_PATH)/src/Elm/Kernel/List.elm: $(wildcard codegen/Elm/Kernel/*.elm)
 	mkdir -p $(KERNEL_PATH)/src/Elm
 	cp -r codegen/Elm/Kernel $(KERNEL_PATH)/src/Elm/
+
+# Copy source overrides (e.g. simplified Task.elm) into the downloaded elm/core tree
+# so the codegen picks them up instead of the originals
+build/src/elm/core/1.0.5/src/Task.elm: codegen/Elm/src/Task.elm build/src/elm/core/1.0.5/elm.json
+	cp $< $@
 
 ALL_GENERATED = $(shell find generated -type f -name '*.elm')
 ALL_SRC = $(shell find src -type f -name '*.elm')
