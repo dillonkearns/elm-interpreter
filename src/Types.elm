@@ -1,4 +1,4 @@
-module Types exposing (CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, PartialEval, PartialResult, Value(..))
+module Types exposing (CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -66,6 +66,41 @@ type Value
     | PartiallyApplied Env (List Value) (List (Node Pattern)) (Maybe QualifiedNameRef) Implementation
     | JsArray (Array Value)
     | List (List Value)
+    | JsonValue JsonVal
+    | JsonDecoderValue JsonDecoder
+
+
+{-| JSON value representation for Json.Encode.Value / Json.Decode.Value.
+-}
+type JsonVal
+    = JsonNull
+    | JsonBool Bool
+    | JsonInt Int
+    | JsonFloat Float
+    | JsonString String
+    | JsonArray (List JsonVal)
+    | JsonObject (List ( String, JsonVal ))
+
+
+{-| Decoder combinator tree for Json.Decode.Decoder.
+-}
+type JsonDecoder
+    = DecodeString
+    | DecodeBool
+    | DecodeInt
+    | DecodeFloat
+    | DecodeValue
+    | DecodeNull Value
+    | DecodeList JsonDecoder
+    | DecodeArray JsonDecoder
+    | DecodeField String JsonDecoder
+    | DecodeIndex Int JsonDecoder
+    | DecodeKeyValuePairs JsonDecoder
+    | DecodeMap Value (List JsonDecoder)
+    | DecodeAndThen Value JsonDecoder
+    | DecodeOneOf (List JsonDecoder)
+    | DecodeFail String
+    | DecodeSucceed Value
 
 
 {-| Function implementation: either an AST expression to evaluate,
@@ -111,3 +146,19 @@ type EvalErrorKind
     | Unsupported String
     | NameError String
     | Todo String
+
+
+evalErrorKindToString : EvalErrorKind -> String
+evalErrorKindToString kind =
+    case kind of
+        TypeError msg ->
+            "TypeError: " ++ msg
+
+        Unsupported msg ->
+            "Unsupported: " ++ msg
+
+        NameError msg ->
+            "NameError: " ++ msg
+
+        Todo msg ->
+            "Todo: " ++ msg

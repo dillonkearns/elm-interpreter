@@ -8,6 +8,8 @@ import Core.Bitwise
 import Core.Char
 import Core.Debug
 import Core.Elm.JsArray
+import Core.Json.Decode
+import Core.Json.Encode
 import Core.List
 import Core.String
 import Elm.Syntax.Expression as Expression exposing (Expression(..), FunctionImplementation)
@@ -20,12 +22,13 @@ import FastDict as Dict exposing (Dict)
 import Kernel.Basics
 import Kernel.Debug
 import Kernel.JsArray
+import Kernel.Json
 import Kernel.List
 import Kernel.String
 import Kernel.Utils
 import Maybe.Extra
 import Syntax exposing (fakeNode)
-import Types exposing (Eval, EvalErrorData, EvalResult, Implementation(..), Value(..))
+import Types exposing (Eval, EvalErrorData, EvalResult, Implementation(..), JsonDecoder(..), Value(..))
 import Value exposing (typeError)
 
 
@@ -175,6 +178,50 @@ functions evalFunction =
         , ( "equal", Kernel.Utils.comparison [ EQ ] )
         , ( "notEqual", Kernel.Utils.comparison [ LT, GT ] )
         , ( "compare", twoWithError anything anything to order Kernel.Utils.compare Core.Basics.compare )
+        ]
+      )
+
+    -- Elm.Kernel.Json
+    , ( [ "Elm", "Kernel", "Json" ]
+      , [ -- Encode
+          ( "wrap", one anything to anything Kernel.Json.wrap Core.Json.Encode.string )
+        , ( "encode", twoWithError int anything to string Kernel.Json.encode Core.Json.Encode.encode )
+        , ( "encodeNull", constant anything Kernel.Json.encodeNull )
+        , ( "encodeList", twoWithError (function evalFunction anything to anything) anyList to anything Kernel.Json.encodeList Core.Json.Encode.null )
+        , ( "encodeObject", oneWithError anyList to anything Kernel.Json.encodeObject Core.Json.Encode.null )
+        , ( "emptyArray", one anything to anything Kernel.Json.emptyArray Core.Json.Encode.null )
+        , ( "emptyObject", one anything to anything Kernel.Json.emptyObject Core.Json.Encode.null )
+        , ( "addEntry", threeWithError (function evalFunction anything to anything) anything anyList to anyList Kernel.Json.addEntry Core.Json.Encode.null )
+        , ( "addField", three string anything anything to anything Kernel.Json.addField Core.Json.Encode.null )
+
+          -- Decode constructors
+        , ( "decodeString", constant anything Kernel.Json.decodeString )
+        , ( "decodeBool", constant anything Kernel.Json.decodeBool )
+        , ( "decodeInt", constant anything Kernel.Json.decodeInt )
+        , ( "decodeFloat", constant anything Kernel.Json.decodeFloat )
+        , ( "decodeValue", constant anything Kernel.Json.decodeValue )
+        , ( "decodeNull", one anything to anything Kernel.Json.decodeNull Core.Json.Decode.null )
+        , ( "decodeList", one anything to anything Kernel.Json.decodeList Core.Json.Decode.list )
+        , ( "decodeArray", one anything to anything Kernel.Json.decodeArray Core.Json.Decode.array )
+        , ( "decodeField", two string anything to anything Kernel.Json.decodeField Core.Json.Decode.field )
+        , ( "decodeIndex", two int anything to anything Kernel.Json.decodeIndex Core.Json.Decode.index )
+        , ( "decodeKeyValuePairs", one anything to anything Kernel.Json.decodeKeyValuePairs Core.Json.Decode.keyValuePairs )
+        , ( "succeed", one anything to anything Kernel.Json.succeed Core.Json.Decode.succeed )
+        , ( "fail", one string to anything Kernel.Json.fail Core.Json.Decode.fail )
+        , ( "oneOf", one anyList to anything Kernel.Json.oneOf Core.Json.Decode.oneOf )
+        , ( "map1", two anything anything to anything Kernel.Json.jsonMap1 Core.Json.Decode.map )
+        , ( "map2", three anything anything anything to anything Kernel.Json.jsonMap2 Core.Json.Decode.map2 )
+        , ( "map3", jsonMapNEntry 4 )
+        , ( "map4", jsonMapNEntry 5 )
+        , ( "map5", jsonMapNEntry 6 )
+        , ( "map6", jsonMapNEntry 7 )
+        , ( "map7", jsonMapNEntry 8 )
+        , ( "map8", jsonMapNEntry 9 )
+        , ( "andThen", two anything anything to anything Kernel.Json.jsonAndThen Core.Json.Decode.andThen )
+
+          -- Decode runners (need evalFunction)
+        , ( "runOnString", jsonRunOnString evalFunction )
+        , ( "run", jsonRun evalFunction )
         ]
       )
     ]
@@ -740,4 +787,77 @@ twoNumbers fInt fFloat implementation moduleName =
 
             _ ->
                 EvalResult.fail <| typeError env "Expected two numbers"
+    )
+
+
+{-| Custom kernel entry for Json.Decode.runOnString.
+Captures evalFunction so the decoder engine can apply Elm functions.
+-}
+jsonRunOnString : EvalFunction -> ModuleName -> ( Int, List Value -> Eval Value )
+jsonRunOnString evalFn _ =
+    ( 2
+    , \args cfg env ->
+        case args of
+            [ decoderVal, String jsonString ] ->
+                Kernel.Json.runOnString evalFn decoderVal jsonString cfg env
+
+            [ _ ] ->
+                EvalResult.fail <| typeError env "Json.Decode.decodeString needs two arguments"
+
+            [] ->
+                EvalResult.fail <| typeError env "Json.Decode.decodeString needs two arguments"
+
+            _ ->
+                EvalResult.fail <| typeError env "Json.Decode.decodeString: expected a Decoder and a String"
+    )
+
+
+{-| Custom kernel entry for Json.Decode.decodeValue.
+-}
+jsonRun : EvalFunction -> ModuleName -> ( Int, List Value -> Eval Value )
+jsonRun evalFn _ =
+    ( 2
+    , \args cfg env ->
+        case args of
+            [ decoderVal, jsonVal ] ->
+                Kernel.Json.run evalFn decoderVal jsonVal cfg env
+
+            [ _ ] ->
+                EvalResult.fail <| typeError env "Json.Decode.decodeValue needs two arguments"
+
+            [] ->
+                EvalResult.fail <| typeError env "Json.Decode.decodeValue needs two arguments"
+
+            _ ->
+                EvalResult.fail <| typeError env "Json.Decode.decodeValue: expected a Decoder and a Value"
+    )
+
+
+{-| Generic kernel entry for Json.Decode.mapN (N >= 3).
+The first arg is the function, rest are decoders.
+-}
+jsonMapNEntry : Int -> ModuleName -> ( Int, List Value -> Eval Value )
+jsonMapNEntry arity _ =
+    ( arity
+    , \args _ env ->
+        case args of
+            func :: decoderArgs ->
+                if List.length args == arity then
+                    let
+                        extractDecoder : Value -> JsonDecoder
+                        extractDecoder v =
+                            case v of
+                                JsonDecoderValue d ->
+                                    d
+
+                                _ ->
+                                    DecodeFail "mapN: not a decoder"
+                    in
+                    EvalResult.succeed (JsonDecoderValue (DecodeMap func (List.map extractDecoder decoderArgs)))
+
+                else
+                    EvalResult.fail <| typeError env ("Expected " ++ String.fromInt arity ++ " arguments for mapN")
+
+            _ ->
+                EvalResult.fail <| typeError env ("Expected " ++ String.fromInt arity ++ " arguments for mapN")
     )

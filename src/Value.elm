@@ -5,7 +5,7 @@ import Elm.Syntax.Expression as Expression exposing (Expression)
 import Elm.Syntax.Node exposing (Node)
 import FastDict as Dict
 import Syntax exposing (fakeNode)
-import Types exposing (Env, EvalErrorData, EvalErrorKind(..), Implementation(..), Value(..))
+import Types exposing (Env, EvalErrorData, EvalErrorKind(..), Implementation(..), JsonDecoder(..), JsonVal(..), Value(..))
 
 
 typeError : Env -> String -> EvalErrorData
@@ -98,6 +98,13 @@ toExpression value =
 
             JsArray array ->
                 arrayToExpression "JsArray" (Array.toList array)
+
+            JsonValue _ ->
+                -- Json.Encode.Value is opaque; represent as a placeholder
+                Expression.FunctionOrValue [ "Json", "Encode" ] "value"
+
+            JsonDecoderValue _ ->
+                Expression.FunctionOrValue [ "Json", "Decode" ] "decoder"
 
             PartiallyApplied _ [] _ (Just qualifiedName) _ ->
                 Expression.FunctionOrValue qualifiedName.moduleName qualifiedName.name
@@ -327,6 +334,12 @@ toString value =
         JsArray arr ->
             "[" ++ String.join "," (List.map toString (Array.toList arr)) ++ "]"
 
+        JsonValue json ->
+            jsonValToString json
+
+        JsonDecoderValue _ ->
+            "<decoder>"
+
         PartiallyApplied _ _ _ _ _ ->
             "<function>"
 
@@ -414,6 +427,35 @@ fromOrder order =
 
         GT ->
             gtValue
+
+
+jsonValToString : JsonVal -> String
+jsonValToString json =
+    case json of
+        JsonNull ->
+            "<null>"
+
+        JsonBool b ->
+            if b then
+                "<true>"
+
+            else
+                "<false>"
+
+        JsonInt i ->
+            "<" ++ String.fromInt i ++ ">"
+
+        JsonFloat f ->
+            "<" ++ String.fromFloat f ++ ">"
+
+        JsonString s ->
+            "<\"" ++ s ++ "\">"
+
+        JsonArray items ->
+            "<[" ++ String.join "," (List.map jsonValToString items) ++ "]>"
+
+        JsonObject pairs ->
+            "<{" ++ String.join "," (List.map (\( k, v ) -> k ++ ":" ++ jsonValToString v) pairs) ++ "}>"
 
 
 toOrder : Value -> Maybe Order
