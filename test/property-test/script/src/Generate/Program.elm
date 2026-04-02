@@ -59,12 +59,18 @@ programGenerator index =
     allTestGenerators
         |> Random.map
             (\parts ->
+                let
+                    -- Wrap each expr in identity to force parenthesization,
+                    -- avoiding bare case/if inside list literals
+                    wrappedExprs =
+                        List.map (\e -> Gen.Basics.call_.identity e) parts.testExprs
+                in
                 Elm.file [ moduleName ]
                     ([ Elm.portOutgoing "output" Type.string ]
                         ++ parts.declarations
                         ++ [ Elm.declaration "computeResult"
                                 (Gen.String.call_.join (Elm.string "|")
-                                    (Elm.list parts.testExprs)
+                                    (Elm.list wrappedExprs)
                                 )
                            , mainDeclaration
                            ]
@@ -82,7 +88,19 @@ allTestGenerators =
         (Random.map (\exprs -> { emptyParts | testExprs = exprs }) stringTestGenerator)
         (Random.map (\exprs -> { emptyParts | testExprs = exprs }) listTestGenerator)
         advancedTestGenerator2
+        patternAndEdgeCaseGenerator
+
+
+{-| Combines custom type tests with pattern matching edge case tests.
+-}
+patternAndEdgeCaseGenerator : Random.Generator ModuleParts
+patternAndEdgeCaseGenerator =
+    Random.map2
+        (\custom patterns ->
+            combineParts [ custom, patterns ]
+        )
         customTypeTestGenerator
+        (Random.map (\exprs -> { emptyParts | testExprs = exprs }) patternMatchExprGenerator)
 
 
 {-| Extended advanced tests: wraps original advancedTestGenerator + adds
@@ -1041,6 +1059,218 @@ singleMiscExpr =
 
 
 
+-- PATTERN MATCHING EDGE CASE GENERATOR
+
+
+patternMatchExprGenerator : Random.Generator (List Elm.Expression)
+patternMatchExprGenerator =
+    Random.int 3 6
+        |> Random.andThen (\count -> Random.list count singlePatternTest)
+
+
+singlePatternTest : Random.Generator Elm.Expression
+singlePatternTest =
+    Random.int 0 9
+        |> Random.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        -- Case on integer literal patterns (non-negative only; negative literals aren't valid patterns in Elm)
+                        Random.map3
+                            (\a b target ->
+                                Elm.Case.custom (Elm.int target)
+                                    Type.int
+                                    [ Elm.Case.branch (Elm.Arg.int a) (\_ -> Elm.string ("got" ++ String.fromInt a))
+                                    , Elm.Case.branch (Elm.Arg.int b) (\_ -> Elm.string ("got" ++ String.fromInt b))
+                                    , Elm.Case.branch (Elm.Arg.var "other") (\other -> Gen.String.call_.fromInt other)
+                                    ]
+                            )
+                            (Random.int 0 20)
+                            (Random.int 21 40)
+                            (Random.int -20 40)
+
+                    1 ->
+                        -- Tuple destructuring in let
+                        Random.map3
+                            (\a b c ->
+                                Elm.Let.letIn
+                                    (\pair ->
+                                        Gen.String.call_.fromInt
+                                            (Elm.Op.plus
+                                                (Gen.Tuple.call_.first pair)
+                                                (Elm.Op.multiply (Gen.Tuple.call_.second pair) (Elm.int c))
+                                            )
+                                    )
+                                    |> Elm.Let.value "pair" (Elm.tuple (Elm.int a) (Elm.int b))
+                                    |> Elm.Let.toExpression
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+
+                    2 ->
+                        -- Case on string literal patterns
+                        Random.map2
+                            (\idx extra ->
+                                let
+                                    word = randomWord idx
+                                in
+                                Elm.Case.custom (Elm.string word)
+                                    Type.string
+                                    [ Elm.Case.branch (Elm.Arg.string "hello") (\_ -> Elm.string "greeting")
+                                    , Elm.Case.branch (Elm.Arg.string "world") (\_ -> Elm.string "planet")
+                                    , Elm.Case.branch (Elm.Arg.string "foo") (\_ -> Elm.string "metavar")
+                                    , Elm.Case.branch (Elm.Arg.var "s") (\s -> Elm.Op.append (Elm.string "other:") s)
+                                    ]
+                            )
+                            (Random.int 0 9)
+                            (Random.int 0 9)
+
+                    3 ->
+                        -- Char literal
+                        Random.map
+                            (\idx ->
+                                let
+                                    c = randomChar idx
+                                in
+                                Gen.String.call_.fromChar (Elm.char c)
+                            )
+                            (Random.int 0 9)
+
+                    4 ->
+                        -- Float arithmetic
+                        Random.map2
+                            (\a b ->
+                                Gen.String.call_.fromFloat
+                                    (Elm.Op.plus (Elm.float (toFloat a / 10.0)) (Elm.float (toFloat b / 10.0)))
+                            )
+                            (Random.int -100 100)
+                            (Random.int -100 100)
+
+                    5 ->
+                        -- Nested Maybe pattern matching (Just (Just x) vs Just Nothing vs Nothing)
+                        Random.map2
+                            (\a useInner ->
+                                let
+                                    innerMaybe =
+                                        if useInner then
+                                            Gen.Maybe.make_.just (Elm.int a)
+                                        else
+                                            Gen.Maybe.make_.nothing
+
+                                    outerMaybe =
+                                        if a > 0 then
+                                            Gen.Maybe.make_.just innerMaybe
+                                        else
+                                            Gen.Maybe.make_.nothing
+                                in
+                                Elm.Case.maybe outerMaybe
+                                    { nothing = Elm.string "none"
+                                    , just =
+                                        ( "inner"
+                                        , \inner ->
+                                            Elm.Case.maybe inner
+                                                { nothing = Elm.string "just-nothing"
+                                                , just = ( "v", \v -> Elm.Op.append (Elm.string "val:") (Gen.String.call_.fromInt v) )
+                                                }
+                                        )
+                                    }
+                            )
+                            (Random.int -10 10)
+                            (Random.map (\n -> n > 0) (Random.int 0 1))
+
+                    6 ->
+                        -- List.sort
+                        randomIntList 3 6
+                            |> Random.map
+                                (\items ->
+                                    Gen.String.call_.join (Elm.string ",")
+                                        (Gen.List.call_.map Gen.String.values_.fromInt
+                                            (Gen.List.sort (List.map Elm.int items))
+                                        )
+                                )
+
+                    7 ->
+                        -- Multiple let bindings referencing each other
+                        Random.map3
+                            (\a b c ->
+                                Elm.Let.letIn
+                                    (\x ->
+                                        Elm.Let.letIn
+                                            (\y ->
+                                                Elm.Let.letIn
+                                                    (\z ->
+                                                        Gen.String.call_.fromInt (Elm.Op.plus x (Elm.Op.plus y z))
+                                                    )
+                                                    |> Elm.Let.value "z" (Elm.Op.multiply x y)
+                                                    |> Elm.Let.toExpression
+                                            )
+                                            |> Elm.Let.value "y" (Elm.Op.plus x (Elm.int b))
+                                            |> Elm.Let.toExpression
+                                    )
+                                    |> Elm.Let.value "x" (Elm.int a)
+                                    |> Elm.Let.toExpression
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    8 ->
+                        -- List.any / List.all
+                        randomIntList 3 7
+                            |> Random.map
+                                (\items ->
+                                    Elm.ifThen
+                                        (Gen.List.call_.any
+                                            (Elm.fn (Elm.Arg.var "n")
+                                                (\n -> Elm.Op.gt n (Elm.int 0))
+                                                |> Elm.withType (Type.function [ Type.int ] Type.bool)
+                                            )
+                                            (Elm.list (List.map Elm.int items))
+                                        )
+                                        (Elm.ifThen
+                                            (Gen.List.call_.all
+                                                (Elm.fn (Elm.Arg.var "n")
+                                                    (\n -> Elm.Op.gt n (Elm.int 0))
+                                                    |> Elm.withType (Type.function [ Type.int ] Type.bool)
+                                                )
+                                                (Elm.list (List.map Elm.int items))
+                                            )
+                                            (Elm.string "all-pos")
+                                            (Elm.string "some-pos")
+                                        )
+                                        (Elm.string "none-pos")
+                                )
+
+                    _ ->
+                        -- Not operator
+                        Random.map
+                            (\a ->
+                                Elm.ifThen
+                                    (Gen.Basics.call_.not (Elm.Op.gt (Elm.int a) (Elm.int 0)))
+                                    (Elm.string "not-positive")
+                                    (Elm.string "positive")
+                            )
+                            (Random.int -10 10)
+            )
+
+
+randomChar : Int -> Char
+randomChar idx =
+    case modBy 10 idx of
+        0 -> 'a'
+        1 -> 'z'
+        2 -> 'A'
+        3 -> 'Z'
+        4 -> '0'
+        5 -> '9'
+        6 -> ' '
+        7 -> '!'
+        8 -> 'x'
+        _ -> 'q'
+
+
+
 -- HELPERS
 
 
@@ -1048,9 +1278,3 @@ randomIntList : Int -> Int -> Random.Generator (List Int)
 randomIntList minLen maxLen =
     Random.int minLen maxLen
         |> Random.andThen (\len -> Random.list len (Random.int -50 50))
-
-
-{-| Combine 5 generators into a single generator of lists.
--}
-map5 =
-    Random.map5
