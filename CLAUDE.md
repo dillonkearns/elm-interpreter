@@ -12,9 +12,18 @@ touch yarn.lock        # Makefile expects yarn.lock to exist
 make all               # downloads elm/core source, runs elm-codegen, produces generated/
 ```
 
-This produces `generated/Core/Basics.elm` and all other generated Core modules that the interpreter needs to function. Without this step, compilation will fail with missing module errors.
+**What `make all` does:**
+1. `yarn install` — installs elm-codegen CLI
+2. Downloads elm/core, elm/json, elm/regex, etc. source tarballs from GitHub into `build/`
+3. Copies `codegen/Elm/Kernel/*.elm` into `build/src/elm/kernel/` (ONLY the `Kernel/` subdirectory — not `codegen/Elm/src/`)
+4. Runs `elm-codegen run --flags-from build/src` — reads the library sources and produces `generated/Core/*.elm`
 
-If `make all` fails with "No rule to make target 'yarn.lock'", you forgot `touch yarn.lock`.
+The `generated/` directory contains the Core library as Elm AST data structures (e.g. `generated/Core/Basics.elm` has all `Basics` function implementations as `FunctionImplementation` records). Without this step, compilation will fail with missing module errors.
+
+**Common errors:**
+- "No rule to make target 'yarn.lock'" → you forgot `touch yarn.lock`
+- Missing `generated/Core/Basics.elm` → you need to run `make all`
+- `SyntaxError: Invalid or unexpected token` when running interpreter.js → `generated/` files are stale or from a different branch, re-run `make all`
 
 ## Running Tests
 
@@ -33,10 +42,15 @@ npx elm-test-rs --filter "sort"    # run tests matching a pattern
   - `Kernel/*.elm` - Native implementations (Basics, List, String, Json, etc.)
   - `Types.elm` - Value types, Error types, EvalResult
   - `Value.elm` - Value utilities and Debug.toString
-- `generated/` - **gitignored** - Generated from `make all`, contains Core library AST
-- `codegen/` - elm-codegen source for generating Core modules
-  - `Elm/Kernel/*.elm` - Kernel function AST implementations (fallbacks when native kernel not available)
-- `helpers/` - Helper modules used by generated code
+- `generated/` - **gitignored** - Generated from `make all`, contains Core library AST (e.g. `generated/Core/Basics.elm`, `generated/Core/List.elm`)
+- `build/` - **gitignored** - Intermediate build artifacts from `make all` (downloaded elm/core source tarballs, extracted source)
+- `codegen/` - elm-codegen configuration and source for generating Core modules
+  - `Generate.elm` - The elm-codegen generator that reads library source and produces `generated/`
+  - `elm.codegen.json` - Declares which packages to generate codegen helpers for
+  - `Elm/Kernel/*.elm` - **Checked in.** Hand-written Elm implementations of kernel functions (List sort, String ops, Parser). These are AST fallbacks used when no native kernel function is registered in `src/Kernel.elm`. The Makefile copies ONLY this `Kernel/` dir into `build/src/elm/kernel/0.0.0/src/Elm/Kernel/`.
+  - `Elm/src/*.elm` - **Checked in.** Elm source files from elm/core (Basics.elm, List.elm, etc.). These are the source that `Generate.elm` reads to produce the generated AST. Do NOT confuse these with the downloaded sources in `build/` — these are committed reference copies.
+  - `Gen/` - **gitignored** - Auto-generated elm-codegen helper modules (produced by `npx elm-codegen install`)
+- `helpers/` - Helper modules (H.elm) used by generated code for AST node construction
 - `tests/` - Test suite
   - `EndToEnd.elm` - Integration tests
   - `CoreTests/*.elm` - Tests for standard library functions
