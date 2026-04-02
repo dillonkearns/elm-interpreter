@@ -193,6 +193,64 @@ toArray value =
             Nothing
 
 
+{-| Try to interpret a Value as a Dict (RBNode_elm_builtin/RBEmpty_elm_builtin tree).
+Returns Just a sorted list of (key, value) pairs, or Nothing if not a Dict.
+-}
+toDict : Value -> Maybe (List ( Value, Value ))
+toDict value =
+    case value of
+        Custom { name } _ ->
+            if name == "RBNode_elm_builtin" || name == "RBEmpty_elm_builtin" then
+                Just (toDictHelp value [])
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+toDictHelp : Value -> List ( Value, Value ) -> List ( Value, Value )
+toDictHelp value acc =
+    case value of
+        Custom { name } args ->
+            case name of
+                "RBNode_elm_builtin" ->
+                    case args of
+                        [ _, key, val, left, right ] ->
+                            toDictHelp left (( key, val ) :: toDictHelp right acc)
+
+                        _ ->
+                            acc
+
+                "RBEmpty_elm_builtin" ->
+                    acc
+
+                _ ->
+                    acc
+
+        _ ->
+            acc
+
+
+{-| Try to interpret a Value as a Set (Set_elm_builtin wrapping a Dict).
+Returns Just a sorted list of elements, or Nothing if not a Set.
+-}
+toSet : Value -> Maybe (List Value)
+toSet value =
+    case value of
+        Custom { name } [ innerDict ] ->
+            if name == "Set_elm_builtin" then
+                toDict innerDict
+                    |> Maybe.map (List.map Tuple.first)
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
 boolToString : Bool -> String
 boolToString b =
     if b then
@@ -249,12 +307,22 @@ toString value =
                     "Array.fromList [" ++ String.join "," (List.map toString array) ++ "]"
 
                 Nothing ->
-                    case args of
-                        [] ->
-                            name.name
+                    case toDict value of
+                        Just pairs ->
+                            "Dict.fromList [" ++ String.join "," (List.map (\( k, v ) -> "(" ++ toString k ++ "," ++ toString v ++ ")") pairs) ++ "]"
 
-                        _ ->
-                            name.name ++ " " ++ String.join " " (List.map toStringParens args)
+                        Nothing ->
+                            case toSet value of
+                                Just items ->
+                                    "Set.fromList [" ++ String.join "," (List.map toString items) ++ "]"
+
+                                Nothing ->
+                                    case args of
+                                        [] ->
+                                            name.name
+
+                                        _ ->
+                                            name.name ++ " " ++ String.join " " (List.map toStringParens args)
 
         JsArray arr ->
             "[" ++ String.join "," (List.map toString (Array.toList arr)) ++ "]"

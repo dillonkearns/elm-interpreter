@@ -37,6 +37,8 @@ suite =
         , patternMatchTests
         , lambdaInlineTests
         , sortStabilityTests
+        , debugToStringTests
+        , parserEdgeCaseTests
         ]
 
 
@@ -674,4 +676,61 @@ main =
 """
             (list String)
             [ "a", "c", "b", "d" ]
+
+        -- Known elm-syntax parser limitation: negative at start of list literal
+        -- needs a space. [-3] fails to parse but [ -3 ] works.
+        -- See issues/002-negative-list-literal-parse.md
+        , Test.skip <|
+            evalTest "negative at start of list literal"
+                "List.sum [-3, 5, -1]"
+                Int
+                1
+        ]
+
+
+debugToStringTests : Test
+debugToStringTests =
+    describe "Debug.toString"
+        [ evalTestModule "Dict shows Dict.fromList format"
+            """module Temp exposing (main)
+import Dict
+main = Debug.toString (Dict.fromList [ ("a", 1), ("b", 2) ])
+"""
+            String
+            """Dict.fromList [("a",1),("b",2)]"""
+        , evalTestModule "Set shows Set.fromList format"
+            """module Temp exposing (main)
+import Set
+main = Debug.toString (Set.fromList [ 1, 2, 3 ])
+"""
+            String
+            "Set.fromList [1,2,3]"
+        , evalTestModule "empty Dict"
+            """module Temp exposing (main)
+import Dict
+main = Debug.toString (Dict.empty)
+"""
+            String
+            "Dict.fromList []"
+        , evalTestModule "empty Set"
+            """module Temp exposing (main)
+import Set
+main = Debug.toString (Set.empty)
+"""
+            String
+            "Set.fromList []"
+        ]
+
+
+parserEdgeCaseTests : Test
+parserEdgeCaseTests =
+    describe "Parser edge cases"
+        [ evalTest "negative in list with space"
+            "List.sum [ -3, 5, -1 ]"
+            Int
+            1
+        , evalTest "negative after comma in list"
+            "List.sum [5, -3, -1]"
+            Int
+            1
         ]
