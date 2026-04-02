@@ -11,3 +11,4 @@ script/elm-stuff/
 codegen/Gen/
 runner/elm-stuff/
 runner/interpreter.js
+runner/multi-runner.js
