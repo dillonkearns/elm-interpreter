@@ -1,4 +1,4 @@
-module Generate.Program exposing (programGenerator)
+module Generate.Program exposing (multiModuleGenerator, programGenerator)
 
 {-| Generates random Elm programs for property-based testing of the interpreter.
 
@@ -2156,6 +2156,290 @@ singleJsonTest =
                                     }
                             )
                             (Random.map (\n -> n > 0) (Random.int 0 9))
+            )
+
+
+
+-- MULTI-MODULE GENERATOR
+-- Generates a helper module + main module pair to test import resolution,
+-- qualified names, custom type exports, and cross-module function calls.
+
+
+{-| Generate a pair of files: a helper module and a main module that imports it.
+Returns (helperFile, mainFile).
+-}
+multiModuleGenerator : Int -> Random.Generator ( Elm.File, Elm.File )
+multiModuleGenerator index =
+    let
+        helperName =
+            "TestHelper" ++ String.fromInt index
+
+        mainName =
+            "Test" ++ String.fromInt index
+    in
+    Random.int 0 3
+        |> Random.andThen
+            (\tag ->
+                case tag of
+                    0 ->
+                        -- Helper with functions, main uses them qualified
+                        Random.map3
+                            (\a b c ->
+                                let
+                                    helperFile =
+                                        Elm.file [ helperName ]
+                                            [ Elm.declaration "double"
+                                                (Elm.fn (Elm.Arg.var "n")
+                                                    (\n -> Elm.Op.multiply n (Elm.int 2))
+                                                    |> Elm.withType (Type.function [ Type.int ] Type.int)
+                                                )
+                                                |> Elm.expose
+                                            , Elm.declaration "greet"
+                                                (Elm.fn (Elm.Arg.var "name")
+                                                    (\name -> Elm.Op.append (Elm.string "Hello, ") (Elm.Op.append name (Elm.string "!")))
+                                                    |> Elm.withType (Type.function [ Type.string ] Type.string)
+                                                )
+                                                |> Elm.expose
+                                            , Elm.declaration "constant"
+                                                (Elm.int a)
+                                                |> Elm.expose
+                                            ]
+
+                                    mainFile =
+                                        Elm.file [ mainName ]
+                                            [ Elm.portOutgoing "output" Type.string
+                                            , Elm.declaration "computeResult"
+                                                (Gen.String.call_.join (Elm.string "|")
+                                                    (Elm.list
+                                                        [ Gen.String.call_.fromInt
+                                                            (Elm.apply
+                                                                (Elm.value { importFrom = [ helperName ], name = "double", annotation = Nothing })
+                                                                [ Elm.int b ]
+                                                            )
+                                                        , Elm.apply
+                                                            (Elm.value { importFrom = [ helperName ], name = "greet", annotation = Nothing })
+                                                            [ Elm.string (randomWord c) ]
+                                                        , Gen.String.call_.fromInt
+                                                            (Elm.value { importFrom = [ helperName ], name = "constant", annotation = Nothing })
+                                                        , Gen.String.call_.fromInt
+                                                            (Elm.apply
+                                                                (Elm.value { importFrom = [ helperName ], name = "double", annotation = Nothing })
+                                                                [ Elm.apply
+                                                                    (Elm.value { importFrom = [ helperName ], name = "double", annotation = Nothing })
+                                                                    [ Elm.int c ]
+                                                                ]
+                                                            )
+                                                        ]
+                                                    )
+                                                )
+                                            , mainDeclaration
+                                            ]
+                                in
+                                ( helperFile, mainFile )
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+                            (Random.int 0 9)
+
+                    1 ->
+                        -- Helper with type alias, main uses constructor
+                        Random.map3
+                            (\a b c ->
+                                let
+                                    helperFile =
+                                        Elm.file [ helperName ]
+                                            [ Elm.alias "Point"
+                                                (Type.record
+                                                    [ ( "x", Type.int )
+                                                    , ( "y", Type.int )
+                                                    ]
+                                                )
+                                                |> Elm.expose
+                                            , Elm.declaration "movePoint"
+                                                (Elm.fn (Elm.Arg.var "p")
+                                                    (\p ->
+                                                        Elm.fn (Elm.Arg.var "dx")
+                                                            (\dx ->
+                                                                Elm.record
+                                                                    [ ( "x", Elm.Op.plus (Elm.get "x" p) dx )
+                                                                    , ( "y", Elm.get "y" p )
+                                                                    ]
+                                                            )
+                                                    )
+                                                    |> Elm.withType
+                                                        (Type.function [ Type.record [ ( "x", Type.int ), ( "y", Type.int ) ] ]
+                                                            (Type.function [ Type.int ]
+                                                                (Type.record [ ( "x", Type.int ), ( "y", Type.int ) ])
+                                                            )
+                                                        )
+                                                )
+                                                |> Elm.expose
+                                            , Elm.declaration "showPoint"
+                                                (Elm.fn (Elm.Arg.var "p")
+                                                    (\p ->
+                                                        Elm.Op.append
+                                                            (Gen.String.call_.fromInt (Elm.get "x" p))
+                                                            (Elm.Op.append (Elm.string ",")
+                                                                (Gen.String.call_.fromInt (Elm.get "y" p))
+                                                            )
+                                                    )
+                                                    |> Elm.withType (Type.function [ Type.record [ ( "x", Type.int ), ( "y", Type.int ) ] ] Type.string)
+                                                )
+                                                |> Elm.expose
+                                            ]
+
+                                    mainFile =
+                                        Elm.file [ mainName ]
+                                            [ Elm.portOutgoing "output" Type.string
+                                            , Elm.declaration "computeResult"
+                                                (Elm.Let.letIn
+                                                    (\p1 ->
+                                                        Elm.Let.letIn
+                                                            (\p2 ->
+                                                                Gen.String.call_.join (Elm.string "|")
+                                                                    (Elm.list
+                                                                        [ Elm.apply
+                                                                            (Elm.value { importFrom = [ helperName ], name = "showPoint", annotation = Nothing })
+                                                                            [ p1 ]
+                                                                        , Elm.apply
+                                                                            (Elm.value { importFrom = [ helperName ], name = "showPoint", annotation = Nothing })
+                                                                            [ p2 ]
+                                                                        ]
+                                                                    )
+                                                            )
+                                                            |> Elm.Let.value "p2"
+                                                                (Elm.apply
+                                                                    (Elm.value { importFrom = [ helperName ], name = "movePoint", annotation = Nothing })
+                                                                    [ p1, Elm.int c ]
+                                                                )
+                                                            |> Elm.Let.toExpression
+                                                    )
+                                                    |> Elm.Let.value "p1"
+                                                        (Elm.apply
+                                                            (Elm.value { importFrom = [ helperName ], name = "Point", annotation = Nothing })
+                                                            [ Elm.int a, Elm.int b ]
+                                                        )
+                                                    |> Elm.Let.toExpression
+                                                )
+                                            , mainDeclaration
+                                            ]
+                                in
+                                ( helperFile, mainFile )
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+
+                    2 ->
+                        -- Helper with multiple functions, main chains them
+                        Random.map2
+                            (\a b ->
+                                let
+                                    helperFile =
+                                        Elm.file [ helperName ]
+                                            [ Elm.declaration "addOne"
+                                                (Elm.fn (Elm.Arg.var "n") (\n -> Elm.Op.plus n (Elm.int 1))
+                                                    |> Elm.withType (Type.function [ Type.int ] Type.int)
+                                                )
+                                                |> Elm.expose
+                                            , Elm.declaration "negate2"
+                                                (Elm.fn (Elm.Arg.var "n") (\n -> Elm.Op.multiply n (Elm.int -1))
+                                                    |> Elm.withType (Type.function [ Type.int ] Type.int)
+                                                )
+                                                |> Elm.expose
+                                            , Elm.declaration "showWithLabel"
+                                                (Elm.fn (Elm.Arg.var "label")
+                                                    (\label ->
+                                                        Elm.fn (Elm.Arg.var "n")
+                                                            (\n -> Elm.Op.append label (Gen.String.call_.fromInt n))
+                                                    )
+                                                )
+                                                |> Elm.expose
+                                            ]
+
+                                    addOneRef = Elm.value { importFrom = [ helperName ], name = "addOne", annotation = Nothing }
+                                    negateRef = Elm.value { importFrom = [ helperName ], name = "negate2", annotation = Nothing }
+                                    showRef = Elm.value { importFrom = [ helperName ], name = "showWithLabel", annotation = Nothing }
+
+                                    mainFile =
+                                        Elm.file [ mainName ]
+                                            [ Elm.portOutgoing "output" Type.string
+                                            , Elm.declaration "computeResult"
+                                                (Gen.String.call_.join (Elm.string "|")
+                                                    (Elm.list
+                                                        [ Gen.String.call_.fromInt (Elm.apply addOneRef [ Elm.int a ])
+                                                        , Gen.String.call_.fromInt (Elm.apply negateRef [ Elm.int b ])
+                                                        , Gen.String.call_.fromInt
+                                                            (Elm.apply addOneRef
+                                                                [ Elm.apply negateRef [ Elm.int a ] ]
+                                                            )
+                                                        , Elm.apply showRef [ Elm.string "val:", Elm.int (a + b) ]
+                                                        ]
+                                                    )
+                                                )
+                                            , mainDeclaration
+                                            ]
+                                in
+                                ( helperFile, mainFile )
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+
+                    _ ->
+                        -- Helper with value + function, main uses partial application
+                        Random.map3
+                            (\a b c ->
+                                let
+                                    helperFile =
+                                        Elm.file [ helperName ]
+                                            [ Elm.declaration "scale"
+                                                (Elm.fn (Elm.Arg.var "factor")
+                                                    (\factor ->
+                                                        Elm.fn (Elm.Arg.var "n")
+                                                            (\n -> Elm.Op.multiply factor n)
+                                                    )
+                                                    |> Elm.withType (Type.function [ Type.int ] (Type.function [ Type.int ] Type.int))
+                                                )
+                                                |> Elm.expose
+                                            , Elm.declaration "baseValue"
+                                                (Elm.int a)
+                                                |> Elm.expose
+                                            ]
+
+                                    scaleRef = Elm.value { importFrom = [ helperName ], name = "scale", annotation = Nothing }
+                                    baseRef = Elm.value { importFrom = [ helperName ], name = "baseValue", annotation = Nothing }
+
+                                    mainFile =
+                                        Elm.file [ mainName ]
+                                            [ Elm.portOutgoing "output" Type.string
+                                            , Elm.declaration "computeResult"
+                                                (Elm.Let.letIn
+                                                    (\double ->
+                                                        Elm.Let.letIn
+                                                            (\triple ->
+                                                                Gen.String.call_.join (Elm.string "|")
+                                                                    (Elm.list
+                                                                        [ Gen.String.call_.fromInt baseRef
+                                                                        , Gen.String.call_.fromInt (Elm.apply double [ Elm.int b ])
+                                                                        , Gen.String.call_.fromInt (Elm.apply triple [ Elm.int c ])
+                                                                        , Gen.String.call_.fromInt (Elm.apply double [ baseRef ])
+                                                                        ]
+                                                                    )
+                                                            )
+                                                            |> Elm.Let.value "triple" (Elm.apply scaleRef [ Elm.int 3 ])
+                                                            |> Elm.Let.toExpression
+                                                    )
+                                                    |> Elm.Let.value "double" (Elm.apply scaleRef [ Elm.int 2 ])
+                                                    |> Elm.Let.toExpression
+                                                )
+                                            , mainDeclaration
+                                            ]
+                                in
+                                ( helperFile, mainFile )
+                            )
+                            (Random.int -10 10)
+                            (Random.int -10 10)
+                            (Random.int -10 10)
             )
 
 

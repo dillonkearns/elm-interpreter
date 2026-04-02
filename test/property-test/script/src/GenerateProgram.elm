@@ -33,7 +33,7 @@ run =
                 |> BackendTask.combine
                 |> BackendTask.andThen
                     (\_ ->
-                        writeManifest (List.map .moduleName programs)
+                        writeManifest programs
                     )
                 |> BackendTask.andThen
                     (\_ ->
@@ -81,10 +81,9 @@ program =
             )
 
 
-type alias GeneratedProgram =
-    { moduleName : String
-    , file : Elm.File
-    }
+type GeneratedProgram
+    = SingleModule { moduleName : String, file : Elm.File }
+    | MultiModule { moduleName : String, helperFile : Elm.File, mainFile : Elm.File }
 
 
 generatePrograms : Random.Seed -> Int -> List GeneratedProgram -> List GeneratedProgram
@@ -97,28 +96,91 @@ generatePrograms seed remaining acc =
             index =
                 List.length acc
 
-            ( file, nextSeed ) =
-                Random.step (Generate.Program.programGenerator index) seed
-
-            moduleName =
-                "Test" ++ String.fromInt index
+            isMultiModule =
+                modBy 5 index == 4
         in
-        generatePrograms nextSeed
-            (remaining - 1)
-            ({ moduleName = moduleName, file = file } :: acc)
+        if isMultiModule then
+            let
+                ( ( helperFile, mainFile ), nextSeed ) =
+                    Random.step (Generate.Program.multiModuleGenerator index) seed
+            in
+            generatePrograms nextSeed
+                (remaining - 1)
+                (MultiModule
+                    { moduleName = "Test" ++ String.fromInt index
+                    , helperFile = helperFile
+                    , mainFile = mainFile
+                    }
+                    :: acc
+                )
+
+        else
+            let
+                ( file, nextSeed ) =
+                    Random.step (Generate.Program.programGenerator index) seed
+            in
+            generatePrograms nextSeed
+                (remaining - 1)
+                (SingleModule
+                    { moduleName = "Test" ++ String.fromInt index
+                    , file = file
+                    }
+                    :: acc
+                )
 
 
-writeProgram { file } =
-    Script.writeFile
-        { path = "generated/src/" ++ file.path
-        , body = file.contents
-        }
+writeProgram prog =
+    case prog of
+        SingleModule { file } ->
+            Script.writeFile
+                { path = "generated/src/" ++ file.path
+                , body = file.contents
+                }
+
+        MultiModule { helperFile, mainFile } ->
+            Script.writeFile
+                { path = "generated/src/" ++ helperFile.path
+                , body = helperFile.contents
+                }
+                |> BackendTask.andThen
+                    (\_ ->
+                        Script.writeFile
+                            { path = "generated/src/" ++ mainFile.path
+                            , body = mainFile.contents
+                            }
+                    )
 
 
-writeManifest moduleNames =
+programModuleName : GeneratedProgram -> String
+programModuleName prog =
+    case prog of
+        SingleModule { moduleName } ->
+            moduleName
+
+        MultiModule { moduleName } ->
+            moduleName
+
+
+encodeManifestEntry : GeneratedProgram -> Json.Encode.Value
+encodeManifestEntry prog =
+    case prog of
+        SingleModule { moduleName } ->
+            Json.Encode.string moduleName
+
+        MultiModule { moduleName, helperFile } ->
+            Json.Encode.object
+                [ ( "main", Json.Encode.string moduleName )
+                , ( "helpers"
+                  , Json.Encode.list Json.Encode.string
+                        [ String.replace ".elm" "" helperFile.path ]
+                  )
+                ]
+
+
+writeManifest programs =
     Script.writeFile
         { path = "generated/manifest.json"
         , body =
             Json.Encode.encode 2
-                (Json.Encode.list Json.Encode.string moduleNames)
+                (Json.Encode.list encodeManifestEntry programs)
         }
