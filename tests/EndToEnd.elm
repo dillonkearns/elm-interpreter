@@ -7,7 +7,7 @@ import Expect
 import Array
 import FastDict as Dict
 import Test exposing (Test, describe, test)
-import TestUtils exposing (evalTest, evalTest_, list, slowTest)
+import TestUtils exposing (evalTest, evalTest_, list, maybe, slowTest)
 import Types exposing (Value(..))
 
 
@@ -42,6 +42,7 @@ suite =
         , parserEdgeCaseTests
         , stepLimitTests
         , taskTests
+        , bytesTests
         ]
 
 
@@ -838,4 +839,74 @@ main = Task.andThen (\\x -> Task.succeed (x + 1)) (Task.succeed 3) == Task.succe
 """
             Bool
             True
+        ]
+
+
+bytesTests : Test
+bytesTests =
+    describe "Bytes module"
+        [ evalTestModule "encode unsignedInt8 has width 1"
+            """module Temp exposing (main)
+import Bytes
+import Bytes.Encode
+main = Bytes.width (Bytes.Encode.encode (Bytes.Encode.unsignedInt8 42))
+"""
+            Int
+            1
+        , evalTestModule "encode signedInt16 has width 2"
+            """module Temp exposing (main)
+import Bytes
+import Bytes.Encode
+main = Bytes.width (Bytes.Encode.encode (Bytes.Encode.signedInt16 Bytes.BE 256))
+"""
+            Int
+            2
+        , evalTestModule "encode sequence width sums up"
+            """module Temp exposing (main)
+import Bytes
+import Bytes.Encode
+main = Bytes.width (Bytes.Encode.encode (Bytes.Encode.sequence [ Bytes.Encode.unsignedInt8 1, Bytes.Encode.unsignedInt8 2, Bytes.Encode.unsignedInt32 Bytes.BE 3 ]))
+"""
+            Int
+            6
+        , evalTestModule "decode unsignedInt8 round-trip"
+            """module Temp exposing (main)
+import Bytes.Encode
+import Bytes.Decode
+main = Bytes.Decode.decode Bytes.Decode.unsignedInt8 (Bytes.Encode.encode (Bytes.Encode.unsignedInt8 42))
+"""
+            (maybe Int)
+            (Just 42)
+        , evalTestModule "decode signedInt8 negative"
+            """module Temp exposing (main)
+import Bytes.Encode
+import Bytes.Decode
+main = Bytes.Decode.decode Bytes.Decode.signedInt8 (Bytes.Encode.encode (Bytes.Encode.signedInt8 -5))
+"""
+            (maybe Int)
+            (Just -5)
+        , evalTestModule "decode unsignedInt16 BE round-trip"
+            """module Temp exposing (main)
+import Bytes
+import Bytes.Encode
+import Bytes.Decode
+main = Bytes.Decode.decode (Bytes.Decode.unsignedInt16 Bytes.BE) (Bytes.Encode.encode (Bytes.Encode.unsignedInt16 Bytes.BE 1000))
+"""
+            (maybe Int)
+            (Just 1000)
+        , evalTestModule "getStringWidth"
+            """module Temp exposing (main)
+import Bytes.Encode
+main = Bytes.Encode.getStringWidth "hello"
+"""
+            Int
+            5
+        , evalTestModule "decode fail returns Nothing"
+            """module Temp exposing (main)
+import Bytes.Encode
+import Bytes.Decode
+main = Bytes.Decode.decode Bytes.Decode.fail (Bytes.Encode.encode (Bytes.Encode.unsignedInt8 42))
+"""
+            (maybe Int)
+            Nothing
         ]

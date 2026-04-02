@@ -215,6 +215,17 @@ innerCompare l r env =
         ( RegexValue _, _ ) ->
             Err <| typeError env "Cannot compare Regex values"
 
+        ( BytesValue a, BytesValue b ) ->
+            if a == b then
+                Ok EQ
+
+            else
+                -- Bytes don't have a natural ordering, but we can compare by contents
+                compareListHelp (List.map Int (Array.toList a)) (List.map Int (Array.toList b)) env
+
+        ( BytesValue _, _ ) ->
+            Err <| typeError env "Cannot compare Bytes with non-Bytes"
+
 
 compareListHelp : List Value -> List Value -> Env -> Result EvalErrorData Order
 compareListHelp ll rl env =

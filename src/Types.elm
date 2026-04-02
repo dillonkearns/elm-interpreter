@@ -71,6 +71,7 @@ type Value
     | JsonValue JsonVal
     | JsonDecoderValue JsonDecoder
     | RegexValue Regex.Regex
+    | BytesValue (Array Int)
 
 
 {-| JSON value representation for Json.Encode.Value / Json.Decode.Value.

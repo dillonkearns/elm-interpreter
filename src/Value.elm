@@ -109,6 +109,9 @@ toExpression value =
             RegexValue _ ->
                 Expression.FunctionOrValue [ "Regex" ] "regex"
 
+            BytesValue _ ->
+                Expression.FunctionOrValue [ "Bytes" ] "bytes"
+
             PartiallyApplied _ [] _ (Just qualifiedName) _ ->
                 Expression.FunctionOrValue qualifiedName.moduleName qualifiedName.name
 
@@ -345,6 +348,9 @@ toString value =
 
         RegexValue _ ->
             "<regex>"
+
+        BytesValue arr ->
+            "<" ++ String.fromInt (Array.length arr) ++ " bytes>"
 
         PartiallyApplied _ _ _ _ _ ->
             "<function>"

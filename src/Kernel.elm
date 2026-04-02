@@ -5,6 +5,9 @@ import Bitwise
 import Core.Array
 import Core.Basics
 import Core.Bitwise
+import Core.Bytes
+import Core.Bytes.Decode
+import Core.Bytes.Encode
 import Core.Char
 import Core.Debug
 import Core.Elm.JsArray
@@ -22,6 +25,7 @@ import Environment
 import EvalResult
 import FastDict as Dict exposing (Dict)
 import Kernel.Basics
+import Kernel.Bytes
 import Kernel.Debug
 import Kernel.JsArray
 import Kernel.Json
@@ -241,6 +245,37 @@ functions evalFunction =
         ]
       )
 
+    -- Elm.Kernel.Bytes
+    , ( [ "Elm", "Kernel", "Bytes" ]
+      , [ ( "width", one bytesVal to int Kernel.Bytes.width Core.Bytes.width )
+        , ( "encode", oneWithError anything to bytesOut Kernel.Bytes.encodeKernel Core.Bytes.Encode.encode )
+        , ( "getStringWidth", one string to int Kernel.Bytes.getStringWidth Core.Bytes.Encode.getStringWidth )
+        , ( "decode", bytesDecodeKernel evalFunction )
+        , ( "read_i8", bytesRead2 Kernel.Bytes.readI8 Core.Bytes.Decode.signedInt8 )
+        , ( "read_u8", bytesRead2 Kernel.Bytes.readU8 Core.Bytes.Decode.unsignedInt8 )
+        , ( "read_i16", bytesRead3 Kernel.Bytes.readI16 Core.Bytes.Decode.signedInt16 )
+        , ( "read_u16", bytesRead3 Kernel.Bytes.readU16 Core.Bytes.Decode.unsignedInt16 )
+        , ( "read_i32", bytesRead3 Kernel.Bytes.readI32 Core.Bytes.Decode.signedInt32 )
+        , ( "read_u32", bytesRead3 Kernel.Bytes.readU32 Core.Bytes.Decode.unsignedInt32 )
+        , ( "read_f32", bytesRead3 Kernel.Bytes.readF32 Core.Bytes.Decode.float32 )
+        , ( "read_f64", bytesRead3 Kernel.Bytes.readF64 Core.Bytes.Decode.float64 )
+        , ( "read_bytes", bytesReadN Kernel.Bytes.readBytesChunk Core.Bytes.Decode.bytes )
+        , ( "read_string", bytesReadN Kernel.Bytes.readString Core.Bytes.Decode.string )
+        , ( "decodeFailure", bytesRead2 Kernel.Bytes.decodeFailure Core.Bytes.Decode.fail )
+        , ( "getHostEndianness", twoWithError anything anything to anything Kernel.Bytes.getHostEndianness Core.Bytes.getHostEndianness )
+        , ( "write_i8", writeStub Core.Bytes.Encode.write )
+        , ( "write_u8", writeStub Core.Bytes.Encode.write )
+        , ( "write_i16", writeStub4 Core.Bytes.Encode.write )
+        , ( "write_u16", writeStub4 Core.Bytes.Encode.write )
+        , ( "write_i32", writeStub4 Core.Bytes.Encode.write )
+        , ( "write_u32", writeStub4 Core.Bytes.Encode.write )
+        , ( "write_f32", writeStub4 Core.Bytes.Encode.write )
+        , ( "write_f64", writeStub4 Core.Bytes.Encode.write )
+        , ( "write_string", writeStub Core.Bytes.Encode.write )
+        , ( "write_bytes", writeStub Core.Bytes.Encode.write )
+        ]
+      )
+
     -- Elm.Kernel.Parser
     , ( [ "Elm", "Kernel", "Parser" ]
       , [ ( "isSubString", parserIsSubString )
@@ -386,6 +421,27 @@ char =
                     Nothing
     , toValue = Char
     , name = "Char"
+    }
+
+
+bytesVal : InSelector (Array Int) {}
+bytesVal =
+    { fromValue =
+        \value ->
+            case value of
+                BytesValue arr ->
+                    Just arr
+
+                _ ->
+                    Nothing
+    , name = "Bytes"
+    }
+
+
+bytesOut : OutSelector (Array Int) {}
+bytesOut =
+    { toValue = BytesValue
+    , name = "Bytes"
     }
 
 
@@ -1053,6 +1109,142 @@ parserIsSubChar evalFn _ =
 
             _ ->
                 EvalResult.fail <| typeError env "Parser.isSubChar: expected function, Int, String"
+    )
+
+
+{-| Kernel entry for Bytes.Decode.decode.
+Takes a decoder function and bytes value. The decoder function is the function
+inside the Decoder wrapper, which takes (Bytes, Int) -> (Int, Value).
+-}
+bytesDecodeKernel : EvalFunction -> ModuleName -> ( Int, List Value -> Eval Value )
+bytesDecodeKernel evalFn _ =
+    ( 2
+    , \args cfg env ->
+        case args of
+            [ decoderFn, bsArg ] ->
+                case decoderFn of
+                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation ->
+                        let
+                            applyDecoder : Value -> Eval (Value -> Eval Value)
+                            applyDecoder arg c _ =
+                                evalFn (oldArgs ++ [ arg ]) patterns maybeName implementation c closureEnv
+                                    |> EvalResult.onValue
+                                        (\result ->
+                                            case result of
+                                                PartiallyApplied cEnv oArgs pats mName impl ->
+                                                    Ok (\arg2 c2 _ -> evalFn (oArgs ++ [ arg2 ]) pats mName impl c2 cEnv)
+
+                                                _ ->
+                                                    Err (typeError env "Bytes.decode: decoder did not return a function")
+                                        )
+                        in
+                        Kernel.Bytes.decode applyDecoder bsArg cfg env
+
+                    _ ->
+                        EvalResult.fail <| typeError env "Bytes.decode: first argument must be a function"
+
+            [ _ ] ->
+                EvalResult.fail <| typeError env "Bytes.decode: needs two arguments"
+
+            _ ->
+                EvalResult.fail <| typeError env "Bytes.decode: expected decoder and bytes"
+    )
+
+
+{-| Bytes read kernel entry for 2-arg read functions (read_u8, read_i8, decodeFailure).
+These take (Bytes, Int) -> (Int, Value).
+-}
+bytesRead2 : (Array Int -> Int -> Value) -> FunctionImplementation -> ModuleName -> ( Int, List Value -> Eval Value )
+bytesRead2 readFn implementation moduleName =
+    ( 2
+    , \args _ env ->
+        case args of
+            [ BytesValue arr, Int offset ] ->
+                EvalResult.succeed (readFn arr offset)
+
+            [ _ ] ->
+                partiallyApply moduleName args implementation
+
+            [] ->
+                partiallyApply moduleName args implementation
+
+            _ ->
+                EvalResult.fail <| typeError env "Expected Bytes and Int"
+    )
+
+
+{-| Bytes read kernel entry for 3-arg read functions (read_u16 etc.).
+These take (Bool, Bytes, Int) -> (Int, Value). The Bool is already partially applied.
+-}
+bytesRead3 : (Bool -> Array Int -> Int -> Value) -> FunctionImplementation -> ModuleName -> ( Int, List Value -> Eval Value )
+bytesRead3 readFn implementation moduleName =
+    ( 3
+    , \args _ env ->
+        case args of
+            [ Bool le, BytesValue arr, Int offset ] ->
+                EvalResult.succeed (readFn le arr offset)
+
+            -- Also handle Int argument (for read_bytes and read_string which take Int, not Bool)
+            [ Int n, BytesValue arr, Int offset ] ->
+                -- Reinterpret: for read_bytes/read_string, first arg is count
+                EvalResult.succeed (readFn (n /= 0) arr offset)
+
+            [ _, _ ] ->
+                partiallyApply moduleName args implementation
+
+            [ _ ] ->
+                partiallyApply moduleName args implementation
+
+            [] ->
+                partiallyApply moduleName args implementation
+
+            _ ->
+                EvalResult.fail <| typeError env "Expected Bool/Int, Bytes, Int"
+    )
+
+
+{-| Bytes read kernel entry for read_bytes and read_string.
+These take (Int, Bytes, Int) -> (Int, Value). The Int is the byte count.
+-}
+bytesReadN : (Int -> Array Int -> Int -> Value) -> FunctionImplementation -> ModuleName -> ( Int, List Value -> Eval Value )
+bytesReadN readFn implementation moduleName =
+    ( 3
+    , \args _ env ->
+        case args of
+            [ Int n, BytesValue arr, Int offset ] ->
+                EvalResult.succeed (readFn n arr offset)
+
+            [ _, _ ] ->
+                partiallyApply moduleName args implementation
+
+            [ _ ] ->
+                partiallyApply moduleName args implementation
+
+            [] ->
+                partiallyApply moduleName args implementation
+
+            _ ->
+                EvalResult.fail <| typeError env "Expected Int, Bytes, Int"
+    )
+
+
+{-| Write stub for 3-arg write functions (never called if encode is a kernel function).
+-}
+writeStub : FunctionImplementation -> ModuleName -> ( Int, List Value -> Eval Value )
+writeStub _ _ =
+    ( 3
+    , \_ _ env ->
+        EvalResult.fail <| typeError env "Bytes write functions are not implemented in the interpreter"
+    )
+
+
+{-| Write stub for 4-arg write functions.
+-}
+writeStub4 : FunctionImplementation -> ModuleName -> ( Int, List Value -> Eval Value )
+writeStub4 _ _ =
+    ( 4
+    , \_ _ env ->
+        EvalResult.fail <| typeError env "Bytes write functions are not implemented in the interpreter"
     )
 
 
