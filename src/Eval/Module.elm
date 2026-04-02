@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, parseProjectSources, trace, traceOrEvalModule)
+module Eval.Module exposing (ProjectEnv, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvFromFiles, parseProjectSources, trace, traceOrEvalModule, traceWithEnv)
 
 import Core
 import Dict as ElmDict
@@ -336,6 +336,207 @@ evalWithEnv (ProjectEnv projectEnv) additionalSources expression =
                                 |> EvalResult.toResult
                     in
                     Result.mapError Types.EvalError result
+
+
+{-| Like `evalWithEnv`, but accepts pre-parsed `File` ASTs instead of source strings.
+Skips the parse step entirely — useful when you already have the AST (e.g. build tools,
+mutation testing, or incremental compilation where files are parsed once and reused).
+-}
+evalWithEnvFromFiles : ProjectEnv -> List File -> Expression -> Result Error Value
+evalWithEnvFromFiles (ProjectEnv projectEnv) additionalFiles expression =
+    let
+        parsedModules :
+            List
+                { file : File
+                , moduleName : ModuleName
+                , interface : List Exposed
+                }
+        parsedModules =
+            additionalFiles
+                |> List.map
+                    (\file ->
+                        { file = file
+                        , moduleName = fileModuleName file
+                        , interface = buildInterfaceFromFile file
+                        }
+                    )
+
+        additionalInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        additionalInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        allInterfaces =
+            ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+        envResult : Result Error Env
+        envResult =
+            parsedModules
+                |> Result.MyExtra.combineFoldl
+                    (\parsedModule envAcc ->
+                        buildModuleEnv allInterfaces parsedModule envAcc
+                    )
+                    (Ok projectEnv.env)
+    in
+    case envResult of
+        Err e ->
+            Err e
+
+        Ok env ->
+            let
+                lastModule : ModuleName
+                lastModule =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .moduleName
+                        |> Maybe.withDefault [ "Main" ]
+
+                lastFile : Maybe File
+                lastFile =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .file
+
+                finalImports : ImportedNames
+                finalImports =
+                    case lastFile of
+                        Just file ->
+                            (defaultImports ++ file.imports)
+                                |> List.foldl (processImport allInterfaces) emptyImports
+
+                        Nothing ->
+                            emptyImports
+
+                lastModuleKey : String
+                lastModuleKey =
+                    Environment.moduleKey lastModule
+
+                finalEnv : Env
+                finalEnv =
+                    { env
+                        | currentModule = lastModule
+                        , currentModuleKey = lastModuleKey
+                        , currentModuleFunctions =
+                            Dict.get lastModuleKey env.functions
+                                |> Maybe.withDefault Dict.empty
+                        , imports = finalImports
+                    }
+
+                result : Result Types.EvalErrorData Value
+                result =
+                    Eval.Expression.evalExpression
+                        (fakeNode expression)
+                        { trace = False }
+                        finalEnv
+                        |> EvalResult.toResult
+            in
+            Result.mapError Types.EvalError result
+
+
+{-| Like `evalWithEnv`, but returns trace information (call tree + log lines)
+alongside the result. Useful for debugging and profiling.
+-}
+traceWithEnv : ProjectEnv -> List String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
+traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
+    let
+        parseResult =
+            additionalSources
+                |> List.map
+                    (\source ->
+                        source
+                            |> Elm.Parser.parseToFile
+                            |> Result.mapError ParsingError
+                            |> Result.andThen
+                                (\file ->
+                                    Ok
+                                        { file = file
+                                        , moduleName = fileModuleName file
+                                        , interface = buildInterfaceFromFile file
+                                        }
+                                )
+                    )
+                |> combineResults
+    in
+    case parseResult of
+        Err e ->
+            ( Err e, Rope.empty, Rope.empty )
+
+        Ok parsedModules ->
+            let
+                additionalInterfaces =
+                    parsedModules
+                        |> List.map (\m -> ( m.moduleName, m.interface ))
+                        |> ElmDict.fromList
+
+                allInterfaces =
+                    ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+                envResult =
+                    parsedModules
+                        |> Result.MyExtra.combineFoldl
+                            (\parsedModule envAcc ->
+                                buildModuleEnv allInterfaces parsedModule envAcc
+                            )
+                            (Ok projectEnv.env)
+            in
+            case envResult of
+                Err e ->
+                    ( Err e, Rope.empty, Rope.empty )
+
+                Ok env ->
+                    let
+                        lastModule =
+                            parsedModules
+                                |> List.reverse
+                                |> List.head
+                                |> Maybe.map .moduleName
+                                |> Maybe.withDefault [ "Main" ]
+
+                        lastFile =
+                            parsedModules
+                                |> List.reverse
+                                |> List.head
+                                |> Maybe.map .file
+
+                        finalImports =
+                            case lastFile of
+                                Just file ->
+                                    (defaultImports ++ file.imports)
+                                        |> List.foldl (processImport allInterfaces) emptyImports
+
+                                Nothing ->
+                                    emptyImports
+
+                        lastModuleKey =
+                            Environment.moduleKey lastModule
+
+                        finalEnv =
+                            { env
+                                | currentModule = lastModule
+                                , currentModuleKey = lastModuleKey
+                                , currentModuleFunctions =
+                                    Dict.get lastModuleKey env.functions
+                                        |> Maybe.withDefault Dict.empty
+                                , imports = finalImports
+                            }
+
+                        evalResult =
+                            Eval.Expression.evalExpression
+                                (fakeNode expression)
+                                { trace = True }
+                                finalEnv
+
+                        ( result, callTrees, logLines ) =
+                            EvalResult.toTriple evalResult
+                    in
+                    ( Result.mapError Types.EvalError result
+                    , callTrees
+                    , logLines
+                    )
 
 
 buildInitialEnv : File -> Result Error Env

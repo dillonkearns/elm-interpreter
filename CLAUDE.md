@@ -8,12 +8,11 @@ The `generated/`, `build/`, and `node_modules/` directories are gitignored. You 
 
 ```bash
 npm install            # install Node dependencies
-touch yarn.lock        # Makefile expects yarn.lock to exist
 make all               # downloads elm/core source, runs elm-codegen, produces generated/
 ```
 
 **What `make all` does:**
-1. `yarn install` — installs elm-codegen CLI
+1. `yarn install` — installs elm-codegen CLI (using the committed `yarn.lock`)
 2. Downloads elm/core, elm/json, elm/regex, etc. source tarballs from GitHub into `build/`
 3. Copies `codegen/Elm/Kernel/*.elm` into `build/src/elm/kernel/` (ONLY the `Kernel/` subdirectory — not `codegen/Elm/src/`)
 4. Runs `elm-codegen run --flags-from build/src` — reads the library sources and produces `generated/Core/*.elm`
@@ -21,7 +20,6 @@ make all               # downloads elm/core source, runs elm-codegen, produces g
 The `generated/` directory contains the Core library as Elm AST data structures (e.g. `generated/Core/Basics.elm` has all `Basics` function implementations as `FunctionImplementation` records). Without this step, compilation will fail with missing module errors.
 
 **Common errors:**
-- "No rule to make target 'yarn.lock'" → you forgot `touch yarn.lock`
 - Missing `generated/Core/Basics.elm` → you need to run `make all`
 - `SyntaxError: Invalid or unexpected token` when running interpreter.js → `generated/` files are stale or from a different branch, re-run `make all`
 
@@ -71,6 +69,22 @@ node harness.mjs
 ```
 
 Or use the orchestrator: `SEED=42 COUNT=20 bash run.sh`
+
+## Eval.Module API
+
+The interpreter's module-level API in `Eval.Module`:
+
+- **`eval`** `String -> Expression -> Result Error Value` — evaluate an expression in a single module
+- **`evalProject`** `List String -> Expression -> Result Error Value` — evaluate in multi-module context
+- **`buildProjectEnv`** `List String -> Result Error ProjectEnv` — parse sources and build a reusable environment
+- **`buildProjectEnvFromParsed`** — same but from already-parsed module ASTs
+- **`parseProjectSources`** — parse source strings into `{ file, moduleName, interface }` records
+- **`evalWithEnv`** `ProjectEnv -> List String -> Expression -> Result Error Value` — evaluate with a pre-built env + additional source strings
+- **`evalWithEnvFromFiles`** `ProjectEnv -> List File -> Expression -> Result Error Value` — same but with pre-parsed `File` ASTs (skips re-parsing)
+- **`traceWithEnv`** `ProjectEnv -> List String -> Expression -> (Result Error Value, Rope CallTree, Rope String)` — like `evalWithEnv` but with tracing
+- **`trace`** / **`traceOrEvalModule`** — single-module evaluation with call tree tracing
+
+The `ProjectEnv` type is opaque and can be reused across multiple `evalWithEnv`/`evalWithEnvFromFiles` calls — parse once, evaluate many times.
 
 ## Key Architecture Notes
 
