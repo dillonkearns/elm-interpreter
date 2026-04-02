@@ -2068,29 +2068,139 @@ evalOperator opName cfg env =
         Nothing ->
             Types.failPartial <| nameError env opName
 
-        Just kernelFunction ->
+        Just operatorRef ->
+            -- Look up the actual function implementation to avoid circular
+            -- references (e.g., Parser.keeper = (|=) which maps back to keeper).
+            -- Resolve through the functions dictionary to get the real implementation.
             let
-                callFn =
-                    if cfg.trace then
-                        Environment.call
+                resolvedRef : { moduleName : ModuleName, name : String, function : Maybe Expression.FunctionImplementation }
+                resolvedRef =
+                    resolveOperatorFunction operatorRef
+            in
+            case resolvedRef.function of
+                Just function ->
+                    if List.isEmpty function.arguments then
+                        -- Zero-arg function (eta-reduced): evaluate its body directly
+                        -- This handles cases like `keeper = A.keeper` or `keeper = (|=)`
+                        Recursion.recurse
+                            ( function.expression
+                            , cfg
+                            , { env
+                                | currentModule = resolvedRef.moduleName
+                                , currentModuleKey = Environment.moduleKey resolvedRef.moduleName
+                                , currentModuleFunctions =
+                                    Dict.get (Environment.moduleKey resolvedRef.moduleName) env.functions
+                                        |> Maybe.withDefault Dict.empty
+                                , values = Dict.empty
+                                , imports =
+                                    Dict.get (Environment.moduleKey resolvedRef.moduleName) env.moduleImports
+                                        |> Maybe.withDefault env.imports
+                              }
+                            )
 
                     else
-                        Environment.callNoStack
-            in
-            PartiallyApplied
-                (callFn kernelFunction.moduleName opName env)
-                []
-                [ fakeNode <| VarPattern "$l", fakeNode <| VarPattern "$r" ]
-                Nothing
-                (AstImpl <|
-                    fakeNode <|
-                        Expression.Application
-                            [ fakeNode <| Expression.FunctionOrValue kernelFunction.moduleName kernelFunction.name
-                            , fakeNode <| Expression.FunctionOrValue [] "$l"
-                            , fakeNode <| Expression.FunctionOrValue [] "$r"
-                            ]
-                )
-                |> Types.succeedPartial
+                        let
+                            callFn =
+                                if cfg.trace then
+                                    Environment.call
+
+                                else
+                                    Environment.callNoStack
+                        in
+                        PartiallyApplied
+                            (callFn resolvedRef.moduleName resolvedRef.name env)
+                            []
+                            function.arguments
+                            (Just { moduleName = resolvedRef.moduleName, name = resolvedRef.name })
+                            (AstImpl function.expression)
+                            |> Types.succeedPartial
+
+                Nothing ->
+                    -- Fallback: function not found in coreFunctions, use indirect call
+                    let
+                        callFn =
+                            if cfg.trace then
+                                Environment.call
+
+                            else
+                                Environment.callNoStack
+                    in
+                    PartiallyApplied
+                        (callFn operatorRef.moduleName opName env)
+                        []
+                        [ fakeNode <| VarPattern "$l", fakeNode <| VarPattern "$r" ]
+                        Nothing
+                        (AstImpl <|
+                            fakeNode <|
+                                Expression.Application
+                                    [ fakeNode <| Expression.FunctionOrValue operatorRef.moduleName operatorRef.name
+                                    , fakeNode <| Expression.FunctionOrValue [] "$l"
+                                    , fakeNode <| Expression.FunctionOrValue [] "$r"
+                                    ]
+                        )
+                        |> Types.succeedPartial
+
+
+{-| Resolve an operator reference through the function chain.
+Follows zero-arg functions that are just re-exports (like Parser.keeper = (|=))
+until we find the real implementation with arguments.
+-}
+resolveOperatorFunction : QualifiedNameRef -> { moduleName : ModuleName, name : String, function : Maybe Expression.FunctionImplementation }
+resolveOperatorFunction ref =
+    case Dict.get ref.moduleName Core.functions |> Maybe.andThen (Dict.get ref.name) of
+        Just function ->
+            if List.isEmpty function.arguments then
+                -- Zero-arg function: check if body is another reference we can follow
+                case Node.value function.expression of
+                    Expression.FunctionOrValue qualModule qualName ->
+                        if not (List.isEmpty qualModule) then
+                            -- Follow the chain (e.g., keeper = A.keeper)
+                            resolveOperatorFunction { moduleName = qualModule, name = qualName }
+
+                        else
+                            { moduleName = ref.moduleName, name = ref.name, function = Just function }
+
+                    Expression.PrefixOperator _ ->
+                        -- Body is (|=) or (|.) - this is a re-export like `keeper = (|=)`.
+                        -- Search all modules for the actual implementation of this function name.
+                        resolveOperatorAcrossModules ref.name
+
+                    _ ->
+                        { moduleName = ref.moduleName, name = ref.name, function = Just function }
+
+            else
+                { moduleName = ref.moduleName, name = ref.name, function = Just function }
+
+        Nothing ->
+            { moduleName = ref.moduleName, name = ref.name, function = Nothing }
+
+
+{-| Search all Core modules for a function with the given name that has a real
+implementation (non-empty arguments), skipping re-exports like `keeper = (|=)`.
+-}
+resolveOperatorAcrossModules : String -> { moduleName : ModuleName, name : String, function : Maybe Expression.FunctionImplementation }
+resolveOperatorAcrossModules name =
+    Core.functions
+        |> Dict.foldl
+            (\moduleName moduleDict acc ->
+                case acc of
+                    Just found ->
+                        Just found
+
+                    Nothing ->
+                        case Dict.get name moduleDict of
+                            Just function ->
+                                if not (List.isEmpty function.arguments) then
+                                    Just { moduleName = moduleName, name = name, function = Just function }
+
+                                else
+                                    Nothing
+
+                            Nothing ->
+                                Nothing
+            )
+            Nothing
+        |> Maybe.withDefault { moduleName = [], name = name, function = Nothing }
 
 
 {-| Check if name starts with uppercase (variant/constructor).

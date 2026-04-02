@@ -10,6 +10,7 @@ import Core.Debug
 import Core.Elm.JsArray
 import Core.Json.Decode
 import Core.Json.Encode
+import Core.Elm.Kernel.Parser
 import Core.Regex
 import Core.List
 import Core.String
@@ -25,6 +26,7 @@ import Kernel.Debug
 import Kernel.JsArray
 import Kernel.Json
 import Kernel.List
+import Kernel.Parser
 import Kernel.Regex
 import Kernel.String
 import Kernel.Utils
@@ -236,6 +238,18 @@ functions evalFunction =
         , ( "findAtMost", three int anything string to anything Kernel.Regex.findAtMost Core.Regex.findAtMost )
         , ( "splitAtMost", three int anything string to anything Kernel.Regex.splitAtMost Core.Regex.splitAtMost )
         , ( "replaceAtMost", regexReplaceAtMost evalFunction )
+        ]
+      )
+
+    -- Elm.Kernel.Parser
+    , ( [ "Elm", "Kernel", "Parser" ]
+      , [ ( "isSubString", parserIsSubString )
+        , ( "isSubChar", parserIsSubChar evalFunction )
+        , ( "isAsciiCode", three int int string to bool Kernel.Parser.isAsciiCode Core.Elm.Kernel.Parser.isAsciiCode )
+        , ( "chompBase10", two int string to int Kernel.Parser.chompBase10 Core.Elm.Kernel.Parser.chompBase10 )
+        , ( "consumeBase", parserConsumeBase )
+        , ( "consumeBase16", parserConsumeBase16 )
+        , ( "findSubString", parserFindSubString )
         ]
       )
     ]
@@ -902,3 +916,160 @@ regexReplaceAtMost evalFn _ =
             _ ->
                 EvalResult.fail <| typeError env "Regex.replaceAtMost: expected Int, Regex, function, String"
     )
+
+
+{-| Custom kernel entry for Parser.isSubString (5 args, returns Triple).
+-}
+parserIsSubString : ModuleName -> ( Int, List Value -> Eval Value )
+parserIsSubString _ =
+    ( 5
+    , \args _ env ->
+        case args of
+            [ String small, Int offset, Int row, Int col, String big ] ->
+                let
+                    ( newOffset, newRow, newCol ) =
+                        Kernel.Parser.isSubString small offset row col big
+                in
+                EvalResult.succeed (Triple (Int newOffset) (Int newRow) (Int newCol))
+
+            _ ->
+                EvalResult.fail <| typeError env "Parser.isSubString: expected String, Int, Int, Int, String"
+    )
+
+
+{-| Custom kernel entry for Parser.findSubString (5 args, returns Triple).
+-}
+parserFindSubString : ModuleName -> ( Int, List Value -> Eval Value )
+parserFindSubString _ =
+    ( 5
+    , \args _ env ->
+        case args of
+            [ String small, Int offset, Int row, Int col, String big ] ->
+                let
+                    ( newOffset, newRow, newCol ) =
+                        Kernel.Parser.findSubString small offset row col big
+                in
+                EvalResult.succeed (Triple (Int newOffset) (Int newRow) (Int newCol))
+
+            _ ->
+                EvalResult.fail <| typeError env "Parser.findSubString: expected String, Int, Int, Int, String"
+    )
+
+
+{-| Custom kernel entry for Parser.consumeBase (3 args, returns Tuple).
+-}
+parserConsumeBase : ModuleName -> ( Int, List Value -> Eval Value )
+parserConsumeBase _ =
+    ( 3
+    , \args _ env ->
+        case args of
+            [ Int base, Int offset, String str ] ->
+                let
+                    ( newOffset, total ) =
+                        Kernel.Parser.consumeBase base offset str
+                in
+                EvalResult.succeed (Tuple (Int newOffset) (Int total))
+
+            _ ->
+                EvalResult.fail <| typeError env "Parser.consumeBase: expected Int, Int, String"
+    )
+
+
+{-| Custom kernel entry for Parser.consumeBase16 (2 args, returns Tuple).
+-}
+parserConsumeBase16 : ModuleName -> ( Int, List Value -> Eval Value )
+parserConsumeBase16 _ =
+    ( 2
+    , \args _ env ->
+        case args of
+            [ Int offset, String str ] ->
+                let
+                    ( newOffset, total ) =
+                        Kernel.Parser.consumeBase16 offset str
+                in
+                EvalResult.succeed (Tuple (Int newOffset) (Int total))
+
+            _ ->
+                EvalResult.fail <| typeError env "Parser.consumeBase16: expected Int, String"
+    )
+
+
+{-| Custom kernel entry for Parser.isSubChar.
+Takes a predicate function, offset, and string. Needs evalFunction for the predicate callback.
+Returns -1 (fail), -2 (newline match), or new offset.
+-}
+parserIsSubChar : EvalFunction -> ModuleName -> ( Int, List Value -> Eval Value )
+parserIsSubChar evalFn _ =
+    ( 3
+    , \args cfg env ->
+        case args of
+            [ predicate, Int offset, String str ] ->
+                if String.length str <= offset then
+                    EvalResult.succeed (Int -1)
+
+                else
+                    case String.slice offset (offset + 1) str |> String.uncons of
+                        Nothing ->
+                            EvalResult.succeed (Int -1)
+
+                        Just ( c, _ ) ->
+                            let
+                                code =
+                                    Char.toCode c
+                            in
+                            if Bitwise.and code 0xF800 == 0xD800 then
+                                -- Surrogate pair: extract 2-unit character
+                                let
+                                    fullChar =
+                                        String.slice offset (offset + 2) str
+                                            |> String.uncons
+                                            |> Maybe.map Tuple.first
+                                            |> Maybe.withDefault c
+                                in
+                                applyPredicate evalFn predicate (Char fullChar) cfg env
+                                    |> EvalResult.map
+                                        (\matched ->
+                                            if matched then
+                                                Int (offset + 2)
+
+                                            else
+                                                Int -1
+                                        )
+
+                            else
+                                applyPredicate evalFn predicate (Char c) cfg env
+                                    |> EvalResult.map
+                                        (\matched ->
+                                            if matched then
+                                                if c == '\n' then
+                                                    Int -2
+
+                                                else
+                                                    Int (offset + 1)
+
+                                            else
+                                                Int -1
+                                        )
+
+            _ ->
+                EvalResult.fail <| typeError env "Parser.isSubChar: expected function, Int, String"
+    )
+
+
+applyPredicate : EvalFunction -> Value -> Value -> Types.Config -> Types.Env -> Types.EvalResult Bool
+applyPredicate evalFn predicate charArg cfg env =
+    case predicate of
+        PartiallyApplied closureEnv oldArgs patterns maybeName implementation ->
+            evalFn (oldArgs ++ [ charArg ]) patterns maybeName implementation cfg closureEnv
+                |> EvalResult.onValue
+                    (\result ->
+                        case result of
+                            Bool b ->
+                                Ok b
+
+                            _ ->
+                                Err (typeError env "isSubChar predicate must return Bool")
+                    )
+
+        _ ->
+            EvalResult.fail <| typeError env "isSubChar: expected a predicate function"

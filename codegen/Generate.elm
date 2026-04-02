@@ -17,6 +17,8 @@ import Elm.Syntax.Infix as Infix
 import Elm.Syntax.Module as Module
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
+import Elm.Syntax.Range
+import Elm.Syntax.TypeAnnotation
 import Elm.Syntax.Pattern as Pattern
 import Gen.CodeGen.Generate as Generate exposing (Directory(..))
 import Gen.Dict
@@ -321,10 +323,23 @@ normalModuleToFile (Node _ moduleName) file =
         generatedModuleName =
             "Core" :: moduleName
 
+        aliasMap : Dict.Dict ModuleName ModuleName
+        aliasMap =
+            file.imports
+                |> List.filterMap
+                    (\(Node _ imp) ->
+                        imp.moduleAlias
+                            |> Maybe.map
+                                (\(Node _ alias_) ->
+                                    ( alias_, Node.value imp.moduleName )
+                                )
+                    )
+                |> Dict.fromList
+
         namesAndDeclarations : List ( String, Elm.Declaration )
         namesAndDeclarations =
             file.declarations
-                |> List.filterMap (declarationToGen moduleName)
+                |> List.filterMap (declarationToGen aliasMap moduleName)
 
         names : List String
         names =
@@ -334,22 +349,49 @@ normalModuleToFile (Node _ moduleName) file =
         declarations =
             List.map Tuple.second namesAndDeclarations
 
+        aliasConstructors : List ( String, Elm.Expression )
+        aliasConstructors =
+            recordAliasConstructorsToGen aliasMap moduleName file.declarations
+
+        typeConstructors : List ( String, Elm.Expression )
+        typeConstructors =
+            customTypeConstructorsToGen moduleName file.declarations
+
         functions : Elm.Declaration
         functions =
-            names
-                |> List.map
-                    (\name ->
-                        Elm.tuple
-                            (Elm.string name)
-                            (Elm.value
-                                { importFrom = []
-                                , name = name
-                                , annotation =
-                                    Just
-                                        Gen.Elm.Syntax.Expression.annotation_.functionImplementation
-                                }
+            let
+                functionEntries : List Elm.Expression
+                functionEntries =
+                    names
+                        |> List.map
+                            (\name ->
+                                Elm.tuple
+                                    (Elm.string name)
+                                    (Elm.value
+                                        { importFrom = []
+                                        , name = name
+                                        , annotation =
+                                            Just
+                                                Gen.Elm.Syntax.Expression.annotation_.functionImplementation
+                                        }
+                                    )
                             )
-                    )
+
+                aliasEntries : List Elm.Expression
+                aliasEntries =
+                    aliasConstructors
+                        |> List.map
+                            (\( name, impl ) ->
+                                Elm.tuple (Elm.string name) impl
+                            )
+            in
+            let
+                ctorEntries : List Elm.Expression
+                ctorEntries =
+                    typeConstructors
+                        |> List.map (\( name, impl ) -> Elm.tuple (Elm.string name) impl)
+            in
+            (functionEntries ++ aliasEntries ++ ctorEntries)
                 |> Gen.FastDict.fromList
                 |> Elm.declaration "functions"
                 |> Elm.expose
@@ -416,8 +458,8 @@ normalModuleToFile (Node _ moduleName) file =
     }
 
 
-declarationToGen : ModuleName -> Node Declaration.Declaration -> Maybe ( String, Elm.Declaration )
-declarationToGen moduleName (Node _ declaration) =
+declarationToGen : Dict.Dict ModuleName ModuleName -> ModuleName -> Node Declaration.Declaration -> Maybe ( String, Elm.Declaration )
+declarationToGen aliasMap moduleName (Node _ declaration) =
     case declaration of
         Declaration.FunctionDeclaration function ->
             let
@@ -431,7 +473,7 @@ declarationToGen moduleName (Node _ declaration) =
             in
             Just
                 ( name
-                , functionImplementationToGen
+                , functionImplementationToGen aliasMap
                     { implementation
                         | name =
                             Node
@@ -446,17 +488,131 @@ declarationToGen moduleName (Node _ declaration) =
             Nothing
 
 
-functionImplementationToGen : Expression.FunctionImplementation -> Elm.Expression
-functionImplementationToGen { name, arguments, expression } =
+{-| Generate record alias constructor functions from type alias declarations.
+These are separate from regular declarations because they can't use normal
+Elm declaration syntax (constructor names are capitalized).
+-}
+recordAliasConstructorsToGen : Dict.Dict ModuleName ModuleName -> ModuleName -> List (Node Declaration.Declaration) -> List ( String, Elm.Expression )
+recordAliasConstructorsToGen aliasMap moduleName declarations =
+    List.filterMap
+        (\(Node _ declaration) ->
+            case declaration of
+                Declaration.AliasDeclaration alias_ ->
+                    case Node.value alias_.typeAnnotation of
+                        Elm.Syntax.TypeAnnotation.Record fields ->
+                            let
+                                aliasName : String
+                                aliasName =
+                                    Node.value alias_.name
+
+                                fieldNames : List String
+                                fieldNames =
+                                    List.map (\(Node _ ( Node _ fieldName, _ )) -> fieldName) fields
+
+                                argNames : List String
+                                argNames =
+                                    List.indexedMap (\i _ -> "$alias_arg" ++ String.fromInt i) fieldNames
+
+                                implementation : Expression.FunctionImplementation
+                                implementation =
+                                    { name = Node (Node.range alias_.name) (String.join "." (moduleName ++ [ aliasName ]))
+                                    , arguments =
+                                        argNames
+                                            |> List.map (\n -> Node Elm.Syntax.Range.emptyRange (Pattern.VarPattern n))
+                                    , expression =
+                                        Node Elm.Syntax.Range.emptyRange
+                                            (Expression.RecordExpr
+                                                (List.map2
+                                                    (\fieldName argName ->
+                                                        Node Elm.Syntax.Range.emptyRange
+                                                            ( Node Elm.Syntax.Range.emptyRange fieldName
+                                                            , Node Elm.Syntax.Range.emptyRange (Expression.FunctionOrValue [] argName)
+                                                            )
+                                                    )
+                                                    fieldNames
+                                                    argNames
+                                                )
+                                            )
+                                    }
+                            in
+                            Just ( aliasName, functionImplementationToGen aliasMap implementation )
+
+                        _ ->
+                            Nothing
+
+                _ ->
+                    Nothing
+        )
+        declarations
+
+
+{-| Generate custom type constructor functions.
+Each constructor becomes a FunctionImplementation that creates the appropriate Custom value.
+-}
+customTypeConstructorsToGen : ModuleName -> List (Node Declaration.Declaration) -> List ( String, Elm.Expression )
+customTypeConstructorsToGen moduleName declarations =
+    List.concatMap
+        (\(Node _ declaration) ->
+            case declaration of
+                Declaration.CustomTypeDeclaration customType ->
+                    List.filterMap
+                        (\(Node _ ctor) ->
+                            let
+                                ctorName : String
+                                ctorName =
+                                    Node.value ctor.name
+
+                                arity : Int
+                                arity =
+                                    List.length ctor.arguments
+
+                                argNames : List String
+                                argNames =
+                                    List.indexedMap (\i _ -> "$ctor_arg" ++ String.fromInt i) ctor.arguments
+
+                                implementation : Expression.FunctionImplementation
+                                implementation =
+                                    { name = Node Elm.Syntax.Range.emptyRange (String.join "." (moduleName ++ [ ctorName ]))
+                                    , arguments =
+                                        argNames
+                                            |> List.map (\n -> Node Elm.Syntax.Range.emptyRange (Pattern.VarPattern n))
+                                    , expression =
+                                        if arity == 0 then
+                                            Node Elm.Syntax.Range.emptyRange
+                                                (Expression.FunctionOrValue moduleName ctorName)
+
+                                        else
+                                            Node Elm.Syntax.Range.emptyRange
+                                                (Expression.Application
+                                                    (Node Elm.Syntax.Range.emptyRange (Expression.FunctionOrValue moduleName ctorName)
+                                                        :: List.map
+                                                            (\n -> Node Elm.Syntax.Range.emptyRange (Expression.FunctionOrValue [] n))
+                                                            argNames
+                                                    )
+                                                )
+                                    }
+                            in
+                            Just ( ctorName, functionImplementationToGen Dict.empty implementation )
+                        )
+                        customType.constructors
+
+                _ ->
+                    []
+        )
+        declarations
+
+
+functionImplementationToGen : Dict.Dict ModuleName ModuleName -> Expression.FunctionImplementation -> Elm.Expression
+functionImplementationToGen aliasMap { name, arguments, expression } =
     Gen.Elm.Syntax.Expression.make_.functionImplementation
         { name = renode Elm.string name
-        , arguments = arguments |> List.map (\pattern -> renode patternToGen pattern) |> Elm.list
-        , expression = renode expressionToGen expression
+        , arguments = arguments |> List.map (\pattern -> renode (patternToGen aliasMap) pattern) |> Elm.list
+        , expression = renode (expressionToGen aliasMap) expression
         }
 
 
-patternToGen : Pattern.Pattern -> Elm.Expression
-patternToGen pattern =
+patternToGen : Dict.Dict ModuleName ModuleName -> Pattern.Pattern -> Elm.Expression
+patternToGen aliasMap pattern =
     case pattern of
         Pattern.AllPattern ->
             Gen.Elm.Syntax.Pattern.make_.allPattern
@@ -480,7 +636,7 @@ patternToGen pattern =
             Gen.Elm.Syntax.Pattern.make_.floatPattern (Elm.float f)
 
         Pattern.TuplePattern children ->
-            Gen.Elm.Syntax.Pattern.make_.tuplePattern (renodeList patternToGen children)
+            Gen.Elm.Syntax.Pattern.make_.tuplePattern (renodeList (patternToGen aliasMap) children)
 
         Pattern.RecordPattern fields ->
             Gen.Elm.Syntax.Pattern.make_.recordPattern (renodeList Elm.string fields)
@@ -489,19 +645,25 @@ patternToGen pattern =
             Gen.Elm.Syntax.Pattern.make_.varPattern (Elm.string name)
 
         Pattern.ParenthesizedPattern child ->
-            Gen.Elm.Syntax.Pattern.make_.parenthesizedPattern (renode patternToGen child)
+            Gen.Elm.Syntax.Pattern.make_.parenthesizedPattern (renode (patternToGen aliasMap) child)
 
         Pattern.AsPattern child name ->
-            Gen.Elm.Syntax.Pattern.make_.asPattern (renode patternToGen child) (renode Elm.string name)
+            Gen.Elm.Syntax.Pattern.make_.asPattern (renode (patternToGen aliasMap) child) (renode Elm.string name)
 
         Pattern.UnConsPattern head tail ->
-            Gen.Elm.Syntax.Pattern.make_.unConsPattern (renode patternToGen head) (renode patternToGen tail)
+            Gen.Elm.Syntax.Pattern.make_.unConsPattern (renode (patternToGen aliasMap) head) (renode (patternToGen aliasMap) tail)
 
         Pattern.ListPattern children ->
-            Gen.Elm.Syntax.Pattern.make_.listPattern (renodeList patternToGen children)
+            Gen.Elm.Syntax.Pattern.make_.listPattern (renodeList (patternToGen aliasMap) children)
 
         Pattern.NamedPattern qualifiedNameRef children ->
-            Gen.Elm.Syntax.Pattern.make_.namedPattern (qualifiedNameRefToGen qualifiedNameRef) (renodeList patternToGen children)
+            let
+                resolvedRef =
+                    { qualifiedNameRef
+                        | moduleName = resolveAlias aliasMap qualifiedNameRef.moduleName
+                    }
+            in
+            Gen.Elm.Syntax.Pattern.make_.namedPattern (qualifiedNameRefToGen resolvedRef) (renodeList (patternToGen aliasMap) children)
 
 
 qualifiedNameRefToGen : Pattern.QualifiedNameRef -> Elm.Expression
@@ -526,33 +688,43 @@ renodeList f list =
     Elm.list (List.map (renode f) list)
 
 
-expressionToGen : Expression.Expression -> Elm.Expression
-expressionToGen expression =
+resolveAlias : Dict.Dict ModuleName ModuleName -> ModuleName -> ModuleName
+resolveAlias aliasMap moduleName =
+    Dict.get moduleName aliasMap
+        |> Maybe.withDefault moduleName
+
+
+expressionToGen : Dict.Dict ModuleName ModuleName -> Expression.Expression -> Elm.Expression
+expressionToGen aliasMap expression =
     case expression of
         Expression.UnitExpr ->
             Gen.Elm.Syntax.Expression.make_.unitExpr
 
         Expression.Application children ->
-            Gen.Elm.Syntax.Expression.make_.application (renodeList expressionToGen children)
+            Gen.Elm.Syntax.Expression.make_.application (renodeList (expressionToGen aliasMap) children)
 
         Expression.OperatorApplication opName infix_ l r ->
             Gen.Elm.Syntax.Expression.make_.operatorApplication
                 (Elm.string opName)
                 (infixToGen infix_)
-                (renode expressionToGen l)
-                (renode expressionToGen r)
+                (renode (expressionToGen aliasMap) l)
+                (renode (expressionToGen aliasMap) r)
 
         Expression.FunctionOrValue [] name ->
             Gen.H.val name
 
         Expression.FunctionOrValue moduleName name ->
-            Gen.Elm.Syntax.Expression.make_.functionOrValue (Elm.list <| List.map Elm.string moduleName) (Elm.string name)
+            let
+                resolvedModuleName =
+                    resolveAlias aliasMap moduleName
+            in
+            Gen.Elm.Syntax.Expression.make_.functionOrValue (Elm.list <| List.map Elm.string resolvedModuleName) (Elm.string name)
 
         Expression.IfBlock cond true false ->
             Gen.Elm.Syntax.Expression.make_.ifBlock
-                (renode expressionToGen cond)
-                (renode expressionToGen true)
-                (renode expressionToGen false)
+                (renode (expressionToGen aliasMap) cond)
+                (renode (expressionToGen aliasMap) true)
+                (renode (expressionToGen aliasMap) false)
 
         Expression.PrefixOperator opName ->
             Gen.Elm.Syntax.Expression.make_.prefixOperator (Elm.string opName)
@@ -570,101 +742,107 @@ expressionToGen expression =
             Gen.Elm.Syntax.Expression.make_.floatable (Elm.float f)
 
         Expression.Negation child ->
-            Gen.Elm.Syntax.Expression.make_.negation (renode expressionToGen child)
+            Gen.Elm.Syntax.Expression.make_.negation (renode (expressionToGen aliasMap) child)
 
         Expression.Literal s ->
             Gen.Elm.Syntax.Expression.make_.literal (Elm.string s)
 
         Expression.CharLiteral c ->
-            Gen.Elm.Syntax.Expression.make_.charLiteral (Elm.char c)
+            Gen.Elm.Syntax.Expression.make_.charLiteral
+                (if Char.toCode c < 32 || Char.toCode c > 126 then
+                    Elm.apply (Elm.value { importFrom = [ "Char" ], name = "fromCode", annotation = Nothing }) [ Elm.int (Char.toCode c) ]
+
+                 else
+                    Elm.char c
+                )
 
         Expression.TupledExpression children ->
-            Gen.Elm.Syntax.Expression.make_.tupledExpression (renodeList expressionToGen children)
+            Gen.Elm.Syntax.Expression.make_.tupledExpression (renodeList (expressionToGen aliasMap) children)
 
         Expression.ParenthesizedExpression child ->
-            Gen.Elm.Syntax.Expression.make_.parenthesizedExpression (renode expressionToGen child)
+            Gen.Elm.Syntax.Expression.make_.parenthesizedExpression (renode (expressionToGen aliasMap) child)
 
         Expression.LetExpression letBlock ->
-            Gen.Elm.Syntax.Expression.make_.letExpression (letBlockToGen letBlock)
+            Gen.Elm.Syntax.Expression.make_.letExpression (letBlockToGen aliasMap letBlock)
 
         Expression.CaseExpression caseBlock ->
-            Gen.Elm.Syntax.Expression.make_.caseExpression (caseBlockToGen caseBlock)
+            Gen.Elm.Syntax.Expression.make_.caseExpression (caseBlockToGen aliasMap caseBlock)
 
         Expression.LambdaExpression lambda ->
-            Gen.Elm.Syntax.Expression.make_.lambdaExpression (lambdaToGen lambda)
+            Gen.Elm.Syntax.Expression.make_.lambdaExpression (lambdaToGen aliasMap lambda)
 
         Expression.RecordExpr setters ->
-            Gen.Elm.Syntax.Expression.make_.recordExpr (renodeList recordSetterToGen setters)
+            Gen.Elm.Syntax.Expression.make_.recordExpr (renodeList (recordSetterToGen aliasMap) setters)
 
         Expression.ListExpr children ->
-            Gen.Elm.Syntax.Expression.make_.listExpr (renodeList expressionToGen children)
+            Gen.Elm.Syntax.Expression.make_.listExpr (renodeList (expressionToGen aliasMap) children)
 
         Expression.RecordAccess child field ->
-            Gen.Elm.Syntax.Expression.make_.recordAccess (renode expressionToGen child) (renode Elm.string field)
+            Gen.Elm.Syntax.Expression.make_.recordAccess (renode (expressionToGen aliasMap) child) (renode Elm.string field)
 
         Expression.RecordAccessFunction name ->
             Gen.Elm.Syntax.Expression.make_.recordAccessFunction (Elm.string name)
 
         Expression.RecordUpdateExpression name setters ->
-            Gen.Elm.Syntax.Expression.make_.recordUpdateExpression (renode Elm.string name) (renodeList recordSetterToGen setters)
+            Gen.Elm.Syntax.Expression.make_.recordUpdateExpression (renode Elm.string name) (renodeList (recordSetterToGen aliasMap) setters)
 
         Expression.GLSLExpression s ->
             Gen.Elm.Syntax.Expression.make_.gLSLExpression (Elm.string s)
 
 
-caseBlockToGen : Expression.CaseBlock -> Elm.Expression
-caseBlockToGen { expression, cases } =
+caseBlockToGen : Dict.Dict ModuleName ModuleName -> Expression.CaseBlock -> Elm.Expression
+caseBlockToGen aliasMap { expression, cases } =
     Gen.Elm.Syntax.Expression.make_.caseBlock
-        { expression = renode expressionToGen expression
-        , cases = Elm.list <| List.map caseToGen cases
+        { expression = renode (expressionToGen aliasMap) expression
+        , cases = Elm.list <| List.map (caseToGen aliasMap) cases
         }
 
 
-caseToGen : Expression.Case -> Elm.Expression
-caseToGen ( pattern, expression ) =
+caseToGen : Dict.Dict ModuleName ModuleName -> Expression.Case -> Elm.Expression
+caseToGen aliasMap ( pattern, expression ) =
     Elm.tuple
-        (renode patternToGen pattern)
-        (renode expressionToGen expression)
+        (renode (patternToGen aliasMap) pattern)
+        (renode (expressionToGen aliasMap) expression)
 
 
-lambdaToGen : Expression.Lambda -> Elm.Expression
-lambdaToGen { args, expression } =
+lambdaToGen : Dict.Dict ModuleName ModuleName -> Expression.Lambda -> Elm.Expression
+lambdaToGen aliasMap { args, expression } =
     Gen.Elm.Syntax.Expression.make_.lambda
-        { args = renodeList patternToGen args
-        , expression = renode expressionToGen expression
+        { args = renodeList (patternToGen aliasMap) args
+        , expression = renode (expressionToGen aliasMap) expression
         }
 
 
-letBlockToGen : Expression.LetBlock -> Elm.Expression
-letBlockToGen { declarations, expression } =
+letBlockToGen : Dict.Dict ModuleName ModuleName -> Expression.LetBlock -> Elm.Expression
+letBlockToGen aliasMap { declarations, expression } =
     Gen.Elm.Syntax.Expression.make_.letBlock
-        { declarations = renodeList letDeclarationToGen declarations
-        , expression = renode expressionToGen expression
+        { declarations = renodeList (letDeclarationToGen aliasMap) declarations
+        , expression = renode (expressionToGen aliasMap) expression
         }
 
 
-letDeclarationToGen : Expression.LetDeclaration -> Elm.Expression
-letDeclarationToGen declaration =
+letDeclarationToGen : Dict.Dict ModuleName ModuleName -> Expression.LetDeclaration -> Elm.Expression
+letDeclarationToGen aliasMap declaration =
     case declaration of
         Expression.LetFunction function ->
-            Gen.Elm.Syntax.Expression.make_.letFunction (functionToGen function)
+            Gen.Elm.Syntax.Expression.make_.letFunction (functionToGen aliasMap function)
 
         Expression.LetDestructuring pattern expression ->
-            Gen.Elm.Syntax.Expression.make_.letDestructuring (renode patternToGen pattern) (renode expressionToGen expression)
+            Gen.Elm.Syntax.Expression.make_.letDestructuring (renode (patternToGen aliasMap) pattern) (renode (expressionToGen aliasMap) expression)
 
 
-functionToGen : Expression.Function -> Elm.Expression
-functionToGen { declaration } =
+functionToGen : Dict.Dict ModuleName ModuleName -> Expression.Function -> Elm.Expression
+functionToGen aliasMap { declaration } =
     Gen.Elm.Syntax.Expression.make_.function
         { documentation = Gen.Maybe.make_.nothing
         , signature = Gen.Maybe.make_.nothing
-        , declaration = renode functionImplementationToGen declaration
+        , declaration = renode (functionImplementationToGen aliasMap) declaration
         }
 
 
-recordSetterToGen : Expression.RecordSetter -> Elm.Expression
-recordSetterToGen ( name, value ) =
-    Elm.tuple (renode Elm.string name) (renode expressionToGen value)
+recordSetterToGen : Dict.Dict ModuleName ModuleName -> Expression.RecordSetter -> Elm.Expression
+recordSetterToGen aliasMap ( name, value ) =
+    Elm.tuple (renode Elm.string name) (renode (expressionToGen aliasMap) value)
 
 
 infixToGen : Infix.InfixDirection -> Elm.Expression

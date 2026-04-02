@@ -1,4 +1,4 @@
-LIBRARIES = elm/core/1.0.5 elmcraft/core-extra/2.2.0 elm/json/1.1.4 elm/regex/1.0.0
+LIBRARIES = elm/core/1.0.5 elmcraft/core-extra/2.2.0 elm/json/1.1.4 elm/regex/1.0.0 elm/parser/1.1.0
 
 .PHONY: all
 all: generated/Core/Basics.elm
