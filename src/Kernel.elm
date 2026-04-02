@@ -122,7 +122,7 @@ functions evalFunction =
         , ( "initializeFromList", two int anyList to (tuple (jsArray anything) anyList) Kernel.JsArray.initializeFromList Core.Elm.JsArray.initializeFromList )
         , ( "length", one (jsArray anything) to int Array.length Core.Elm.JsArray.length )
         , ( "map", twoWithError (function evalFunction anything to anything) (jsArray anything) to (jsArray anything) Kernel.JsArray.map Core.Elm.JsArray.map )
-        , ( "indexedMap", twoWithError (function2 evalFunction int anything to anything) (jsArray anything) to (jsArray anything) Kernel.JsArray.indexedMap Core.Elm.JsArray.indexedMap )
+        , ( "indexedMap", threeWithError (function2 evalFunction int anything to anything) int (jsArray anything) to (jsArray anything) Kernel.JsArray.indexedMap Core.Elm.JsArray.indexedMap )
         , ( "push", two anything (jsArray anything) to (jsArray anything) Array.push Core.Elm.JsArray.push )
         , ( "slice", three int int (jsArray anything) to (jsArray anything) Array.slice Core.Elm.JsArray.slice )
         , ( "singleton", one anything to (jsArray anything) (List.singleton >> Array.fromList) Core.Elm.JsArray.singleton )

@@ -93,9 +93,9 @@ map f array cfg env =
         |> EvalResult.map Array.fromList
 
 
-indexedMap : (Int -> Eval (Value -> Eval Value)) -> Array Value -> Eval (Array Value)
-indexedMap f array cfg env =
-    Types.combineMap f (List.range 0 (Array.length array - 1)) cfg env
+indexedMap : (Int -> Eval (Value -> Eval Value)) -> Int -> Array Value -> Eval (Array Value)
+indexedMap f offset array cfg env =
+    Types.combineMap f (List.range offset (offset + Array.length array - 1)) cfg env
         |> EvalResult.andThen
             (\fs ->
                 Types.combineMap
