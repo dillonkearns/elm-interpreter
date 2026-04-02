@@ -757,6 +757,46 @@ stepLimitTests =
                 Eval.evalWithMaxSteps Nothing
                     "let loop n = if n <= 0 then 0 else loop (n - 1) in loop 100"
                     |> Expect.equal (Ok (Int 0))
+        , test "evalWithEnvAndLimit respects step limit" <|
+            \_ ->
+                let
+                    source =
+                        """module Temp exposing (main)
+main = let loop n = if n <= 0 then 0 else loop (n - 1) in loop 10000"""
+
+                    projectEnv =
+                        Eval.Module.buildProjectEnv []
+                in
+                case projectEnv of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 50)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.err
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "evalWithEnvAndLimit with Nothing allows completion" <|
+            \_ ->
+                let
+                    source =
+                        """module Temp exposing (main)
+main = let loop n = if n <= 0 then 0 else loop (n - 1) in loop 10"""
+
+                    projectEnv =
+                        Eval.Module.buildProjectEnv []
+                in
+                case projectEnv of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit Nothing
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 0))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
         ]
 
 

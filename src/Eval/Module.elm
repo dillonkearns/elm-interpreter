@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvFromFiles, parseProjectSources, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (ProjectEnv, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, parseProjectSources, trace, traceOrEvalModule, traceWithEnv)
 
 import Core
 import Dict as ElmDict
@@ -222,7 +222,16 @@ Only the additional sources are parsed; the ProjectEnv's environment is reused.
 The expression is evaluated in the context of the last additional source.
 -}
 evalWithEnv : ProjectEnv -> List String -> Expression -> Result Error Value
-evalWithEnv (ProjectEnv projectEnv) additionalSources expression =
+evalWithEnv projectEnv additionalSources expression =
+    evalWithEnvAndLimit Nothing projectEnv additionalSources expression
+
+
+{-| Like `evalWithEnv`, but with an optional step limit to prevent hangs
+on large computations. Pass `Just n` to limit evaluation to `n` trampoline
+steps, or `Nothing` for unlimited.
+-}
+evalWithEnvAndLimit : Maybe Int -> ProjectEnv -> List String -> Expression -> Result Error Value
+evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expression =
     let
         parseResult :
             Result Error
@@ -331,7 +340,7 @@ evalWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = Nothing }
+                                { trace = False, maxSteps = maxSteps }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
