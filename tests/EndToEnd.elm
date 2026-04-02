@@ -36,6 +36,7 @@ suite =
         , edgeCaseTests
         , patternMatchTests
         , lambdaInlineTests
+        , sortStabilityTests
         ]
 
 
@@ -621,4 +622,56 @@ lambdaInlineTests =
             "()"
             identity
             Unit
+        ]
+
+
+sortStabilityTests : Test
+sortStabilityTests =
+    describe "List.sortBy stability"
+        [ evalTestModule "sortBy preserves order of equal elements"
+            """module Temp exposing (main)
+
+main =
+    let
+        items =
+            [ { name = "alice", group = 2 }
+            , { name = "bob", group = 1 }
+            , { name = "charlie", group = 2 }
+            ]
+
+        sorted = List.sortBy .group items
+    in
+    List.map .name sorted
+"""
+            (list String)
+            [ "bob", "alice", "charlie" ]
+        , evalTestModule "sort stability with identical sort keys"
+            """module Temp exposing (main)
+
+main =
+    let
+        items =
+            [ { val = "first", key = 1 }
+            , { val = "second", key = 1 }
+            , { val = "third", key = 1 }
+            ]
+
+        sorted = List.sortBy .key items
+    in
+    List.map .val sorted
+"""
+            (list String)
+            [ "first", "second", "third" ]
+        , evalTestModule "sortWith stability"
+            """module Temp exposing (main)
+
+main =
+    let
+        items = [ (1, "a"), (2, "b"), (1, "c"), (2, "d") ]
+        sorted = List.sortWith (\\( k1, _ ) ( k2, _ ) -> compare k1 k2) items
+    in
+    List.map (\\( _, v ) -> v) sorted
+"""
+            (list String)
+            [ "a", "c", "b", "d" ]
         ]
