@@ -8,6 +8,7 @@
     "property-test": "sh run.sh"
   },
   "devDependencies": {
+    "c8": "^11.0.0",
     "elm": "^0.19.1-6",
     "elm-codegen": "^0.6.3",
     "elm-pages": "^3.3.4"

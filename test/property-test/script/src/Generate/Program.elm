@@ -21,6 +21,7 @@ import Elm.Declare
 import Elm.Let
 import Elm.Op
 import Gen.Basics
+import Gen.Char
 import Gen.List
 import Gen.Maybe
 import Gen.Platform
@@ -531,7 +532,7 @@ advancedTestGenerator =
 
 singleAdvancedTest : Random.Generator Elm.Expression
 singleAdvancedTest =
-    Random.int 0 11
+    Random.int 0 15
         |> Random.andThen
             (\tag ->
                 case tag of
@@ -719,7 +720,7 @@ singleAdvancedTest =
                             (Random.int -50 50)
                             (Random.map (\n -> n > 0) (Random.int 0 1))
 
-                    _ ->
+                    11 ->
                         -- Piping (|>)
                         Random.map2
                             (\a b ->
@@ -733,6 +734,77 @@ singleAdvancedTest =
                             )
                             (Random.int -50 50)
                             (Random.int -50 50)
+
+                    12 ->
+                        -- Record accessor with List.sortBy
+                        Random.map3
+                            (\a b c ->
+                                let
+                                    getName = Elm.fn (Elm.Arg.var "r") (\r -> Elm.get "name" r)
+                                    getScore = Elm.fn (Elm.Arg.var "r") (\r -> Elm.get "score" r)
+                                    records =
+                                        Elm.list
+                                            [ Elm.record [ ( "name", Elm.string (randomWord a) ), ( "score", Elm.int b ) ]
+                                            , Elm.record [ ( "name", Elm.string (randomWord c) ), ( "score", Elm.int a ) ]
+                                            , Elm.record [ ( "name", Elm.string (randomWord b) ), ( "score", Elm.int c ) ]
+                                            ]
+                                in
+                                Gen.String.call_.join (Elm.string ",")
+                                    (Gen.List.call_.map getName
+                                        (Gen.List.call_.sortBy getScore records)
+                                    )
+                            )
+                            (Random.int 0 9)
+                            (Random.int -20 20)
+                            (Random.int 0 9)
+
+                    13 ->
+                        -- Char classification functions
+                        Random.map
+                            (\idx ->
+                                let
+                                    c = Elm.char (randomChar idx)
+
+                                    boolStr b =
+                                        Elm.ifThen b (Elm.string "T") (Elm.string "F")
+                                in
+                                Gen.String.call_.join (Elm.string ",")
+                                    (Elm.list
+                                        [ boolStr (Gen.Char.call_.isAlpha c)
+                                        , boolStr (Gen.Char.call_.isDigit c)
+                                        , boolStr (Gen.Char.call_.isUpper c)
+                                        , boolStr (Gen.Char.call_.isLower c)
+                                        ]
+                                    )
+                            )
+                            (Random.int 0 9)
+
+                    14 ->
+                        -- Composed functions applied
+                        Random.map2
+                            (\a b ->
+                                let
+                                    addB = Elm.fn (Elm.Arg.var "x") (\x -> Elm.Op.plus x (Elm.int b))
+                                        |> Elm.withType (Type.function [ Type.int ] Type.int)
+                                    doubleIt = Elm.fn (Elm.Arg.var "y") (\y -> Elm.Op.multiply y (Elm.int 2))
+                                        |> Elm.withType (Type.function [ Type.int ] Type.int)
+                                in
+                                Gen.String.call_.fromInt
+                                    (Elm.apply doubleIt [ Elm.apply addB [ Elm.int a ] ])
+                            )
+                            (Random.int -20 20)
+                            (Random.int -20 20)
+
+                    _ ->
+                        -- Record field access via lambda
+                        Random.map2
+                            (\a s ->
+                                Elm.apply
+                                    (Elm.fn (Elm.Arg.var "rec") (\rec -> Elm.get "name" rec))
+                                    [ Elm.record [ ( "name", Elm.string (randomWord s) ), ( "value", Elm.int a ) ] ]
+                            )
+                            (Random.int -50 50)
+                            (Random.int 0 9)
             )
 
 
