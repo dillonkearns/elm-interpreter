@@ -42,6 +42,7 @@ suite =
         , parserEdgeCaseTests
         , stepLimitTests
         , accumulatorLoopDetectionTests
+        , growingArgsLoopDetectionTests
         , taskTests
         , bytesTests
         ]
@@ -870,6 +871,75 @@ main = ping 0"""
 in
 mySum 0 [1, 2, 3, 4, 5]"""
                     |> Expect.equal (Ok (Types.Int 15))
+        ]
+
+
+{-| Tests for Category B loops: arguments change every call (so fingerprint
+differs), but the function is not making progress toward termination.
+These use a step limit as safety timeout, and assert the error is from
+cycle detection, not the step limit.
+-}
+growingArgsLoopDetectionTests : Test
+growingArgsLoopDetectionTests =
+    describe "cycle detection (growing args — Category B)"
+        [ test "accumulator grows, input exhausted — broken foldByBytes" <|
+            \_ ->
+                -- Models elm-ical mutation: base case removed from foldByBytes.
+                -- acc grows every call, chars stays []. Fingerprint changes.
+                Eval.evalWithMaxSteps (Just 100000)
+                    """let
+    fold acc chars =
+        case chars of
+            _ -> fold (0 :: acc) (List.drop 1 chars)
+in
+fold [] [1, 2, 3]"""
+                    |> expectInfiniteRecursionError
+        , test "counter grows without bound (caught by step limit)" <|
+            \_ ->
+                -- f(0) -> f(1) -> f(2) -> ... No base case.
+                -- This is NOT structurally growing (Int size is always 1),
+                -- so the Category B size-change check can't detect it.
+                -- The step limit catches it as a fallback.
+                Eval.evalWithMaxSteps (Just 100000)
+                    """let growForever n = growForever (n + 1)
+in growForever 0"""
+                    |> Expect.err
+        , test "accumulator grows, input stays empty" <|
+            \_ ->
+                -- Both args change, but one only grows and the other is stuck.
+                Eval.evalWithMaxSteps (Just 100000)
+                    """let
+    helper acc remaining =
+        case remaining of
+            [] -> helper (0 :: acc) []
+            c :: rest -> helper (c :: acc) rest
+in
+helper [] [1, 2, 3]"""
+                    |> expectInfiniteRecursionError
+        , test "legitimate accumulator recursion terminates — must NOT flag" <|
+            \_ ->
+                -- Correctly-written: input shrinks each call. Terminates.
+                Eval.evalWithMaxSteps (Just 100000)
+                    """let
+    myLength acc xs =
+        case xs of
+            [] -> acc
+            _ :: rest -> myLength (acc + 1) rest
+in
+myLength 0 [1, 2, 3, 4, 5]"""
+                    |> Expect.equal (Ok (Types.Int 5))
+        , test "legitimate fold with growing accumulator — must NOT flag" <|
+            \_ ->
+                -- acc grows but input shrinks. Terminates normally.
+                Eval.evalWithMaxSteps (Just 100000)
+                    """let
+    rev acc xs =
+        case xs of
+            [] -> acc
+            x :: rest -> rev (x :: acc) rest
+in
+rev [] [1, 2, 3]"""
+                    |> Expect.equal (Ok (Types.List [ Types.Int 3, Types.Int 2, Types.Int 1 ]))
         ]
 
 

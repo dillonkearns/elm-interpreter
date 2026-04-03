@@ -1,6 +1,7 @@
 module Eval.Expression exposing (evalExpression, evalFunction)
 
 import Array
+import Bitwise
 import Core
 import Elm.Syntax.Expression as Expression exposing (Expression(..), LetDeclaration)
 import Elm.Syntax.Infix
@@ -25,12 +26,12 @@ import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData
 import Value exposing (nameError, typeError, unsupported)
 
 
-{-| Cheap fingerprint of bound values — uses only top-level structure (type tag,
-length, first element) so it's O(number of bindings) with O(1) per value.
+{-| Cheap fingerprint of a list of argument values — uses only top-level
+structure (type tag, length, first element) so it's O(args) with O(1) per value.
 -}
-fingerprintValues : EnvValues -> Int
-fingerprintValues values =
-    Dict.foldl (\_ v acc -> acc * 31 + fingerprintValue v) 5381 values
+fingerprintArgs : List Value -> Int
+fingerprintArgs args =
+    List.foldl (\v acc -> Bitwise.xor (acc * 31) (fingerprintValue v)) 5381 args
 
 
 fingerprintValue : Value -> Int
@@ -79,44 +80,104 @@ fingerprintValue value =
             0
 
 
+{-| Cheap size estimate of argument values — sum of top-level sizes.
+Used to detect Category B loops (args change but total size grows
+monotonically, meaning no argument is getting structurally smaller).
+-}
+sizeOfArgs : List Value -> Int
+sizeOfArgs args =
+    List.foldl (\v acc -> acc + sizeOfValue v) 0 args
+
+
+sizeOfValue : Value -> Int
+sizeOfValue value =
+    case value of
+        List items ->
+            List.length items
+
+        String s ->
+            String.length s
+
+        Tuple _ _ ->
+            2
+
+        Triple _ _ _ ->
+            3
+
+        Custom _ args ->
+            List.length args
+
+        Record dict ->
+            Dict.size dict
+
+        JsArray arr ->
+            Array.length arr
+
+        _ ->
+            1
+
+
 {-| Combined check + update for cycle detection. Returns either:
 - CycleDetected: infinite loop found, bail out
 - Continue updatedCheck: no cycle, proceed with updated check state
 Computes fingerprint and does Dict lookup only ONCE.
+
+Detects two patterns:
+- Category A: identical fingerprint for 3 consecutive calls (same args = guaranteed loop)
+- Category B: fingerprint changes but total value size never decreases for 50 consecutive
+  calls (args growing monotonically = no progress toward base case)
 -}
 type CycleResult
     = CycleDetected
-    | Continue (Dict String { fingerprint : Int, depth : Int, count : Int })
+    | Continue (Dict String { fingerprint : Int, depth : Int, count : Int, size : Int, growCount : Int })
 
 
-checkAndUpdateCycle : QualifiedNameRef -> Env -> CycleResult
-checkAndUpdateCycle qualifiedName env =
+checkAndUpdateCycle : QualifiedNameRef -> List Value -> Env -> CycleResult
+checkAndUpdateCycle qualifiedName args env =
     let
         fnKey =
             Syntax.qualifiedNameToString qualifiedName
 
         fp =
-            fingerprintValues env.values
+            fingerprintArgs args
+
+        sz =
+            sizeOfArgs args
     in
     case Dict.get fnKey env.recursionCheck of
         Nothing ->
-            Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1 } env.recursionCheck)
+            Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = 0 } env.recursionCheck)
 
         Just entry ->
             if entry.depth >= env.callDepth then
                 -- Not recursive (function returned and was called again)
-                Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1 } env.recursionCheck)
+                Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = 0 } env.recursionCheck)
 
-            else if entry.fingerprint /= fp then
-                -- Recursive but args changed
-                Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1 } env.recursionCheck)
+            else if entry.fingerprint == fp then
+                -- Category A: identical fingerprint (same args)
+                if entry.count >= 3 then
+                    CycleDetected
 
-            else if entry.count < 3 then
-                -- Same fingerprint, warming up
-                Continue (Dict.insert fnKey { entry | count = entry.count + 1 } env.recursionCheck)
+                else
+                    Continue (Dict.insert fnKey { entry | count = entry.count + 1 } env.recursionCheck)
 
             else
-                CycleDetected
+                -- Fingerprint changed. Check Category B: is total size growing?
+                let
+                    newGrowCount =
+                        if sz > entry.size then
+                            -- Size strictly increased — args growing
+                            entry.growCount + 1
+
+                        else
+                            -- Size stayed same or decreased — making progress or stable
+                            0
+                in
+                if newGrowCount >= 50 then
+                    CycleDetected
+
+                else
+                    Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = newGrowCount } env.recursionCheck)
 
 
 evalExpression : Node Expression -> Eval Value
@@ -1221,11 +1282,26 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                                 Recursion.base (f args cfg env)
 
         _ ->
-            call
-                maybeQualifiedName
-                implementation
-                cfg
-                boundEnv
+            case maybeQualifiedName of
+                Just qualifiedName ->
+                    if env.callDepth < 200 then
+                        call maybeQualifiedName implementation cfg boundEnv
+
+                    else
+                        case checkAndUpdateCycle qualifiedName args env of
+                            CycleDetected ->
+                                Types.failPartial <|
+                                    typeError env
+                                        ("Infinite recursion detected: "
+                                            ++ Syntax.qualifiedNameToString qualifiedName
+                                            ++ " called with identical arguments"
+                                        )
+
+                            Continue updatedCheck ->
+                                call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = updatedCheck }
+
+                Nothing ->
+                    call maybeQualifiedName implementation cfg boundEnv
 
 
 call : Maybe QualifiedNameRef -> Implementation -> PartialEval Value
@@ -1245,26 +1321,7 @@ call maybeQualifiedName implementation cfg env =
                         newEnv =
                             callFn qualifiedName.moduleName qualifiedName.name env
                     in
-                    if env.callDepth < 100 then
-                        -- Fast path: shallow call depth, no cycle check needed
-                        Recursion.recurse ( expr, cfg, newEnv )
-
-                    else
-                        case checkAndUpdateCycle qualifiedName env of
-                            CycleDetected ->
-                                Types.failPartial <|
-                                    typeError env
-                                        ("Infinite recursion detected: "
-                                            ++ Syntax.qualifiedNameToString qualifiedName
-                                            ++ " called with identical arguments"
-                                        )
-
-                            Continue updatedCheck ->
-                                Recursion.recurse
-                                    ( expr
-                                    , cfg
-                                    , { newEnv | recursionCheck = updatedCheck }
-                                    )
+                    Recursion.recurse ( expr, cfg, newEnv )
 
                 Nothing ->
                     Recursion.recurse ( expr, cfg, env )
