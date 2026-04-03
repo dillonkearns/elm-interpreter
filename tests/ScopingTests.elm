@@ -103,7 +103,7 @@ main =
 recordAliasConstructorTests : Test
 recordAliasConstructorTests =
     describe "Record type alias constructors"
-        [ test "Record alias constructor field access .x" <|
+        [ test "same-module field access .x" <|
             \_ ->
                 Eval.Module.eval
                     """module Test exposing (main)
@@ -114,7 +114,7 @@ main = (Point 1 2).x
 """
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (Int 1))
-        , test "Record alias constructor field access .y" <|
+        , test "same-module field access .y" <|
             \_ ->
                 Eval.Module.eval
                     """module Test exposing (main)
@@ -125,7 +125,7 @@ main = (Point 3 4).y
 """
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (Int 4))
-        , test "Record alias constructor used as function" <|
+        , test "same-module constructor used as function" <|
             \_ ->
                 Eval.Module.eval
                     """module Test exposing (main)
@@ -136,6 +136,186 @@ main = List.map .x [Point 10 20, Point 30 40]
 """
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (List [ Int 10, Int 30 ]))
+        , evalProjectTest "cross-module: explicit import exposing (Alias)"
+            [ """module Geometry exposing (Point)
+
+type alias Point = { x : Int, y : Int }
+"""
+            , """module Main exposing (main)
+
+import Geometry exposing (Point)
+
+main = (Point 10 20).x
+"""
+            ]
+            Int
+            10
+        , evalProjectTest "cross-module: qualified Geometry.Point"
+            [ """module Geometry exposing (Point)
+
+type alias Point = { x : Int, y : Int }
+"""
+            , """module Main exposing (main)
+
+import Geometry
+
+main = (Geometry.Point 10 20).x
+"""
+            ]
+            Int
+            10
+        , evalProjectTest "cross-module: constructed in other module, field access in Main"
+            [ """module Geometry exposing (Point, origin)
+
+type alias Point = { x : Int, y : Int }
+
+origin = Point 0 0
+"""
+            , """module Main exposing (main)
+
+import Geometry
+
+main = Geometry.origin.x
+"""
+            ]
+            Int
+            0
+        , evalProjectTest "cross-module: alias from package, constructed in user module"
+            [ """module Syntax exposing (File)
+
+type alias File =
+    { declarations : List String
+    , comments : List String
+    }
+"""
+            , """module Parser exposing (parse)
+
+import Syntax exposing (File)
+
+parse input = Ok (File [ input ] [])
+"""
+            , """module Main exposing (main)
+
+import Parser
+
+main =
+    case Parser.parse "hello" of
+        Ok ast -> ast.declarations
+        Err _ -> []
+"""
+            ]
+            (list String)
+            [ "hello" ]
+        , evalProjectTest "cross-module: 4-field alias through function chain"
+            [ """module Syntax exposing (File)
+
+type alias File =
+    { moduleDefinition : String
+    , imports : List String
+    , declarations : List String
+    , comments : List String
+    }
+"""
+            , """module Builder exposing (buildFile)
+
+import Syntax exposing (File)
+
+buildFile moduleDef imports decls comments =
+    File moduleDef imports decls comments
+"""
+            , """module Main exposing (main)
+
+import Builder
+
+main =
+    (Builder.buildFile "MyModule" [ "import A" ] [ "decl1" ] [ "-- comment" ]).declarations
+"""
+            ]
+            (list String)
+            [ "decl1" ]
+        , test "cross-module: two-phase env (buildProjectEnv + evalWithEnv)" <|
+            \_ ->
+                let
+                    packageSources =
+                        [ """module Syntax exposing (File)
+
+type alias File =
+    { declarations : List String
+    , comments : List String
+    }
+"""
+                        ]
+
+                    userSource =
+                        """module Main exposing (main)
+
+import Syntax exposing (File)
+
+main = (File [ "hello" ] []).declarations
+"""
+                in
+                case Eval.Module.buildProjectEnv packageSources of
+                    Err e ->
+                        Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)
+
+                    Ok projectEnv ->
+                        Eval.Module.evalWithEnv projectEnv
+                            [ userSource ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (List [ String "hello" ]))
+        , evalProjectTest "cross-module: record alias through parser combinator chain"
+            [ """module Syntax exposing (File)
+
+type alias File =
+    { declarations : List String
+    , comments : List String
+    }
+"""
+            , """module Combinator exposing (parse)
+
+import Syntax exposing (File)
+
+type Parser a = Parser (String -> ( a, String ))
+
+succeed : a -> Parser a
+succeed a = Parser (\\input -> ( a, input ))
+
+andMap : Parser a -> Parser (a -> b) -> Parser b
+andMap (Parser pa) (Parser pf) =
+    Parser (\\input ->
+        let
+            ( f, rest1 ) = pf input
+            ( a, rest2 ) = pa rest1
+        in
+        ( f a, rest2 ))
+
+run : Parser a -> String -> a
+run (Parser p) input =
+    let ( result, _ ) = p input
+    in result
+
+getDecls : Parser (List String)
+getDecls = Parser (\\input -> ( [ input ], "" ))
+
+getComments : Parser (List String)
+getComments = Parser (\\input -> ( [], input ))
+
+parse : String -> File
+parse =
+    succeed File
+        |> andMap getDecls
+        |> andMap getComments
+        |> run
+"""
+            , """module Main exposing (main)
+
+import Combinator
+
+main = (Combinator.parse "some source").declarations
+"""
+            ]
+            (list String)
+            [ "some source" ]
         ]
 
 

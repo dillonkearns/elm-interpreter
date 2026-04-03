@@ -801,9 +801,18 @@ exposeExplicitItem allInterfaces (( moduleName, _ ) as moduleNameWithKey) (Node 
         FunctionExpose name ->
             { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
 
-        TypeOrAliasExpose _ ->
-            -- Type name without constructors - doesn't add values
-            acc
+        TypeOrAliasExpose name ->
+            -- Check if this is a type alias — if so, expose its record constructor
+            case ElmDict.get moduleName allInterfaces of
+                Just interface ->
+                    if List.any (\exposed -> exposed == Elm.Interface.Alias name) interface then
+                        { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
+
+                    else
+                        acc
+
+                Nothing ->
+                    acc
 
         TypeExpose { name, open } ->
             case open of

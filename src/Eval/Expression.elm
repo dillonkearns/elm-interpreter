@@ -1465,13 +1465,6 @@ loops with regular custom type constructors.
 findRecordAliasConstructor : ModuleName -> String -> Env -> Maybe ( ModuleName, Expression.FunctionImplementation )
 findRecordAliasConstructor moduleName name env =
     let
-        ( resolvedModule, resolvedModuleKey ) =
-            if List.isEmpty moduleName then
-                ( env.currentModule, env.currentModuleKey )
-
-            else
-                fixModuleName moduleName env
-
         isRecordExprBody : Expression.FunctionImplementation -> Bool
         isRecordExprBody func =
             case Node.value func.expression of
@@ -1481,24 +1474,40 @@ findRecordAliasConstructor moduleName name env =
                 _ ->
                     False
 
-        maybeFunc : Maybe Expression.FunctionImplementation
-        maybeFunc =
-            if List.isEmpty moduleName then
-                Dict.get name env.currentModuleFunctions
+        checkModule : ModuleName -> String -> Maybe ( ModuleName, Expression.FunctionImplementation )
+        checkModule mod modKey =
+            Dict.get modKey env.functions
+                |> Maybe.andThen (Dict.get name)
+                |> Maybe.andThen
+                    (\f ->
+                        if isRecordExprBody f then
+                            Just ( mod, f )
 
-            else
-                Dict.get resolvedModuleKey env.functions
-                    |> Maybe.andThen (Dict.get name)
+                        else
+                            Nothing
+                    )
     in
-    maybeFunc
-        |> Maybe.andThen
-            (\f ->
-                if isRecordExprBody f then
-                    Just ( resolvedModule, f )
+    if List.isEmpty moduleName then
+        -- Try current module first
+        case checkModule env.currentModule env.currentModuleKey of
+            Just result ->
+                Just result
 
-                else
-                    Nothing
-            )
+            Nothing ->
+                -- Try imported modules (for cross-module type alias constructors)
+                case Dict.get name env.imports.exposedValues of
+                    Just ( sourceModule, sourceKey ) ->
+                        checkModule sourceModule sourceKey
+
+                    Nothing ->
+                        Nothing
+
+    else
+        let
+            ( resolvedModule, resolvedModuleKey ) =
+                fixModuleName moduleName env
+        in
+        checkModule resolvedModule resolvedModuleKey
 
 
 fixModuleName : ModuleName -> Env -> ( ModuleName, String )
