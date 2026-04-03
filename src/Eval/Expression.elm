@@ -129,7 +129,7 @@ Detects two patterns:
 -}
 type CycleResult
     = CycleDetected
-    | Continue (Dict String { fingerprint : Int, depth : Int, count : Int, size : Int, growCount : Int })
+    | Continue (Dict String { fingerprint : Int, depth : Int, count : Int, size : Int, growCount : Int, argSizes : List Int, argFingerprints : List Int })
 
 
 checkAndUpdateCycle : QualifiedNameRef -> List Value -> Env -> CycleResult
@@ -143,15 +143,21 @@ checkAndUpdateCycle qualifiedName args env =
 
         sz =
             sizeOfArgs args
+
+        perArgSzs =
+            List.map sizeOfValue args
+
+        perArgFps =
+            List.map fingerprintValue args
     in
     case Dict.get fnKey env.recursionCheck of
         Nothing ->
-            Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = 0 } env.recursionCheck)
+            Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } env.recursionCheck)
 
         Just entry ->
             if entry.depth >= env.callDepth then
                 -- Not recursive (function returned and was called again)
-                Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = 0 } env.recursionCheck)
+                Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } env.recursionCheck)
 
             else if entry.fingerprint == fp then
                 -- Category A: identical fingerprint (same args)
@@ -164,9 +170,19 @@ checkAndUpdateCycle qualifiedName args env =
             else
                 -- Fingerprint changed. Check Category B: is total size growing?
                 let
+                    -- "Bounded progress" = any arg has constant size but changing fingerprint.
+                    -- This detects countdown variables (Int decreasing toward base case)
+                    -- whose size stays 1 but whose value changes each call.
+                    boundedProgress =
+                        hasBoundedProgress entry.argSizes entry.argFingerprints perArgSzs perArgFps
+
                     newGrowCount =
-                        if sz > entry.size then
-                            -- Size strictly increased — args growing
+                        if boundedProgress then
+                            -- A scalar argument is changing value — likely a countdown
+                            0
+
+                        else if sz > entry.size then
+                            -- Size strictly increased, no scalar progress — args growing
                             entry.growCount + 1
 
                         else
@@ -177,7 +193,27 @@ checkAndUpdateCycle qualifiedName args env =
                     CycleDetected
 
                 else
-                    Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = newGrowCount } env.recursionCheck)
+                    Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = newGrowCount, argSizes = perArgSzs, argFingerprints = perArgFps } env.recursionCheck)
+
+
+{-| Check if any argument has constant size but changing fingerprint.
+This detects "countdown" variables — scalars whose value changes each call
+(making progress toward a base case) even though their size stays at 1.
+-}
+hasBoundedProgress : List Int -> List Int -> List Int -> List Int -> Bool
+hasBoundedProgress prevSizes prevFps newSizes newFps =
+    case ( prevSizes, prevFps ) of
+        ( ps :: psTail, pf :: pfTail ) ->
+            case ( newSizes, newFps ) of
+                ( ns :: nsTail, nf :: nfTail ) ->
+                    (ps == ns && pf /= nf)
+                        || hasBoundedProgress psTail pfTail nsTail nfTail
+
+                _ ->
+                    False
+
+        _ ->
+            False
 
 
 evalExpression : Node Expression -> Eval Value

@@ -125,7 +125,7 @@ type alias Env =
     , imports : ImportedNames
     , moduleImports : Dict String ImportedNames
     , callDepth : Int
-    , recursionCheck : Dict String { fingerprint : Int, depth : Int, count : Int, size : Int, growCount : Int }
+    , recursionCheck : Dict String { fingerprint : Int, depth : Int, count : Int, size : Int, growCount : Int, argSizes : List Int, argFingerprints : List Int }
     }
 
 

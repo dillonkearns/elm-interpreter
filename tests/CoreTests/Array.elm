@@ -58,6 +58,10 @@ initTests =
             "Array.toList (Array.initialize -2 identity)"
             (list Int)
             (Array.toList (Array.initialize -2 identity))
+        , evalTest "initialize large (10000 elements)"
+            "Array.length (Array.initialize 10000 identity)"
+            Int
+            (Array.length (Array.initialize 10000 identity))
         ]
 
 
