@@ -1,4 +1,4 @@
-module Kernel.List exposing (sortBy, sortWith)
+module Kernel.List exposing (range, sortBy, sortWith)
 
 {-| Native kernel implementations for List sorting.
 
@@ -10,7 +10,24 @@ insertion sort that correctly preserves the relative order of equal elements.
 
 import EvalResult
 import Kernel.Utils
-import Types exposing (Eval, Value)
+import Types exposing (Eval, Value(..))
+
+
+{-| Direct implementation of List.range. Produces the list without going
+through the interpreter's trampoline, avoiding O(N) Env allocations.
+-}
+range : Int -> Int -> List Value
+range lo hi =
+    rangeHelp lo hi []
+
+
+rangeHelp : Int -> Int -> List Value -> List Value
+rangeHelp lo hi acc =
+    if lo <= hi then
+        rangeHelp lo (hi - 1) (Int hi :: acc)
+
+    else
+        acc
 
 
 {-| Stable sortBy: wraps the toComparable function into a comparison

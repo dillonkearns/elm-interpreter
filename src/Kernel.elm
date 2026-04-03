@@ -139,6 +139,7 @@ functions evalFunction =
     , ( [ "Elm", "Kernel", "List" ]
       , [ ( "cons", two anything anyList to anyList (::) Core.List.cons )
         , ( "fromArray", one (jsArray anything) to anyList Array.toList Core.Array.toList )
+        , ( "range", two int int to anyList Kernel.List.range Core.List.range )
         , ( "sortBy", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.sortBy Core.List.sortBy )
         , ( "sortWith", twoWithError (function2 evalFunction anything anything to order) anyList to anyList Kernel.List.sortWith Core.List.sortWith )
         , ( "toArray", one anyList to (jsArray anything) Array.fromList Core.Array.fromList )

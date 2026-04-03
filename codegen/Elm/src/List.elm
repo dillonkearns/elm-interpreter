@@ -83,7 +83,7 @@ You give the lowest and highest number that should be in the list.
 -}
 range : Int -> Int -> List Int
 range lo hi =
-  rangeHelp lo hi []
+  Elm.Kernel.List.range lo hi
 
 
 rangeHelp : Int -> Int -> List Int -> List Int
