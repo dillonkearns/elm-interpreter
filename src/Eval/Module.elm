@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, parseProjectSources, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, extendWithFiles, fileModuleName, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Core
 import Dict as ElmDict
@@ -215,6 +215,77 @@ buildProjectEnvFromParsed parsedModules =
                 ProjectEnv
                     { env = env
                     , allInterfaces = allInterfaces
+                    }
+            )
+
+
+{-| Replace a single module's declarations in an existing ProjectEnv.
+
+This is the incremental env building primitive: given a base env built from all
+modules, and a new version of one module, produce an updated env with only that
+module's declarations replaced. All other modules remain untouched.
+
+The key insight: `buildModuleEnv` adds declarations to `env.functions` keyed by
+module name. Replacing a module means:
+
+1.  Remove all function entries under the old module's key from env.functions
+2.  Remove the old module's import table from env.moduleImports
+3.  Re-run buildModuleEnv for the new module only
+4.  Update allInterfaces with the new module's interface
+
+This is O(1 module) instead of O(all modules), making it ideal for mutation
+testing where only one module changes per mutation.
+
+-}
+replaceModuleInEnv :
+    ProjectEnv
+    ->
+        { file : File
+        , moduleName : ModuleName
+        , interface : List Exposed
+        }
+    -> Result Error ProjectEnv
+replaceModuleInEnv (ProjectEnv projectEnv) newModule =
+    let
+        modKey : String
+        modKey =
+            Environment.moduleKey newModule.moduleName
+
+        -- Remove the old module's functions from the env
+        cleanedFunctions : Dict.Dict String (Dict.Dict String Elm.Syntax.Expression.FunctionImplementation)
+        cleanedFunctions =
+            Dict.remove modKey projectEnv.env.functions
+
+        -- Remove the old module's import table
+        cleanedModuleImports : Dict.Dict String Types.ImportedNames
+        cleanedModuleImports =
+            Dict.remove modKey projectEnv.env.moduleImports
+
+        cleanedEnv : Env
+        cleanedEnv =
+            { currentModule = projectEnv.env.currentModule
+            , currentModuleKey = projectEnv.env.currentModuleKey
+            , callStack = projectEnv.env.callStack
+            , functions = cleanedFunctions
+            , currentModuleFunctions = projectEnv.env.currentModuleFunctions
+            , values = projectEnv.env.values
+            , imports = projectEnv.env.imports
+            , moduleImports = cleanedModuleImports
+            , callDepth = projectEnv.env.callDepth
+            , recursionCheck = projectEnv.env.recursionCheck
+            }
+
+        -- Update the interfaces with the new module's interface
+        updatedInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        updatedInterfaces =
+            ElmDict.insert newModule.moduleName newModule.interface projectEnv.allInterfaces
+    in
+    buildModuleEnv updatedInterfaces newModule cleanedEnv
+        |> Result.map
+            (\env ->
+                ProjectEnv
+                    { env = env
+                    , allInterfaces = updatedInterfaces
                     }
             )
 
@@ -440,6 +511,49 @@ mutation testing, or incremental compilation where files are parsed once and reu
 evalWithEnvFromFiles : ProjectEnv -> List File -> Expression -> Result Error Value
 evalWithEnvFromFiles projectEnv additionalFiles expression =
     evalWithEnvFromFilesAndLimit Nothing projectEnv additionalFiles expression
+
+
+{-| Extend a ProjectEnv with additional pre-parsed Files, without evaluating
+any expression. Useful for building a "base user env" from pkgEnv + all user
+modules, which can then be incrementally updated via `replaceModuleInEnv`.
+-}
+extendWithFiles : ProjectEnv -> List File -> Result Error ProjectEnv
+extendWithFiles (ProjectEnv projectEnv) additionalFiles =
+    let
+        parsedModules =
+            additionalFiles
+                |> List.map
+                    (\file ->
+                        { file = file
+                        , moduleName = fileModuleName file
+                        , interface = buildInterfaceFromFile file
+                        }
+                    )
+
+        additionalInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces =
+            ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+        envResult =
+            parsedModules
+                |> Result.MyExtra.combineFoldl
+                    (\parsedModule envAcc ->
+                        buildModuleEnv allInterfaces parsedModule envAcc
+                    )
+                    (Ok projectEnv.env)
+    in
+    envResult
+        |> Result.map
+            (\env ->
+                ProjectEnv
+                    { env = env
+                    , allInterfaces = allInterfaces
+                    }
+            )
 
 
 {-| Like `evalWithEnv`, but returns trace information (call tree + log lines)
