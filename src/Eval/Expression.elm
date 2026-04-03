@@ -1,5 +1,6 @@
 module Eval.Expression exposing (evalExpression, evalFunction)
 
+import Array
 import Core
 import Elm.Syntax.Expression as Expression exposing (Expression(..), LetDeclaration)
 import Elm.Syntax.Infix
@@ -22,6 +23,100 @@ import Syntax exposing (fakeNode)
 import TopologicalSort
 import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalResult(..), Implementation(..), PartialEval, PartialResult, Value(..))
 import Value exposing (nameError, typeError, unsupported)
+
+
+{-| Cheap fingerprint of bound values — uses only top-level structure (type tag,
+length, first element) so it's O(number of bindings) with O(1) per value.
+-}
+fingerprintValues : EnvValues -> Int
+fingerprintValues values =
+    Dict.foldl (\_ v acc -> acc * 31 + fingerprintValue v) 5381 values
+
+
+fingerprintValue : Value -> Int
+fingerprintValue value =
+    case value of
+        Int i ->
+            i * 37 + 1
+
+        Float f ->
+            round (f * 1000) + 2
+
+        String s ->
+            String.length s * 41 + 3
+
+        Char c ->
+            Char.toCode c * 43 + 4
+
+        Bool True ->
+            5
+
+        Bool False ->
+            6
+
+        Unit ->
+            7
+
+        List items ->
+            List.length items * 53 + 8
+
+        Tuple a _ ->
+            fingerprintValue a * 59 + 9
+
+        Triple a _ _ ->
+            fingerprintValue a * 61 + 10
+
+        Custom ref args ->
+            List.length args * 67 + 11
+
+        Record dict ->
+            Dict.size dict * 71 + 12
+
+        JsArray arr ->
+            Array.length arr * 73 + 13
+
+        _ ->
+            0
+
+
+{-| Combined check + update for cycle detection. Returns either:
+- CycleDetected: infinite loop found, bail out
+- Continue updatedCheck: no cycle, proceed with updated check state
+Computes fingerprint and does Dict lookup only ONCE.
+-}
+type CycleResult
+    = CycleDetected
+    | Continue (Dict String { fingerprint : Int, depth : Int, count : Int })
+
+
+checkAndUpdateCycle : QualifiedNameRef -> Env -> CycleResult
+checkAndUpdateCycle qualifiedName env =
+    let
+        fnKey =
+            Syntax.qualifiedNameToString qualifiedName
+
+        fp =
+            fingerprintValues env.values
+    in
+    case Dict.get fnKey env.recursionCheck of
+        Nothing ->
+            Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1 } env.recursionCheck)
+
+        Just entry ->
+            if entry.depth >= env.callDepth then
+                -- Not recursive (function returned and was called again)
+                Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1 } env.recursionCheck)
+
+            else if entry.fingerprint /= fp then
+                -- Recursive but args changed
+                Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1 } env.recursionCheck)
+
+            else if entry.count < 3 then
+                -- Same fingerprint, warming up
+                Continue (Dict.insert fnKey { entry | count = entry.count + 1 } env.recursionCheck)
+
+            else
+                CycleDetected
 
 
 evalExpression : Node Expression -> Eval Value
@@ -1146,12 +1241,30 @@ call maybeQualifiedName implementation cfg env =
 
                             else
                                 Environment.callNoStack
+
+                        newEnv =
+                            callFn qualifiedName.moduleName qualifiedName.name env
                     in
-                    Recursion.recurse
-                        ( expr
-                        , cfg
-                        , callFn qualifiedName.moduleName qualifiedName.name env
-                        )
+                    if env.callDepth < 100 then
+                        -- Fast path: shallow call depth, no cycle check needed
+                        Recursion.recurse ( expr, cfg, newEnv )
+
+                    else
+                        case checkAndUpdateCycle qualifiedName env of
+                            CycleDetected ->
+                                Types.failPartial <|
+                                    typeError env
+                                        ("Infinite recursion detected: "
+                                            ++ Syntax.qualifiedNameToString qualifiedName
+                                            ++ " called with identical arguments"
+                                        )
+
+                            Continue updatedCheck ->
+                                Recursion.recurse
+                                    ( expr
+                                    , cfg
+                                    , { newEnv | recursionCheck = updatedCheck }
+                                    )
 
                 Nothing ->
                     Recursion.recurse ( expr, cfg, env )
@@ -1487,6 +1600,8 @@ evalNonVariant moduleName name cfg env =
                                             Dict.get resolvedModuleKey env.moduleImports
                                                 |> Maybe.withDefault env.imports
                                         , moduleImports = env.moduleImports
+                                        , callDepth = env.callDepth + 1
+                                        , recursionCheck = env.recursionCheck
                                         }
                                 in
                                 if List.isEmpty function.arguments then

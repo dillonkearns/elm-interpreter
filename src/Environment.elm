@@ -33,6 +33,8 @@ addValue name value env =
     , values = Dict.insert name value env.values
     , imports = env.imports
     , moduleImports = env.moduleImports
+    , callDepth = env.callDepth
+    , recursionCheck = env.recursionCheck
     }
 
 
@@ -48,6 +50,8 @@ replaceValues newValues env =
     , values = newValues
     , imports = env.imports
     , moduleImports = env.moduleImports
+    , callDepth = env.callDepth
+    , recursionCheck = env.recursionCheck
     }
 
 
@@ -100,6 +104,8 @@ with newValues old =
     , values = Dict.union newValues old.values
     , imports = old.imports
     , moduleImports = old.moduleImports
+    , callDepth = old.callDepth
+    , recursionCheck = old.recursionCheck
     }
 
 
@@ -116,6 +122,8 @@ withBindings bindings old =
     , values = List.foldl (\( k, v ) acc -> Dict.insert k v acc) old.values bindings
     , imports = old.imports
     , moduleImports = old.moduleImports
+    , callDepth = old.callDepth
+    , recursionCheck = old.recursionCheck
     }
 
 
@@ -129,6 +137,8 @@ empty moduleName =
     , values = Dict.empty
     , imports = emptyImports
     , moduleImports = Dict.empty
+    , callDepth = 0
+    , recursionCheck = Dict.empty
     }
 
 
@@ -163,6 +173,8 @@ callKernel moduleName name env =
     , values = env.values
     , imports = env.imports
     , moduleImports = env.moduleImports
+    , callDepth = env.callDepth + 1
+    , recursionCheck = env.recursionCheck
     }
 
 
@@ -184,6 +196,8 @@ call moduleName name env =
         , values = env.values
         , imports = env.imports
         , moduleImports = env.moduleImports
+        , callDepth = env.callDepth + 1
+        , recursionCheck = env.recursionCheck
         }
 
     else
@@ -201,6 +215,8 @@ call moduleName name env =
             Dict.get key env.moduleImports
                 |> Maybe.withDefault env.imports
         , moduleImports = env.moduleImports
+        , callDepth = env.callDepth + 1
+        , recursionCheck = env.recursionCheck
         }
 
 
@@ -223,6 +239,8 @@ callKernelNoStack moduleName _ env =
     , values = env.values
     , imports = env.imports
     , moduleImports = env.moduleImports
+    , callDepth = env.callDepth
+    , recursionCheck = env.recursionCheck
     }
 
 
@@ -251,4 +269,6 @@ callNoStack moduleName _ env =
             Dict.get key env.moduleImports
                 |> Maybe.withDefault env.imports
         , moduleImports = env.moduleImports
+        , callDepth = env.callDepth
+        , recursionCheck = env.recursionCheck
         }

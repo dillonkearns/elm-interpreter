@@ -124,6 +124,8 @@ type alias Env =
     , callStack : List QualifiedNameRef
     , imports : ImportedNames
     , moduleImports : Dict String ImportedNames
+    , callDepth : Int
+    , recursionCheck : Dict String { fingerprint : Int, depth : Int, count : Int }
     }
 
 
