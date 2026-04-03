@@ -77,7 +77,7 @@ encodeHelper encoder acc =
                     writeInt16 (isLE endianness) n acc
 
                 "I32" ->
-                    writeInt32 (isLE endianness) (signedToUnsigned 32 n) acc
+                    writeInt32 (isLE endianness) n acc
 
                 "U32" ->
                     writeInt32 (isLE endianness) n acc
@@ -191,21 +191,194 @@ writeInt32 le n acc =
 
 
 writeFloat32 : Bool -> Float -> List Int -> List Int
-writeFloat32 le _ acc =
-    -- TODO: proper IEEE 754 float32 encoding
-    -- For now, write 4 zero bytes as placeholder
-    if le then
-        0 :: 0 :: 0 :: 0 :: acc
+writeFloat32 le f acc =
+    let
+        -- Encode as float64 first, then truncate precision
+        -- Float32: 1 sign, 8 exponent (bias 127), 23 mantissa
+        bs =
+            float64ToBytes f
 
-    else
-        0 :: 0 :: 0 :: 0 :: acc
+        -- Convert float64 to float32 bytes
+        -- This is lossy but correct for round-tripping
+        f32Bytes =
+            float64BytesToFloat32Bytes bs
+    in
+    writeByteList le f32Bytes acc
 
 
 writeFloat64 : Bool -> Float -> List Int -> List Int
-writeFloat64 le _ acc =
-    -- TODO: proper IEEE 754 float64 encoding
-    -- For now, write 8 zero bytes as placeholder
-    0 :: 0 :: 0 :: 0 :: 0 :: 0 :: 0 :: 0 :: acc
+writeFloat64 le f acc =
+    let
+        bs =
+            float64ToBytes f
+    in
+    writeByteList le bs acc
+
+
+writeByteList : Bool -> List Int -> List Int -> List Int
+writeByteList le bs acc =
+    if le then
+        -- LE: preserve order in reversed acc (final reversal makes it LE)
+        List.foldr (\b a -> b :: a) acc bs
+
+    else
+        -- BE: reverse into acc (final reversal restores BE order)
+        List.foldl (\b a -> b :: a) acc bs
+
+
+{-| Encode a Float as 8 bytes in IEEE 754 double precision (big-endian).
+-}
+float64ToBytes : Float -> List Int
+float64ToBytes f =
+    if isNaN f then
+        [ 0x7F, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+
+    else if isInfinite f then
+        if f > 0 then
+            [ 0x7F, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+
+        else
+            [ 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+
+    else if f == 0 then
+        if 1 / f < 0 then
+            -- negative zero
+            [ 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+
+        else
+            [ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+
+    else
+        let
+            sign =
+                if f < 0 then
+                    1
+
+                else
+                    0
+
+            absF =
+                abs f
+
+            -- Find exponent: 2^exp <= absF < 2^(exp+1)
+            exp =
+                floor (logBase 2 absF)
+
+            -- Bias the exponent (IEEE 754 double: bias = 1023)
+            biasedExp =
+                exp + 1023
+
+            -- Mantissa: absF / 2^exp - 1.0 (remove implicit leading 1)
+            mantissa =
+                absF / (2 ^ toFloat exp) - 1.0
+
+            -- Scale mantissa to 52-bit integer
+            -- Split into high 20 bits and low 32 bits
+            mantissaScaled =
+                mantissa * 4503599627370496
+
+            -- 2^52
+            mantissaInt =
+                round mantissaScaled
+
+            mantissaHigh =
+                mantissaInt // 4294967296
+
+            -- div by 2^32
+            mantissaLow =
+                modBy 4294967296 mantissaInt
+
+            -- Byte 0: sign(1) + exp(7 high bits)
+            b0 =
+                Bitwise.or (Bitwise.shiftLeftBy 7 sign) (Bitwise.shiftRightBy 4 biasedExp)
+
+            -- Byte 1: exp(4 low bits) + mantissa(4 high bits)
+            b1 =
+                Bitwise.or
+                    (Bitwise.shiftLeftBy 4 (Bitwise.and biasedExp 0x0F))
+                    (Bitwise.and (Bitwise.shiftRightBy 16 mantissaHigh) 0x0F)
+
+            b2 =
+                Bitwise.and (Bitwise.shiftRightBy 8 mantissaHigh) 0xFF
+
+            b3 =
+                Bitwise.and mantissaHigh 0xFF
+
+            b4 =
+                Bitwise.and (Bitwise.shiftRightBy 24 mantissaLow) 0xFF
+
+            b5 =
+                Bitwise.and (Bitwise.shiftRightBy 16 mantissaLow) 0xFF
+
+            b6 =
+                Bitwise.and (Bitwise.shiftRightBy 8 mantissaLow) 0xFF
+
+            b7 =
+                Bitwise.and mantissaLow 0xFF
+        in
+        [ Bitwise.and b0 0xFF, Bitwise.and b1 0xFF, b2, b3, b4, b5, b6, b7 ]
+
+
+{-| Convert float64 bytes (8) to float32 bytes (4).
+-}
+float64BytesToFloat32Bytes : List Int -> List Int
+float64BytesToFloat32Bytes f64 =
+    case f64 of
+        [ b0, b1, b2, b3, _, _, _, _ ] ->
+            let
+                -- Extract float64 components
+                sign =
+                    Bitwise.shiftRightBy 7 b0
+
+                exp64 =
+                    Bitwise.or
+                        (Bitwise.shiftLeftBy 4 (Bitwise.and b0 0x7F))
+                        (Bitwise.shiftRightBy 4 b1)
+
+                -- Float32: bias 127, float64: bias 1023. Adjust: exp32 = exp64 - 1023 + 127
+                exp32 =
+                    exp64 - 896
+
+                -- Take top 23 bits of mantissa from float64's 52 bits
+                -- Float64 mantissa starts at bit 4 of b1
+                mantissaHigh =
+                    Bitwise.and b1 0x0F
+
+                fb0 =
+                    Bitwise.or (Bitwise.shiftLeftBy 7 sign)
+                        (Bitwise.and (Bitwise.shiftRightBy 1 exp32) 0x7F)
+
+                fb1 =
+                    Bitwise.or (Bitwise.shiftLeftBy 7 (Bitwise.and exp32 0x01))
+                        (Bitwise.or (Bitwise.shiftLeftBy 3 mantissaHigh) (Bitwise.shiftRightBy 5 b2))
+
+                fb2 =
+                    Bitwise.or (Bitwise.shiftLeftBy 3 (Bitwise.and b2 0x1F)) (Bitwise.shiftRightBy 5 b3)
+
+                fb3 =
+                    Bitwise.or (Bitwise.shiftLeftBy 3 (Bitwise.and b3 0x1F)) 0
+            in
+            if exp64 == 0 then
+                -- Zero or denormalized
+                [ Bitwise.shiftLeftBy 7 sign, 0, 0, 0 ]
+
+            else if exp64 == 0x07FF then
+                -- Inf or NaN
+                [ Bitwise.or (Bitwise.shiftLeftBy 7 sign) 0x7F, 0x80, 0, 0 ]
+
+            else if exp32 <= 0 then
+                -- Underflow to zero
+                [ Bitwise.shiftLeftBy 7 sign, 0, 0, 0 ]
+
+            else if exp32 >= 0xFF then
+                -- Overflow to infinity
+                [ Bitwise.or (Bitwise.shiftLeftBy 7 sign) 0x7F, 0x80, 0, 0 ]
+
+            else
+                [ Bitwise.and fb0 0xFF, Bitwise.and fb1 0xFF, Bitwise.and fb2 0xFF, Bitwise.and fb3 0xFF ]
+
+        _ ->
+            [ 0, 0, 0, 0 ]
 
 
 encodeUtf8 : String -> List Int -> List Int
@@ -444,28 +617,169 @@ readI32 le arr offset =
     readU32 le arr offset
 
 
-{-| Read a 32-bit float (stub - returns 0.0).
+{-| Read a 32-bit float.
 -}
 readF32 : Bool -> Array Int -> Int -> Value
-readF32 _ arr offset =
+readF32 le arr offset =
     if offset + 4 <= Array.length arr then
-        -- TODO: proper IEEE 754 decoding
-        Tuple (Int (offset + 4)) (Float 0.0)
+        let
+            bs =
+                readBytesOrdered le arr offset 4
+
+            f =
+                bytesToFloat32 bs
+        in
+        Tuple (Int (offset + 4)) (Float f)
 
     else
         Tuple (Int -1) Unit
 
 
-{-| Read a 64-bit float (stub - returns 0.0).
+{-| Read a 64-bit float.
 -}
 readF64 : Bool -> Array Int -> Int -> Value
-readF64 _ arr offset =
+readF64 le arr offset =
     if offset + 8 <= Array.length arr then
-        -- TODO: proper IEEE 754 decoding
-        Tuple (Int (offset + 8)) (Float 0.0)
+        let
+            bs =
+                readBytesOrdered le arr offset 8
+
+            f =
+                bytesToFloat64 bs
+        in
+        Tuple (Int (offset + 8)) (Float f)
 
     else
         Tuple (Int -1) Unit
+
+
+{-| Read n bytes from array, reordering for endianness.
+Returns bytes in big-endian order regardless of input endianness.
+-}
+readBytesOrdered : Bool -> Array Int -> Int -> Int -> List Int
+readBytesOrdered le arr offset n =
+    let
+        bs =
+            List.range offset (offset + n - 1)
+                |> List.filterMap (\i -> Array.get i arr)
+    in
+    if le then
+        List.reverse bs
+
+    else
+        bs
+
+
+{-| Decode 8 big-endian bytes into an IEEE 754 double.
+-}
+bytesToFloat64 : List Int -> Float
+bytesToFloat64 bs =
+    case bs of
+        [ b0, b1, b2, b3, b4, b5, b6, b7 ] ->
+            let
+                sign =
+                    Bitwise.shiftRightBy 7 b0
+
+                exp =
+                    Bitwise.or
+                        (Bitwise.shiftLeftBy 4 (Bitwise.and b0 0x7F))
+                        (Bitwise.shiftRightBy 4 b1)
+
+                -- Reconstruct mantissa from bytes
+                mantissaHigh =
+                    Bitwise.or
+                        (Bitwise.shiftLeftBy 16 (Bitwise.and b1 0x0F))
+                        (Bitwise.or (Bitwise.shiftLeftBy 8 b2) b3)
+
+                mantissaLow =
+                    Bitwise.or
+                        (Bitwise.shiftLeftBy 24 b4)
+                        (Bitwise.or (Bitwise.shiftLeftBy 16 b5)
+                            (Bitwise.or (Bitwise.shiftLeftBy 8 b6) b7)
+                        )
+
+                mantissaFloat =
+                    toFloat mantissaHigh * 4294967296 + toFloat (Bitwise.and mantissaLow 0x7FFFFFFF) + (if Bitwise.and mantissaLow 0x80000000 /= 0 then 2147483648 else 0)
+
+                signMul =
+                    if sign == 1 then
+                        -1.0
+
+                    else
+                        1.0
+            in
+            if exp == 0 && mantissaHigh == 0 && mantissaLow == 0 then
+                signMul * 0.0
+
+            else if exp == 0x07FF then
+                if mantissaHigh == 0 && mantissaLow == 0 then
+                    signMul * (1 / 0)
+
+                else
+                    0 / 0
+
+            else if exp == 0 then
+                -- Denormalized
+                signMul * (mantissaFloat / 4503599627370496) * (2 ^ -1022)
+
+            else
+                -- Normalized: (-1)^sign * 2^(exp-1023) * (1 + mantissa/2^52)
+                signMul * (2 ^ toFloat (exp - 1023)) * (1.0 + mantissaFloat / 4503599627370496)
+
+        _ ->
+            0.0
+
+
+{-| Decode 4 big-endian bytes into an IEEE 754 single-precision float.
+-}
+bytesToFloat32 : List Int -> Float
+bytesToFloat32 bs =
+    case bs of
+        [ b0, b1, b2, b3 ] ->
+            let
+                sign =
+                    Bitwise.shiftRightBy 7 b0
+
+                exp =
+                    Bitwise.or
+                        (Bitwise.shiftLeftBy 1 (Bitwise.and b0 0x7F))
+                        (Bitwise.shiftRightBy 7 b1)
+
+                mantissa =
+                    Bitwise.or
+                        (Bitwise.shiftLeftBy 16 (Bitwise.and b1 0x7F))
+                        (Bitwise.or (Bitwise.shiftLeftBy 8 b2) b3)
+
+                mantissaFloat =
+                    toFloat mantissa
+
+                signMul =
+                    if sign == 1 then
+                        -1.0
+
+                    else
+                        1.0
+            in
+            if exp == 0 && mantissa == 0 then
+                signMul * 0.0
+
+            else if exp == 0xFF then
+                if mantissa == 0 then
+                    signMul * (1 / 0)
+
+                else
+                    0 / 0
+
+            else if exp == 0 then
+                -- Denormalized
+                signMul * (mantissaFloat / 8388608) * (2 ^ -126)
+
+            else
+                -- Normalized: (-1)^sign * 2^(exp-127) * (1 + mantissa/2^23)
+                signMul * (2 ^ toFloat (exp - 127)) * (1.0 + mantissaFloat / 8388608)
+
+        _ ->
+            0.0
 
 
 {-| Read a chunk of bytes.
