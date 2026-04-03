@@ -77,22 +77,21 @@ dictSetEqualityTests =
 
 listTests : Test
 listTests =
-    Test.skip <|
-        describe "List equality"
-            [ Test.fuzz2
-                (Fuzz.intRange 100 10000)
-                (Fuzz.intRange 100 10000)
-                "Simple comparison"
-              <|
-                \size1 size2 ->
-                    evalExpect
-                        (withInt "size1" size1 <|
-                            withInt "size2" size2 <|
-                                "List.range 0 size1 == List.range 0 size2"
-                        )
-                        Bool
-                        (List.range 0 size1 == List.range 0 size2)
-            ]
+    describe "List equality"
+        [ Test.fuzz2
+            (Fuzz.intRange 100 2000)
+            (Fuzz.intRange 100 2000)
+            "Simple comparison"
+          <|
+            \size1 size2 ->
+                evalExpect
+                    (withInt "size1" size1 <|
+                        withInt "size2" size2 <|
+                            "List.range 0 size1 == List.range 0 size2"
+                    )
+                    Bool
+                    (List.range 0 size1 == List.range 0 size2)
+        ]
 
 
 diffTests : Test

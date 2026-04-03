@@ -29,7 +29,7 @@ SEED=42 COUNT=20 bash run.sh
 `codegen/` has two subdirectories under `Elm/` that look similar but serve different purposes:
 
 - `codegen/Elm/Kernel/*.elm` — hand-written kernel function AST fallbacks (e.g. sort, string ops). The Makefile copies ONLY this `Kernel/` directory into the build.
-- `codegen/Elm/src/*.elm` — committed copies of elm/core source files that `Generate.elm` reads to produce `generated/Core/*.elm`.
+- `codegen/Elm/src/*.elm` — source overrides for library files. The Makefile copies these into `build/src/` (replacing the downloaded originals) before codegen runs. Used when the original source can't be processed (e.g. `effect module` Task.elm) or needs fixes (e.g. qualified constructor refs in Bytes). `Generate.elm` reads from `build/src/`, not directly from this directory.
 
 These are both checked in. Do not confuse them with the downloaded library sources in `build/` (which are gitignored).
 
