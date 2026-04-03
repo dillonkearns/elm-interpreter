@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, parseProjectSources, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (ProjectEnv, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, parseProjectSources, trace, traceOrEvalModule, traceWithEnv)
 
 import Core
 import Dict as ElmDict
@@ -347,19 +347,13 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                     Result.mapError Types.EvalError result
 
 
-{-| Like `evalWithEnv`, but accepts pre-parsed `File` ASTs instead of source strings.
-Skips the parse step entirely — useful when you already have the AST (e.g. build tools,
-mutation testing, or incremental compilation where files are parsed once and reused).
+{-| Like `evalWithEnvFromFiles`, but with an optional step limit.
+Pass `Just n` to limit evaluation to `n` trampoline steps (prevents infinite
+loops from consuming unbounded memory). Pass `Nothing` for unlimited.
 -}
-evalWithEnvFromFiles : ProjectEnv -> List File -> Expression -> Result Error Value
-evalWithEnvFromFiles (ProjectEnv projectEnv) additionalFiles expression =
+evalWithEnvFromFilesAndLimit : Maybe Int -> ProjectEnv -> List File -> Expression -> Result Error Value
+evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles expression =
     let
-        parsedModules :
-            List
-                { file : File
-                , moduleName : ModuleName
-                , interface : List Exposed
-                }
         parsedModules =
             additionalFiles
                 |> List.map
@@ -370,17 +364,14 @@ evalWithEnvFromFiles (ProjectEnv projectEnv) additionalFiles expression =
                         }
                     )
 
-        additionalInterfaces : ElmDict.Dict ModuleName (List Exposed)
         additionalInterfaces =
             parsedModules
                 |> List.map (\m -> ( m.moduleName, m.interface ))
                 |> ElmDict.fromList
 
-        allInterfaces : ElmDict.Dict ModuleName (List Exposed)
         allInterfaces =
             ElmDict.union additionalInterfaces projectEnv.allInterfaces
 
-        envResult : Result Error Env
         envResult =
             parsedModules
                 |> Result.MyExtra.combineFoldl
@@ -395,7 +386,6 @@ evalWithEnvFromFiles (ProjectEnv projectEnv) additionalFiles expression =
 
         Ok env ->
             let
-                lastModule : ModuleName
                 lastModule =
                     parsedModules
                         |> List.reverse
@@ -403,14 +393,12 @@ evalWithEnvFromFiles (ProjectEnv projectEnv) additionalFiles expression =
                         |> Maybe.map .moduleName
                         |> Maybe.withDefault [ "Main" ]
 
-                lastFile : Maybe File
                 lastFile =
                     parsedModules
                         |> List.reverse
                         |> List.head
                         |> Maybe.map .file
 
-                finalImports : ImportedNames
                 finalImports =
                     case lastFile of
                         Just file ->
@@ -420,11 +408,9 @@ evalWithEnvFromFiles (ProjectEnv projectEnv) additionalFiles expression =
                         Nothing ->
                             emptyImports
 
-                lastModuleKey : String
                 lastModuleKey =
                     Environment.moduleKey lastModule
 
-                finalEnv : Env
                 finalEnv =
                     { env
                         | currentModule = lastModule
@@ -435,15 +421,23 @@ evalWithEnvFromFiles (ProjectEnv projectEnv) additionalFiles expression =
                         , imports = finalImports
                     }
 
-                result : Result Types.EvalErrorData Value
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = Nothing }
+                        { trace = False, maxSteps = maxSteps }
                         finalEnv
                         |> EvalResult.toResult
             in
             Result.mapError Types.EvalError result
+
+
+{-| Like `evalWithEnv`, but accepts pre-parsed `File` ASTs instead of source strings.
+Skips the parse step entirely — useful when you already have the AST (e.g. build tools,
+mutation testing, or incremental compilation where files are parsed once and reused).
+-}
+evalWithEnvFromFiles : ProjectEnv -> List File -> Expression -> Result Error Value
+evalWithEnvFromFiles projectEnv additionalFiles expression =
+    evalWithEnvFromFilesAndLimit Nothing projectEnv additionalFiles expression
 
 
 {-| Like `evalWithEnv`, but returns trace information (call tree + log lines)
