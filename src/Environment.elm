@@ -254,7 +254,7 @@ callNoStack moduleName _ env =
             moduleKey moduleName
     in
     if key == env.currentModuleKey then
-        env
+        { env | callDepth = env.callDepth + 1 }
 
     else
         { currentModule = moduleName
@@ -269,6 +269,6 @@ callNoStack moduleName _ env =
             Dict.get key env.moduleImports
                 |> Maybe.withDefault env.imports
         , moduleImports = env.moduleImports
-        , callDepth = env.callDepth
+        , callDepth = env.callDepth + 1
         , recursionCheck = env.recursionCheck
         }

@@ -41,6 +41,7 @@ suite =
         , debugToStringTests
         , parserEdgeCaseTests
         , stepLimitTests
+        , accumulatorLoopDetectionTests
         , taskTests
         , bytesTests
         ]
@@ -799,6 +800,106 @@ main = let loop n = if n <= 0 then 0 else loop (n - 1) in loop 10"""
                     Err e ->
                         Expect.fail (Debug.toString e)
         ]
+
+
+{-| Tests for cycle detection — identical-argument loops that are provably
+non-terminating in pure Elm. These use no step limit: if the test hangs,
+the detection is broken.
+-}
+accumulatorLoopDetectionTests : Test
+accumulatorLoopDetectionTests =
+    describe "cycle detection (identical args)"
+        [ test "direct recursion with identical args (let binding)" <|
+            \_ ->
+                -- f(x) calls f(x) — provably infinite in pure Elm.
+                Eval.evalWithMaxSteps Nothing
+                    """let loop x = loop x
+in loop 42"""
+                    |> expectInfiniteRecursionError
+        , test "direct recursion with identical args (module-level)" <|
+            \_ ->
+                let
+                    source =
+                        """module Temp exposing (main)
+loop x = loop x
+main = loop 42"""
+
+                    projectEnv =
+                        Eval.Module.buildProjectEnv []
+                in
+                case projectEnv of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit Nothing
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> expectInfiniteRecursionError
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "mutual recursion with identical args" <|
+            \_ ->
+                let
+                    source =
+                        """module Temp exposing (main)
+ping n = pong n
+pong n = ping n
+main = ping 0"""
+
+                    projectEnv =
+                        Eval.Module.buildProjectEnv []
+                in
+                case projectEnv of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit Nothing
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> expectInfiniteRecursionError
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "legitimate deep recursion must NOT be flagged" <|
+            \_ ->
+                Eval.evalWithMaxSteps Nothing
+                    """let
+    mySum acc xs =
+        case xs of
+            [] -> acc
+            x :: rest -> mySum (acc + x) rest
+in
+mySum 0 [1, 2, 3, 4, 5]"""
+                    |> Expect.equal (Ok (Types.Int 15))
+        ]
+
+
+{-| Assert that evaluation returns an "Infinite recursion" error,
+NOT a "Step limit exceeded" error. This proves cycle detection caught the
+loop, not the step limit fallback.
+-}
+expectInfiniteRecursionError : Result Types.Error value -> Expect.Expectation
+expectInfiniteRecursionError result =
+    case result of
+        Err (Types.EvalError { error }) ->
+            case error of
+                Types.TypeError msg ->
+                    if String.contains "Infinite recursion" msg then
+                        Expect.pass
+
+                    else
+                        Expect.fail ("Expected 'Infinite recursion' TypeError, got: " ++ msg)
+
+                Types.Unsupported msg ->
+                    Expect.fail ("Loop was caught by step limit, not cycle detection: " ++ msg)
+
+                other ->
+                    Expect.fail ("Unexpected error kind: " ++ Debug.toString other)
+
+        Err (Types.ParsingError _) ->
+            Expect.fail "Unexpected parse error"
+
+        Ok _ ->
+            Expect.fail "Expected an error but got Ok"
 
 
 taskTests : Test
