@@ -27,6 +27,7 @@ suite =
         , tupleConstructorPatternTests
         , storedLambdaExtractionTests
         , complexExtractionTests
+        , ruleVisitorPatternTests
         ]
 
 
@@ -476,6 +477,365 @@ main =
             ]
             (list String)
             [ "visited: Rule1/MyProject/Page.elm" ]
+        ]
+
+
+
+-- Models the exact Review.Rule pattern: two types in same module,
+-- ModuleVisitor wraps record with field returning ProjectVisitor,
+-- runVisitor expects ModuleVisitor via constructor pattern,
+-- raise/createVisitor cycle.
+
+
+ruleVisitorPatternTests : Test
+ruleVisitorPatternTests =
+    describe "Review.Rule visitor pattern (two types, raise cycle, runVisitor)"
+        [ evalProjectTest "exact elm-review pattern: record alias ops, runVisitor, raise cycle, mutatingMap"
+            -- Models Review.Rule exactly: ModuleVisitorOps is a type alias,
+            -- ModuleVisitor wraps it, runVisitor takes (ops -> Maybe ...) accessor,
+            -- raise creates recursive ModuleVisitor, mutatingMap chains visitors.
+            [ """module Rule exposing (main)
+
+type ProjectVisitor = ProjectVisitor { getErrors : () -> List String }
+
+type alias ModuleVisitorOps =
+    { expressionVisitor : Maybe (String -> ModuleVisitor)
+    , toProjectVisitor : () -> ProjectVisitor
+    }
+
+type ModuleVisitor = ModuleVisitor ModuleVisitorOps
+
+createModuleVisitor : (List String -> ProjectVisitor) -> List String -> ModuleVisitor
+createModuleVisitor toProject errors =
+    let
+        raise newErrors =
+            ModuleVisitor
+                { expressionVisitor = Just (\\expr -> raise (expr :: newErrors))
+                , toProjectVisitor = \\() -> toProject newErrors
+                }
+    in
+    raise errors
+
+runVisitor : (ModuleVisitorOps -> Maybe (a -> ModuleVisitor)) -> a -> ModuleVisitor -> ModuleVisitor
+runVisitor field a ((ModuleVisitor ops) as original) =
+    case field ops of
+        Just visitor ->
+            visitor a
+
+        Nothing ->
+            original
+
+main =
+    let
+        toProject errors =
+            ProjectVisitor { getErrors = \\() -> errors }
+
+        visitor = createModuleVisitor toProject []
+
+        visitors = [ visitor ]
+
+        updatedVisitors =
+            visitors
+                |> List.map (\\acc -> runVisitor .expressionVisitor "hello" acc)
+    in
+    case updatedVisitors of
+        (ModuleVisitor ops) :: _ ->
+            case ops.toProjectVisitor () of
+                ProjectVisitor pv ->
+                    pv.getErrors ()
+
+        [] ->
+            []
+"""
+            ]
+            (list String)
+            [ "hello" ]
+        , evalProjectTest "two custom types same module, raise pattern, List.map through runVisitor"
+            -- Closer to actual elm-review: separate createVisitor, runVisitor, mutatingMap chain
+            [ """module Rule exposing (main)
+
+type ProjectVisitor = ProjectVisitor { getErrors : () -> List String }
+
+type alias ModuleVisitorOps =
+    { expressionVisitor : Maybe (String -> ModuleVisitor)
+    , finalEval : Maybe (() -> ModuleVisitor)
+    , toProjectVisitor : () -> ProjectVisitor
+    }
+
+type ModuleVisitor = ModuleVisitor ModuleVisitorOps
+
+createVisitor : (List String -> ModuleVisitor) -> List String -> Maybe (a -> List String -> ( List String, context )) -> Maybe (a -> ModuleVisitor)
+createVisitor raise errors maybeVisitorFn =
+    case maybeVisitorFn of
+        Nothing -> Nothing
+        Just visitorFn ->
+            Just (\\a -> raise (Tuple.first (visitorFn a errors)))
+
+createModuleVisitor : Maybe (String -> List String -> ( List String, () )) -> (List String -> ProjectVisitor) -> ModuleVisitor
+createModuleVisitor exprVisitorSchema toProject =
+    let
+        raise : List String -> ModuleVisitor
+        raise errors =
+            ModuleVisitor
+                { expressionVisitor = createVisitor raise errors exprVisitorSchema
+                , finalEval = Nothing
+                , toProjectVisitor = \\() -> toProject errors
+                }
+    in
+    raise []
+
+runVisitor : (ModuleVisitorOps -> Maybe (a -> ModuleVisitor)) -> a -> ModuleVisitor -> ModuleVisitor
+runVisitor field a ((ModuleVisitor ops) as original) =
+    case field ops of
+        Just visitor -> visitor a
+        Nothing -> original
+
+main =
+    let
+        toProject errors =
+            ProjectVisitor { getErrors = \\() -> errors }
+
+        exprVisitor = Just (\\expr errors -> ( expr :: errors, () ))
+
+        visitors =
+            [ createModuleVisitor exprVisitor toProject ]
+
+        afterExpr =
+            visitors
+                |> List.map (\\acc -> runVisitor .expressionVisitor "found_expr" acc)
+
+        afterFinal =
+            afterExpr
+                |> List.map (\\acc -> runVisitor .finalEval () acc)
+    in
+    case afterFinal of
+        (ModuleVisitor ops) :: _ ->
+            case ops.toProjectVisitor () of
+                ProjectVisitor pv -> pv.getErrors ()
+
+        [] -> []
+"""
+            ]
+            (list String)
+            [ "found_expr" ]
+        , evalProjectTest "cross-module: types in one module, visitor logic in another"
+            [ """module Rule.Types exposing (ProjectVisitor(..), ModuleVisitor(..), ModuleVisitorOps)
+
+type ProjectVisitor = ProjectVisitor { getErrors : () -> List String }
+
+type alias ModuleVisitorOps =
+    { expressionVisitor : Maybe (String -> ModuleVisitor)
+    , toProjectVisitor : () -> ProjectVisitor
+    }
+
+type ModuleVisitor = ModuleVisitor ModuleVisitorOps
+"""
+            , """module Rule.Visitor exposing (createModuleVisitor, runVisitor)
+
+import Rule.Types exposing (ProjectVisitor(..), ModuleVisitor(..), ModuleVisitorOps)
+
+createModuleVisitor : Maybe (String -> List String -> List String) -> (List String -> ProjectVisitor) -> ModuleVisitor
+createModuleVisitor exprVisitorSchema toProject =
+    let
+        raise : List String -> ModuleVisitor
+        raise errors =
+            ModuleVisitor
+                { expressionVisitor =
+                    case exprVisitorSchema of
+                        Nothing -> Nothing
+                        Just visitorFn ->
+                            Just (\\a -> raise (visitorFn a errors))
+                , toProjectVisitor = \\() -> toProject errors
+                }
+    in
+    raise []
+
+runVisitor : (ModuleVisitorOps -> Maybe (a -> ModuleVisitor)) -> a -> ModuleVisitor -> ModuleVisitor
+runVisitor field a ((ModuleVisitor ops) as original) =
+    case field ops of
+        Just visitor -> visitor a
+        Nothing -> original
+"""
+            , """module Main exposing (main)
+
+import Rule.Types exposing (ProjectVisitor(..), ModuleVisitor(..), ModuleVisitorOps)
+import Rule.Visitor exposing (createModuleVisitor, runVisitor)
+
+main =
+    let
+        toProject errors =
+            ProjectVisitor { getErrors = \\() -> errors }
+
+        visitors =
+            [ createModuleVisitor (Just (\\expr errors -> expr :: errors)) toProject ]
+
+        result =
+            visitors
+                |> List.map (\\acc -> runVisitor .expressionVisitor "hello" acc)
+    in
+    case result of
+        (ModuleVisitor ops) :: _ ->
+            case ops.toProjectVisitor () of
+                ProjectVisitor pv -> pv.getErrors ()
+
+        [] -> []
+"""
+            ]
+            (list String)
+            [ "hello" ]
+        , evalProjectTest "newtype wrapping list, mutatingMap, large record (14 fields)"
+            -- The real ModuleVisitorOps has 14 fields. Test if large records
+            -- interact badly with newtype wrapping + List.map.
+            [ """module Rule exposing (main)
+
+type ProjectVisitor = ProjectVisitor { getErrors : () -> List String }
+
+type alias ModuleVisitorOps =
+    { f1 : Maybe (String -> ModuleVisitor)
+    , f2 : Maybe (String -> ModuleVisitor)
+    , f3 : Maybe (String -> ModuleVisitor)
+    , f4 : Maybe (String -> ModuleVisitor)
+    , f5 : Maybe (String -> ModuleVisitor)
+    , f6 : Maybe (String -> ModuleVisitor)
+    , f7 : Maybe (String -> ModuleVisitor)
+    , f8 : Maybe (String -> ModuleVisitor)
+    , f9 : Maybe (String -> ModuleVisitor)
+    , f10 : Maybe (String -> ModuleVisitor)
+    , f11 : Maybe (String -> ModuleVisitor)
+    , f12 : Maybe (String -> ModuleVisitor)
+    , f13 : Maybe (() -> ModuleVisitor)
+    , toProjectVisitor : () -> ProjectVisitor
+    }
+
+type ModuleVisitor = ModuleVisitor ModuleVisitorOps
+
+type MyArray a = MyArray (List a)
+
+fromList : List a -> MyArray a
+fromList = MyArray
+
+toList : MyArray a -> List a
+toList (MyArray list) = list
+
+mutatingMap : (a -> a) -> MyArray a -> MyArray a
+mutatingMap mapper (MyArray list) =
+    MyArray (List.map mapper list)
+
+createModuleVisitor : (List String -> ProjectVisitor) -> List String -> ModuleVisitor
+createModuleVisitor toProject errors =
+    let
+        raise newErrors =
+            ModuleVisitor
+                { f1 = Just (\\expr -> raise (expr :: newErrors))
+                , f2 = Nothing, f3 = Nothing, f4 = Nothing
+                , f5 = Nothing, f6 = Nothing, f7 = Nothing
+                , f8 = Nothing, f9 = Nothing, f10 = Nothing
+                , f11 = Nothing, f12 = Nothing, f13 = Nothing
+                , toProjectVisitor = \\() -> toProject newErrors
+                }
+    in
+    raise errors
+
+runVisitor : (ModuleVisitorOps -> Maybe (a -> ModuleVisitor)) -> a -> ModuleVisitor -> ModuleVisitor
+runVisitor field a ((ModuleVisitor ops) as original) =
+    case field ops of
+        Just visitor -> visitor a
+        Nothing -> original
+
+main =
+    let
+        toProject errors = ProjectVisitor { getErrors = \\() -> errors }
+        visitors = [ createModuleVisitor toProject [] ]
+
+        result =
+            visitors
+                |> fromList
+                |> mutatingMap (\\acc -> runVisitor .f1 "e1" acc)
+                |> mutatingMap (\\acc -> runVisitor .f2 "e2" acc)
+                |> mutatingMap (\\acc -> runVisitor .f13 () acc)
+                |> toList
+    in
+    case result of
+        (ModuleVisitor ops) :: _ ->
+            case ops.toProjectVisitor () of
+                ProjectVisitor pv -> pv.getErrors ()
+        [] -> []
+"""
+            ]
+            (list String)
+            [ "e1" ]
+        , evalProjectTest "cross-module two-phase: types as package, visitor logic as user code"
+            -- Tests the buildProjectEnv + evalWithEnv path
+            [ """module Rule.Types exposing (ProjectVisitor(..), ModuleVisitor(..), ModuleVisitorOps)
+
+type ProjectVisitor = ProjectVisitor { getErrors : () -> List String }
+
+type alias ModuleVisitorOps =
+    { expressionVisitor : Maybe (String -> ModuleVisitor)
+    , toProjectVisitor : () -> ProjectVisitor
+    }
+
+type ModuleVisitor = ModuleVisitor ModuleVisitorOps
+"""
+            , """module Rule.Visitor exposing (createModuleVisitor, runVisitor)
+
+import Rule.Types exposing (ProjectVisitor(..), ModuleVisitor(..), ModuleVisitorOps)
+
+createModuleVisitor : Maybe (String -> List String -> List String) -> (List String -> ProjectVisitor) -> ModuleVisitor
+createModuleVisitor exprVisitorSchema toProject =
+    let
+        raise : List String -> ModuleVisitor
+        raise errors =
+            ModuleVisitor
+                { expressionVisitor =
+                    case exprVisitorSchema of
+                        Nothing -> Nothing
+                        Just visitorFn ->
+                            Just (\\a -> raise (visitorFn a errors))
+                , toProjectVisitor = \\() -> toProject errors
+                }
+    in
+    raise []
+
+runVisitor : (ModuleVisitorOps -> Maybe (a -> ModuleVisitor)) -> a -> ModuleVisitor -> ModuleVisitor
+runVisitor field a ((ModuleVisitor ops) as original) =
+    case field ops of
+        Just visitor -> visitor a
+        Nothing -> original
+"""
+            , """module Main exposing (main)
+
+import Rule.Types exposing (ProjectVisitor(..), ModuleVisitor(..), ModuleVisitorOps)
+import Rule.Visitor exposing (createModuleVisitor, runVisitor)
+
+main =
+    let
+        toProject errors =
+            ProjectVisitor { getErrors = \\() -> errors }
+
+        visitors =
+            [ createModuleVisitor (Just (\\expr errors -> expr :: errors)) toProject
+            , createModuleVisitor Nothing toProject
+            ]
+
+        afterExpr =
+            visitors
+                |> List.map (\\acc -> runVisitor .expressionVisitor "e1" acc)
+                |> List.map (\\acc -> runVisitor .expressionVisitor "e2" acc)
+    in
+    case afterExpr of
+        (ModuleVisitor ops1) :: (ModuleVisitor ops2) :: _ ->
+            let
+                (ProjectVisitor pv1) = ops1.toProjectVisitor ()
+                (ProjectVisitor pv2) = ops2.toProjectVisitor ()
+            in
+            pv1.getErrors () ++ pv2.getErrors ()
+
+        _ -> [ "WRONG_SHAPE" ]
+"""
+            ]
+            (list String)
+            [ "e2", "e1" ]
         ]
 
 
