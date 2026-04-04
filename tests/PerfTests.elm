@@ -224,6 +224,17 @@ tcoProofTests =
                     "let isEven n = if n == 0 then True else isOdd (n - 1)\n    isOdd n = if n == 0 then False else isEven (n - 1)\nin isEven 101"
                     |> Expect.equal (Ok (Bool False))
 
+        -- === TCO with maxSteps=Nothing (via Eval.eval) ===
+        , test "Eval.eval list build 10000 (needs TCO for memory)" <|
+            -- Eval.eval uses trace=True, maxSteps=Nothing.
+            -- Without TCO, building a 10k-element list through the trampoline
+            -- would be extremely slow due to memory pressure.
+            -- With TCO, tcoLoop keeps memory bounded.
+            \_ ->
+                Eval.eval
+                    "let build acc n = if n <= 0 then List.length acc else build (n :: acc) (n - 1) in build [] 10000"
+                    |> Expect.equal (Ok (Int 10000))
+
         -- === Pipe operators should NOT get TCO (per Elm compiler) ===
         , test "pipe operator is not tail-optimized but still correct" <|
             \_ ->

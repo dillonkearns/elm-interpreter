@@ -1367,22 +1367,21 @@ call maybeQualifiedName implementation cfg env =
                                 }
                             )
 
-                    else if isTailRecursive qualifiedName.name expr && cfg.maxSteps /= Nothing then
+                    else if isTailRecursive qualifiedName.name expr then
                         -- Static analysis confirmed tail-recursive: use tcoLoop
                         let
                             tcoCfg =
                                 { cfg | tcoTarget = Just qualifiedName.name }
 
-                            -- TCO iteration limit based on maxSteps.
-                            -- One tcoLoop iteration ≈ one function call, which is
-                            -- the unit of work the step limit is meant to bound.
                             limit =
                                 case cfg.maxSteps of
                                     Just n ->
                                         n
 
                                     Nothing ->
-                                        10000
+                                        -- No step limit: use generous default for legitimate programs.
+                                        -- Infinite loops are caught by cycle detection in tcoLoop.
+                                        500000
                         in
                         Recursion.base (tcoLoop qualifiedName.name expr limit tcoCfg newEnv)
 
@@ -1597,10 +1596,19 @@ containsSelfCallInArgs funcName expr =
 evalExpression calls. Each iteration is a complete evaluation; self-calls
 are detected and caught as TailCall errors, then rebound and looped.
 
+Cycle detection:
+- Category A: identical values between iterations → immediate detection
+- Category B: values grow monotonically for 50+ iterations → likely infinite
+
 This is tail-recursive in Elm, compiled to a while loop by the host compiler.
 -}
 tcoLoop : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
 tcoLoop funcName body remaining cfg env =
+    tcoLoopHelp funcName body remaining 0 0 (fingerprintValues env.values) cfg env
+
+
+tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value
+tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
     if remaining <= 0 then
         EvErr
             { currentModule = env.currentModule
@@ -1610,48 +1618,134 @@ tcoLoop funcName body remaining cfg env =
 
     else
         let
-            -- Disable inner step limit — tcoLoop's iteration counter is the limit
             innerCfg =
                 { cfg | maxSteps = Nothing }
+
+            result =
+                evalExpression body innerCfg env
         in
-        case evalExpression body innerCfg env of
-            EvErr errData ->
-                case errData.error of
-                    TailCall newValues ->
-                        if newValues == env.values then
-                            -- Identical args: infinite loop detected
-                            EvErr
-                                { currentModule = env.currentModule
-                                , callStack = env.callStack
-                                , error = TypeError ("Infinite recursion detected: " ++ funcName ++ " called with identical arguments")
-                                }
+        case tcoExtractTailCall result of
+            Just newValues ->
+                -- Got a TailCall signal
+                if newValues == env.values then
+                    -- Category A: identical args → infinite loop
+                    EvErr
+                        { currentModule = env.currentModule
+                        , callStack = env.callStack
+                        , error = TypeError ("Infinite recursion detected: " ++ funcName ++ " called with identical arguments")
+                        }
 
-                        else
-                            tcoLoop funcName body (remaining - 1) cfg (Environment.replaceValues newValues env)
+                else
+                    let
+                        newSize =
+                            valuesSize newValues
 
-                    _ ->
-                        EvErr errData
+                        newFingerprint =
+                            fingerprintValues newValues
 
-            EvErrTrace errData trees logs ->
-                case errData.error of
-                    TailCall newValues ->
-                        if newValues == env.values then
-                            EvErrTrace
-                                { currentModule = env.currentModule
-                                , callStack = env.callStack
-                                , error = TypeError ("Infinite recursion detected: " ++ funcName ++ " called with identical arguments")
-                                }
-                                trees
-                                logs
+                        -- "Bounded progress": at least one value has constant size
+                        -- but changing fingerprint. This detects countdown variables
+                        -- (Int changing value but constant size=1), indicating
+                        -- progress toward a base case even if total size grows.
+                        boundedProgress =
+                            hasBoundedProgressInValues env.values newValues
 
-                        else
-                            tcoLoop funcName body (remaining - 1) cfg (Environment.replaceValues newValues env)
+                        newGrowCount =
+                            if boundedProgress then
+                                -- A scalar argument is changing — likely a countdown
+                                0
 
-                    _ ->
-                        EvErrTrace errData trees logs
+                            else if newSize > lastSize && lastSize > 0 then
+                                growCount + 1
 
-            other ->
-                other
+                            else
+                                0
+                    in
+                    if newGrowCount >= 50 then
+                        -- Category B: growing without bound
+                        EvErr
+                            { currentModule = env.currentModule
+                            , callStack = env.callStack
+                            , error = TypeError ("Infinite recursion detected: " ++ funcName ++ " arguments growing without bound")
+                            }
+
+                    else
+                        -- Continue loop (this IS the tail call for Elm's TCO)
+                        tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
+
+            Nothing ->
+                -- Not a TailCall: return the result as-is
+                result
+
+
+{-| Extract TailCall values from an EvalResult, or Nothing if not a TailCall.
+-}
+tcoExtractTailCall : EvalResult Value -> Maybe EnvValues
+tcoExtractTailCall result =
+    case result of
+        EvErr { error } ->
+            case error of
+                TailCall newValues ->
+                    Just newValues
+
+                _ ->
+                    Nothing
+
+        EvErrTrace { error } _ _ ->
+            case error of
+                TailCall newValues ->
+                    Just newValues
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+{-| Compute total size of all values in an env's values dict.
+-}
+valuesSize : EnvValues -> Int
+valuesSize values =
+    Dict.foldl (\_ v acc -> acc + sizeOfValue v) 0 values
+
+
+{-| Cheap fingerprint of all values in an env's values dict.
+-}
+fingerprintValues : EnvValues -> Int
+fingerprintValues values =
+    Dict.foldl (\k v acc -> Bitwise.xor (acc * 31) (fingerprintValue v + String.length k)) 5381 values
+
+
+{-| Check if any value has constant size but changing fingerprint between
+two env value dicts. This detects "countdown" variables that indicate
+progress toward a base case.
+-}
+hasBoundedProgressInValues : EnvValues -> EnvValues -> Bool
+hasBoundedProgressInValues oldValues newValues =
+    Dict.foldl
+        (\key newVal found ->
+            if found then
+                True
+
+            else
+                case Dict.get key oldValues of
+                    Just oldVal ->
+                        let
+                            oldSz =
+                                sizeOfValue oldVal
+
+                            newSz =
+                                sizeOfValue newVal
+                        in
+                        -- Same size but different fingerprint = bounded progress
+                        oldSz == newSz && fingerprintValue oldVal /= fingerprintValue newVal
+
+                    Nothing ->
+                        False
+        )
+        False
+        newValues
 
 
 evalFunctionOrValue : ModuleName -> String -> PartialEval Value
