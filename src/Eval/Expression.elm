@@ -1757,51 +1757,80 @@ tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
         case tcoExtractTailCall result of
             Just newValues ->
                 -- Got a TailCall signal
-                if newValues == env.values then
-                    -- Category A: identical args → infinite loop
+                let
+                    newSize =
+                        valuesSize newValues
+
+                    newFingerprint =
+                        fingerprintValues newValues
+
+                    -- Category A: check if fingerprint is identical (NOT using ==
+                    -- on the values dict, which is unreliable for PartiallyApplied).
+                    identicalFingerprint =
+                        newFingerprint == lastFingerprint && newSize == lastSize
+
+                    -- "Bounded progress": at least one value has constant size
+                    -- but changing fingerprint.
+                    boundedProgress =
+                        hasBoundedProgressInValues env.values newValues
+
+                    newGrowCount =
+                        if boundedProgress then
+                            0
+
+                        else if newSize > lastSize && lastSize > 0 then
+                            growCount + 1
+
+                        else if identicalFingerprint then
+                            -- Fingerprint didn't change — count toward Category A
+                            growCount + 1
+
+                        else
+                            0
+
+                    -- Use same threshold as checkAndUpdateCycle: 500 for closures
+                    hasClosures =
+                        Dict.foldl
+                            (\_ v found ->
+                                found
+                                    || (case v of
+                                            PartiallyApplied _ _ _ _ _ _ ->
+                                                True
+
+                                            _ ->
+                                                False
+                                       )
+                            )
+                            False
+                            newValues
+
+                    threshold =
+                        if hasClosures then
+                            500
+
+                        else
+                            50
+                in
+                if newGrowCount >= threshold then
                     EvErr
                         { currentModule = env.currentModule
                         , callStack = env.callStack
-                        , error = TypeError ("Infinite recursion detected: " ++ funcName ++ " called with identical arguments")
+                        , error =
+                            TypeError
+                                ("Infinite recursion detected: "
+                                    ++ funcName
+                                    ++ (if identicalFingerprint then
+                                            " called with identical arguments"
+
+                                        else
+                                            " arguments growing without bound"
+                                       )
+                                )
                         }
 
                 else
-                    let
-                        newSize =
-                            valuesSize newValues
-
-                        newFingerprint =
-                            fingerprintValues newValues
-
-                        -- "Bounded progress": at least one value has constant size
-                        -- but changing fingerprint. This detects countdown variables
-                        -- (Int changing value but constant size=1), indicating
-                        -- progress toward a base case even if total size grows.
-                        boundedProgress =
-                            hasBoundedProgressInValues env.values newValues
-
-                        newGrowCount =
-                            if boundedProgress then
-                                -- A scalar argument is changing — likely a countdown
-                                0
-
-                            else if newSize > lastSize && lastSize > 0 then
-                                growCount + 1
-
-                            else
-                                0
-                    in
-                    if newGrowCount >= 50 then
-                        -- Category B: growing without bound
-                        EvErr
-                            { currentModule = env.currentModule
-                            , callStack = env.callStack
-                            , error = TypeError ("Infinite recursion detected: " ++ funcName ++ " arguments growing without bound")
-                            }
-
-                    else
-                        -- Continue loop (this IS the tail call for Elm's TCO)
-                        tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
+                    -- Continue loop
+                    tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
 
             Nothing ->
                 -- Not a TailCall: return the result as-is

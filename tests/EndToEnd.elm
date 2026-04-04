@@ -45,6 +45,7 @@ suite =
         , growingArgsLoopDetectionTests
         , taskTests
         , bytesTests
+        , tcoParserPatternTests
         ]
 
 
@@ -1081,4 +1082,94 @@ main = Bytes.Decode.decode Bytes.Decode.fail (Bytes.Encode.encode (Bytes.Encode.
 """
             (maybe Int)
             Nothing
+        ]
+
+
+{-| Tests for the parser-like recursion pattern where a tail-recursive function
+is called with UNCHANGED arguments but makes progress via a separate state
+channel. This is exactly the pattern used by elm-syntax's infix parser.
+-}
+tcoParserPatternTests : Test
+tcoParserPatternTests =
+    describe "TCO parser-like recursion"
+        [ evalTestModule "tail-recursive with unchanged closure args (parser pattern)"
+            -- parseExpr takes a 'handler' function that doesn't change,
+            -- and an offset that decreases. The function IS tail-recursive
+            -- (recurses in if/else branch). The handler arg stays the same
+            -- across calls — this is the pattern that triggers false cycle
+            -- detection in tcoLoop.
+            """module Temp exposing (main)
+
+handler : Int -> Int
+handler x = x + 1
+
+parseExpr : (Int -> Int) -> Int -> Int
+parseExpr f offset =
+    if offset <= 0 then
+        f 0
+    else
+        parseExpr f (offset - 1)
+
+main = parseExpr handler 500
+"""
+            Int
+            1
+        , test "500+ recursion with only-closure args (parser combinator pattern)" <|
+            -- Models infixRight: function takes ONLY closure arguments.
+            -- It's called via an outer loop that provides changing state,
+            -- but the function itself is called with identical args each time.
+            -- The function isn't actually tail-recursive (has work after the
+            -- recursive call), but it recurses deeply.
+            \_ ->
+                Eval.Module.eval
+                    """module Temp exposing (main)
+
+type alias Ctx = { remaining : Int, acc : Int }
+
+applyN : (Int -> Int) -> (Int -> Int -> Int) -> Ctx -> Ctx
+applyN f g ctx =
+    if ctx.remaining <= 0 then
+        ctx
+    else
+        applyN f g { remaining = ctx.remaining - 1, acc = g (f ctx.acc) ctx.acc }
+
+main =
+    let result = applyN (\\x -> x + 1) (\\a b -> a + b) { remaining = 600, acc = 0 }
+    in result.acc
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.ok
+        , evalTestModule "recursion where ONLY closure args and they DON'T change"
+            -- This models the exact elm-syntax parser pattern:
+            -- `infixRight` takes parser combinator functions as args and
+            -- self-calls with the SAME function args. Progress happens via
+            -- the return value, not the arguments. The function reads from
+            -- a mutable-like state (simulated here via a list that shrinks).
+            --
+            -- With TCO, tcoLoop checks `newValues == env.values`. Since the
+            -- function args (closures) don't change, this would be True if
+            -- the env only contains the function args. The key: the env ALSO
+            -- contains the local bindings from the function body.
+            """module Temp exposing (main)
+
+consume : List Int -> ( Int, List Int )
+consume items =
+    case items of
+        [] -> ( 0, [] )
+        x :: rest -> ( x, rest )
+
+parseLoop : (List Int -> ( Int, List Int )) -> List Int -> Int -> Int
+parseLoop handler remaining acc =
+    case remaining of
+        [] -> acc
+        _ ->
+            let
+                ( value, rest ) = handler remaining
+            in
+            parseLoop handler rest (acc + value)
+
+main = parseLoop consume (List.range 1 300) 0
+"""
+            Int
+            45150
         ]
