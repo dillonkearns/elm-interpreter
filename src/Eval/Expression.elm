@@ -2443,7 +2443,29 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
             case declaration of
                 Node _ ({ name, expression } as implementation) ->
                     if isLetDeclarationFunction node then
-                        EvalResult.succeed <| Environment.addFunction env.currentModule implementation env
+                        let
+                            fnName : String
+                            fnName =
+                                Node.value name
+
+                            envWithFn : Env
+                            envWithFn =
+                                Environment.addFunction env.currentModule implementation env
+                        in
+                        -- Also add to env.values so the let-function shadows
+                        -- any parameter with the same name. env.values has higher
+                        -- lookup priority than currentModuleFunctions.
+                        -- If the same name exists in env.values (e.g. from a parameter
+                        -- in an enclosing scope), remove it so the let-function in
+                        -- currentModuleFunctions takes precedence during lookup.
+                        -- Without this, the stale value shadows the let-function
+                        -- because env.values is checked before currentModuleFunctions.
+                        EvalResult.succeed <|
+                            if Dict.member fnName env.values then
+                                { envWithFn | values = Dict.remove fnName envWithFn.values }
+
+                            else
+                                envWithFn
 
                     else
                         evalExpression expression cfg env

@@ -488,6 +488,46 @@ main = funcA ()
 """
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (String "OK: inner"))
+        , test "BUG: let-function should shadow parameter with same name" <|
+            \_ ->
+                -- A function takes a parameter named 'go'. Inside, a let-function
+                -- also named 'go' should shadow the parameter. But addFunction
+                -- puts it in currentModuleFunctions while the parameter stays
+                -- in env.values which has HIGHER lookup priority.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+outer go =
+    let
+        go x = x * 10
+    in
+    go 5
+
+main = outer (\\x -> x + 1)
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 50))
+        , test "BUG: let-function shadows parameter, used in nested closure" <|
+            \_ ->
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type A = A String
+type B = B String
+
+process raise =
+    let
+        raise val = B val
+    in
+    raise "test"
+
+main =
+    case process (\\val -> A val) of
+        B s -> "OK: " ++ s
+        A s -> "BUG: parameter raise was used instead of let raise"
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "OK: test"))
         , test "TYPE-ANNOTATED let function: two functions with same-named typed let-binding" <|
             \_ ->
                 -- The elm-review 'raise' has a type annotation. elm-syntax may
