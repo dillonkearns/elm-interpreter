@@ -1487,7 +1487,11 @@ call maybeQualifiedName implementation cfg env =
                         newEnv =
                             callFn qualifiedName.moduleName qualifiedName.name env
                     in
-                    if cfg.tcoTarget == Just qualifiedName.name then
+                    let
+                        tcoKey =
+                            Syntax.qualifiedNameToString qualifiedName
+                    in
+                    if cfg.tcoTarget == Just tcoKey then
                         -- Inside a tcoLoop: signal TailCall to the loop
                         Recursion.base
                             (EvErr
@@ -1501,7 +1505,7 @@ call maybeQualifiedName implementation cfg env =
                         -- Static analysis confirmed tail-recursive: use tcoLoop
                         let
                             tcoCfg =
-                                { cfg | tcoTarget = Just qualifiedName.name }
+                                { cfg | tcoTarget = Just tcoKey }
 
                             limit =
                                 case cfg.maxSteps of
@@ -1513,7 +1517,7 @@ call maybeQualifiedName implementation cfg env =
                                         -- Infinite loops are caught by cycle detection in tcoLoop.
                                         500000
                         in
-                        Recursion.base (tcoLoop qualifiedName.name expr limit tcoCfg newEnv)
+                        Recursion.base (tcoLoop tcoKey expr limit tcoCfg newEnv)
 
                     else
                         -- Not tail-recursive: normal trampoline

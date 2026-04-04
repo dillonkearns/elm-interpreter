@@ -1172,4 +1172,37 @@ main = parseLoop consume (List.range 1 300) 0
 """
             Int
             45150
+        , test "TCO tcoTarget name collision: same function name in two modules" <|
+            -- Module Helper has `step : Int -> Int` (non-recursive).
+            -- Module Main has tail-recursive `step` that calls Helper.step.
+            -- tcoTarget = "step" must NOT match Helper.step, or TailCall
+            -- would fire for Helper.step and corrupt the return value.
+            \_ ->
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnv env
+                            [ """module Helper exposing (step)
+
+step : Int -> Int
+step x = x * 10
+"""
+                            , """module Main exposing (main)
+
+import Helper
+
+step : Int -> Int -> Int
+step n acc =
+    if n <= 0 then
+        acc
+    else
+        step (n - 1) (acc + Helper.step n)
+
+main = step 5 0
+"""
+                            ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 150))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
         ]
