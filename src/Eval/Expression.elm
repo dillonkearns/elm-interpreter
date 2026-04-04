@@ -2448,23 +2448,23 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                             fnName =
                                 Node.value name
 
+                            -- Register in module functions (for recursive self-reference)
                             envWithFn : Env
                             envWithFn =
                                 Environment.addFunction env.currentModule implementation env
                         in
-                        -- Also add to env.values so the let-function shadows
-                        -- any parameter with the same name. env.values has higher
-                        -- lookup priority than currentModuleFunctions.
-                        -- If the same name exists in env.values (e.g. from a parameter
-                        -- in an enclosing scope), remove it so the let-function in
-                        -- currentModuleFunctions takes precedence during lookup.
-                        -- Without this, the stale value shadows the let-function
-                        -- because env.values is checked before currentModuleFunctions.
+                        -- Store in env.values as a PartiallyApplied capturing the
+                        -- CURRENT env (definition-time). This ensures:
+                        -- 1. Correct lexical scoping: the closure captures the
+                        --    defining scope, not the call-site scope
+                        -- 2. Shadowing: values has higher lookup priority than
+                        --    currentModuleFunctions, so this shadows any
+                        --    module-level function with the same name
+                        -- 3. Prevents dynamic scoping: caller's values won't leak
+                        --    because the PA captures definition-time env
                         EvalResult.succeed <|
-                            if Dict.member fnName env.values then
-                                { envWithFn | values = Dict.remove fnName envWithFn.values }
-
-                            else
+                            Environment.addValue fnName
+                                (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression))
                                 envWithFn
 
                     else

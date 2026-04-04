@@ -488,6 +488,56 @@ main = funcA ()
 """
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (String "OK: inner"))
+        , test "SCOPING: caller's parameter should not leak into same-module callee" <|
+            \_ ->
+                -- funcA has parameter 'x'. It calls funcB in the same module.
+                -- funcB defines let y = x + 1. In proper lexical scoping,
+                -- 'x' is NOT in scope inside funcB. In dynamic scoping, it leaks.
+                -- The interpreter currently can't test this directly (Elm compiler
+                -- would reject funcB referencing x), but we CAN test the consequence:
+                -- a let-function named the same as a caller's parameter.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+funcB () =
+    let
+        helper n = n * 10
+    in
+    helper 5
+
+funcA helper =
+    -- 'helper' is a parameter here (a function).
+    -- funcB defines its own 'helper' as a let-function.
+    -- funcB should use ITS let-function, not funcA's parameter.
+    funcB ()
+
+main = funcA (\\n -> n + 1)
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 50))
+        , test "SCOPING: same-module function call does not inherit caller's let bindings" <|
+            \_ ->
+                -- funcA has a let-binding 'x'. It calls funcB.
+                -- funcB has its own let-binding 'x'. funcB should use its own.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+funcB () =
+    let
+        x = 100
+    in
+    x
+
+funcA () =
+    let
+        x = 999
+    in
+    funcB ()
+
+main = funcA ()
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 100))
         , test "BUG: let-function should shadow parameter with same name" <|
             \_ ->
                 -- A function takes a parameter named 'go'. Inside, a let-function
