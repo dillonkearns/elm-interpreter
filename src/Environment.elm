@@ -150,7 +150,7 @@ empty moduleName =
     , imports = emptyImports
     , moduleImports = Dict.empty
     , callDepth = 0
-    , recursionCheck = Dict.empty
+    , recursionCheck = Nothing
     }
 
 

@@ -127,13 +127,17 @@ Detects two patterns:
 - Category B: fingerprint changes but total value size never decreases for 50 consecutive
   calls (args growing monotonically = no progress toward base case)
 -}
+type alias RecursionCheckDict =
+    Dict String { fingerprint : Int, depth : Int, count : Int, size : Int, growCount : Int, argSizes : List Int, argFingerprints : List Int }
+
+
 type CycleResult
     = CycleDetected
-    | Continue (Dict String { fingerprint : Int, depth : Int, count : Int, size : Int, growCount : Int, argSizes : List Int, argFingerprints : List Int })
+    | Continue RecursionCheckDict
 
 
-checkAndUpdateCycle : QualifiedNameRef -> List Value -> Env -> CycleResult
-checkAndUpdateCycle qualifiedName args env =
+checkAndUpdateCycle : QualifiedNameRef -> List Value -> Int -> RecursionCheckDict -> CycleResult
+checkAndUpdateCycle qualifiedName args callDepth checkDict =
     let
         fnKey =
             Syntax.qualifiedNameToString qualifiedName
@@ -150,14 +154,14 @@ checkAndUpdateCycle qualifiedName args env =
         perArgFps =
             List.map fingerprintValue args
     in
-    case Dict.get fnKey env.recursionCheck of
+    case Dict.get fnKey checkDict of
         Nothing ->
-            Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } env.recursionCheck)
+            Continue (Dict.insert fnKey { fingerprint = fp, depth = callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } checkDict)
 
         Just entry ->
-            if entry.depth >= env.callDepth then
+            if entry.depth >= callDepth then
                 -- Not recursive (function returned and was called again)
-                Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } env.recursionCheck)
+                Continue (Dict.insert fnKey { fingerprint = fp, depth = callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } checkDict)
 
             else if entry.fingerprint == fp then
                 -- Category A: identical fingerprint (same args)
@@ -165,7 +169,7 @@ checkAndUpdateCycle qualifiedName args env =
                     CycleDetected
 
                 else
-                    Continue (Dict.insert fnKey { entry | count = entry.count + 1 } env.recursionCheck)
+                    Continue (Dict.insert fnKey { entry | count = entry.count + 1 } checkDict)
 
             else
                 -- Fingerprint changed. Check Category B: is total size growing?
@@ -193,7 +197,7 @@ checkAndUpdateCycle qualifiedName args env =
                     CycleDetected
 
                 else
-                    Continue (Dict.insert fnKey { fingerprint = fp, depth = env.callDepth, count = 1, size = sz, growCount = newGrowCount, argSizes = perArgSzs, argFingerprints = perArgFps } env.recursionCheck)
+                    Continue (Dict.insert fnKey { fingerprint = fp, depth = callDepth, count = 1, size = sz, growCount = newGrowCount, argSizes = perArgSzs, argFingerprints = perArgFps } checkDict)
 
 
 {-| Check if any argument has constant size but changing fingerprint.
@@ -1383,7 +1387,11 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                         call maybeQualifiedName implementation cfg boundEnv
 
                     else
-                        case checkAndUpdateCycle qualifiedName args env of
+                        let
+                            currentCheck =
+                                Maybe.withDefault Dict.empty env.recursionCheck
+                        in
+                        case checkAndUpdateCycle qualifiedName args env.callDepth currentCheck of
                             CycleDetected ->
                                 Types.failPartial <|
                                     typeError env
@@ -1393,7 +1401,7 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                                         )
 
                             Continue updatedCheck ->
-                                call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = updatedCheck }
+                                call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = Just updatedCheck }
 
                 Nothing ->
                     call maybeQualifiedName implementation cfg boundEnv

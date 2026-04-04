@@ -205,7 +205,7 @@ buildProjectEnvFromParsed parsedModules =
                         , imports = emptyImports
                         , moduleImports = Dict.empty
                         , callDepth = 0
-                        , recursionCheck = Dict.empty
+                        , recursionCheck = Nothing
                         }
                     )
     in
@@ -685,7 +685,7 @@ buildInitialEnv file =
             , imports = imports
             , moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports
             , callDepth = 0
-            , recursionCheck = Dict.empty
+            , recursionCheck = Nothing
             }
 
         addDeclaration : Node Declaration -> Env -> Result Error Env
@@ -965,7 +965,7 @@ evalProject sources expression =
                                 , imports = emptyImports
                                 , moduleImports = Dict.empty
                                 , callDepth = 0
-                                , recursionCheck = Dict.empty
+                                , recursionCheck = Nothing
                                 }
                             )
             in
