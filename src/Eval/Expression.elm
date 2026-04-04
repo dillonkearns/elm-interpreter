@@ -71,10 +71,49 @@ fingerprintValue value =
             List.length args * 67 + 11
 
         Record dict ->
-            Dict.size dict * 71 + 12
+            -- Include fingerprints of values, not just size, so records with
+            -- different field values (e.g., { pos = 1 } vs { pos = 2 })
+            -- produce different fingerprints for bounded-progress detection.
+            Dict.foldl (\_ v acc -> Bitwise.xor (acc * 31) (fingerprintValue v)) (Dict.size dict * 71 + 12) dict
 
         JsArray arr ->
             Array.length arr * 73 + 13
+
+        PartiallyApplied closureEnv args _ maybeName _ arity ->
+            -- Fingerprint based on arity, applied args, function identity,
+            -- AND captured environment values. This ensures closures at
+            -- different parser positions (different captured state) produce
+            -- different fingerprints, preventing false cycle detection.
+            let
+                nameHash =
+                    case maybeName of
+                        Just name ->
+                            String.length name.name * 79
+
+                        Nothing ->
+                            0
+
+                argsHash =
+                    List.foldl (\a acc -> Bitwise.xor (acc * 31) (fingerprintValue a)) 0 args
+
+                -- Include captured env values in fingerprint.
+                -- This is the key fix for parser combinators: the parser state
+                -- (position offset) lives in the captured env, not in the args.
+                envHash =
+                    Dict.foldl
+                        (\_ v acc ->
+                            case v of
+                                PartiallyApplied _ _ _ _ _ _ ->
+                                    -- Don't recurse into nested closures (expensive + cycles)
+                                    acc + 17
+
+                                _ ->
+                                    Bitwise.xor (acc * 31) (fingerprintValue v)
+                        )
+                        0
+                        closureEnv.values
+            in
+            Bitwise.xor (arity * 83 + List.length args * 89 + nameHash + 14) (Bitwise.xor argsHash envHash)
 
         _ ->
             0
@@ -165,7 +204,30 @@ checkAndUpdateCycle qualifiedName args callDepth checkDict =
 
             else if entry.fingerprint == fp then
                 -- Category A: identical fingerprint (same args)
-                if entry.count >= 3 then
+                -- Use higher threshold when args contain functions (closures),
+                -- because closure fingerprinting can't distinguish nested state
+                -- changes (e.g., parser combinators, wrapped counters).
+                let
+                    hasClosureArgs =
+                        List.any
+                            (\a ->
+                                case a of
+                                    PartiallyApplied _ _ _ _ _ _ ->
+                                        True
+
+                                    _ ->
+                                        False
+                            )
+                            args
+
+                    threshold =
+                        if hasClosureArgs then
+                            500
+
+                        else
+                            3
+                in
+                if entry.count >= threshold then
                     CycleDetected
 
                 else
@@ -2473,15 +2535,39 @@ evalLetBlockFull letBlock cfg env =
                     EvalResult.fail <| typeError env "internal error in let block"
 
                 Ok sd ->
-                    -- We can't use combineMap and need to fold
-                    -- because we need to change the environment for each call
+                    -- Two-pass processing for mutual recursion support:
+                    -- Pass 1: register all function declarations in currentModuleFunctions
+                    --         so they can find each other
+                    -- Pass 2: create PartiallyApplied values and evaluate non-function decls
+                    let
+                        envWithAllFunctions =
+                            List.foldl
+                                (\(Node _ decl) e ->
+                                    case decl of
+                                        Expression.LetFunction { declaration } ->
+                                            let
+                                                impl =
+                                                    Node.value declaration
+                                            in
+                                            if not (List.isEmpty impl.arguments) then
+                                                Environment.addLocalFunction impl e
+
+                                            else
+                                                e
+
+                                        _ ->
+                                            e
+                                )
+                                env
+                                sd
+                    in
                     List.foldl
                         (\declaration acc ->
                             EvalResult.andThen
                                 (\e -> addLetDeclaration declaration cfg e)
                                 acc
                         )
-                        (EvalResult.succeed env)
+                        (EvalResult.succeed envWithAllFunctions)
                         sd
     in
     case newEnv of
@@ -2523,40 +2609,21 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
 
                             -- Check if the function body references itself
                             -- (excluding parameter names which shadow outer scope).
-                            isSelfRecursive : Bool
-                            isSelfRecursive =
-                                Set.member fnName
-                                    (Set.diff (freeVariables implementation.expression)
-                                        (List.foldl (\p -> Set.union (patternDefinedVariables p))
-                                            Set.empty
-                                            implementation.arguments
-                                        )
-                                    )
+                            -- Always register in currentModuleFunctions so the
+                            -- body can find itself (self-recursion) AND so sibling
+                            -- let-functions can find it (mutual recursion).
+                            envWithFn : Env
+                            envWithFn =
+                                Environment.addLocalFunction implementation env
+
+                            arity : Int
+                            arity =
+                                List.length implementation.arguments
                         in
-                        if isSelfRecursive then
-                            -- Recursive: register in currentModuleFunctions so the
-                            -- body can find itself, then capture that env.
-                            let
-                                envWithFn : Env
-                                envWithFn =
-                                    Environment.addLocalFunction implementation env
-
-                                arity : Int
-                                arity =
-                                    List.length implementation.arguments
-                            in
-                            EvalResult.succeed <|
-                                Environment.addValue fnName
-                                    (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) arity)
-                                    envWithFn
-
-                        else
-                            -- Non-recursive: skip addLocalFunction entirely.
-                            -- Just store in values with the current env as closure.
-                            EvalResult.succeed <|
-                                Environment.addValue fnName
-                                    (PartiallyApplied env [] implementation.arguments Nothing (AstImpl implementation.expression) (List.length implementation.arguments))
-                                    env
+                        EvalResult.succeed <|
+                            Environment.addValue fnName
+                                (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) arity)
+                                envWithFn
 
                     else
                         evalExpression expression cfg env
