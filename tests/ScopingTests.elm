@@ -14,6 +14,7 @@ suite =
     describe "Variable scoping across module calls"
         [ recordAliasConstructorTests
         , moduleDispatchTests
+        , letFunctionScopingTests
         , describe "caller's local variables should not leak into callee"
             [ evalProjectTest "local var does not shadow callee's module-level function"
                 [ """module Foo exposing (greet, helper)
@@ -222,6 +223,435 @@ main = Helpers.applyDouble 7
             ]
             Int
             14
+        ]
+
+
+letFunctionScopingTests : Test
+letFunctionScopingTests =
+    describe "let-function scoping (same name in different scopes)"
+        [ test "two functions with same-named let-binding 'go' producing different values" <|
+            \_ ->
+                -- Minimal repro: two functions each define a let-function named "go".
+                -- The second "go" should NOT see the first "go"'s body.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+first =
+    let
+        go x = x + 1
+    in
+    go 10
+
+second =
+    let
+        go x = x * 2
+    in
+    go 10
+
+main = ( first, second )
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Tuple (Int 11) (Int 20)))
+        , test "same-named let-function 'raise' in two functions producing different types" <|
+            \_ ->
+                -- Models the elm-review bug: createRuleProjectVisitor and
+                -- createRuleModuleVisitor both define a let-function named "raise"
+                -- that creates different Custom types.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type A = A String
+type B = B String
+
+makeA =
+    let
+        raise val = A val
+    in
+    raise "fromA"
+
+makeB =
+    let
+        raise val = B val
+    in
+    raise "fromB"
+
+main =
+    case ( makeA, makeB ) of
+        ( A a, B b ) -> a ++ " " ++ b
+        _ -> "WRONG"
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "fromA fromB"))
+        , evalProjectTest "same-named let-function across modules"
+            [ """module Mod exposing (makeA, makeB)
+
+type A = A String
+type B = B String
+
+makeA =
+    let
+        raise val = A val
+    in
+    raise "fromA"
+
+makeB =
+    let
+        raise val = B val
+    in
+    raise "fromB"
+"""
+            , """module Main exposing (main)
+
+import Mod exposing (makeA, makeB)
+
+main =
+    case ( makeA, makeB ) of
+        ( Mod.A a, Mod.B b ) -> a ++ " " ++ b
+        _ -> "WRONG"
+"""
+            ]
+            String
+            "fromA fromB"
+        , test "let-function with recursive raise pattern (elm-review pattern)" <|
+            \_ ->
+                -- Exact pattern from Review.Rule: two functions each with
+                -- recursive let-function "raise" creating different wrappers.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type ProjectVisitor = ProjectVisitor { errors : List String }
+type ModuleVisitor = ModuleVisitor { visitor : String -> ModuleVisitor, toProject : () -> ProjectVisitor }
+
+makeProjectVisitor errors =
+    let
+        raise errs =
+            ProjectVisitor { errors = errs }
+    in
+    raise errors
+
+makeModuleVisitor toProjectFn initial =
+    let
+        raise errors =
+            ModuleVisitor
+                { visitor = \\item -> raise (item :: errors)
+                , toProject = \\() -> toProjectFn errors
+                }
+    in
+    raise initial
+
+main =
+    let
+        pv = makeProjectVisitor [ "p1" ]
+
+        mv = makeModuleVisitor (\\errs -> makeProjectVisitor errs) []
+
+        (ModuleVisitor ops) = mv
+        mv2 = ops.visitor "m1"
+
+        (ModuleVisitor ops2) = mv2
+        (ProjectVisitor pvOps) = ops2.toProject ()
+    in
+    case pv of
+        ProjectVisitor p ->
+            String.join "," (p.errors ++ pvOps.errors)
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "p1,m1"))
+        , test "nested closure: outer function with 'raise' calls inner function that also defines 'raise'" <|
+            \_ ->
+                -- Models the actual elm-review pattern:
+                -- createRuleProjectVisitor defines raise (-> ProjectVisitor)
+                -- Inside its body, it stores a closure that later calls
+                -- createRuleModuleVisitor which defines its own raise (-> ModuleVisitor)
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type PV = PV { makeModule : () -> MV }
+type MV = MV { name : String }
+
+createProjectVisitor =
+    let
+        raise cache =
+            PV { makeModule = \\() -> createModuleVisitor cache }
+    in
+    raise "cached"
+
+createModuleVisitor cache =
+    let
+        raise label =
+            MV { name = label ++ "+" ++ cache }
+    in
+    raise "mod"
+
+main =
+    let
+        (PV pv) = createProjectVisitor
+        (MV mv) = pv.makeModule ()
+    in
+    mv.name
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "mod+cached"))
+        , test "let raise in function A, A's body calls function B which also has let raise" <|
+            \_ ->
+                -- A defines raise, then in A's body (still in A's let scope),
+                -- it calls B. B defines its own raise. The question: does B's
+                -- raise get its own body or A's?
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type A = A String
+type B = B String
+
+funcB () =
+    let
+        raise val = B val
+    in
+    raise "fromB"
+
+funcA () =
+    let
+        raise val = A val
+    in
+    case raise "fromA" of
+        A s ->
+            case funcB () of
+                B s2 -> s ++ " " ++ s2
+                A _ -> "WRONG: B got A's raise"
+        B _ -> "WRONG: A got B's raise"
+
+main = funcA ()
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "fromA fromB"))
+        , test "let raise in function A, A stores closure, closure later calls B with its own raise" <|
+            \_ ->
+                -- A defines raise, creates a closure that captures the env,
+                -- then the closure is called later which invokes B.
+                -- B defines its own raise. Does B get A's raise body?
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type A = A { callB : () -> B }
+type B = B String
+
+funcB tag =
+    let
+        raise val = B (tag ++ ":" ++ val)
+    in
+    raise "inner"
+
+funcA () =
+    let
+        raise tag =
+            A { callB = \\() -> funcB tag }
+    in
+    raise "outer"
+
+main =
+    case funcA () of
+        A record ->
+            case record.callB () of
+                B s -> s
+
+main2 = main
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "outer:inner"))
+        , test "function call INSIDE let scope of another raise, callee defines own raise" <|
+            \_ ->
+                -- funcA has let raise = A. In its let body, it calls funcB.
+                -- funcB has let raise = B. funcB's raise should produce B.
+                -- This tests whether funcA's let-function-dict leaks into funcB.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type A = A String
+type B = B String
+
+funcB () =
+    let
+        raise val = B val
+    in
+    raise "inner"
+
+funcA () =
+    let
+        raise val = A val
+        result = funcB ()
+    in
+    case result of
+        B s -> "OK: " ++ s
+        A s -> "BUG: got A instead of B"
+
+main = funcA ()
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "OK: inner"))
+        , test "TYPE-ANNOTATED let function: two functions with same-named typed let-binding" <|
+            \_ ->
+                -- The elm-review 'raise' has a type annotation. elm-syntax may
+                -- parse this as TWO declarations (annotation + function),
+                -- which would route through evalLetBlockFull instead of
+                -- evalLetBlockSingle. This could cause the scoping bug.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type A = A String
+type B = B String
+
+funcA () =
+    let
+        raise : String -> A
+        raise val = A val
+    in
+    raise "fromA"
+
+funcB () =
+    let
+        raise : String -> B
+        raise val = B val
+    in
+    raise "fromB"
+
+main =
+    case ( funcA (), funcB () ) of
+        ( A a, B b ) -> a ++ " " ++ b
+        _ -> "WRONG"
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "fromA fromB"))
+        , test "TYPE-ANNOTATED: funcA calls funcB while A's typed raise is in scope" <|
+            \_ ->
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type A = A String
+type B = B String
+
+funcB () =
+    let
+        raise : String -> B
+        raise val = B val
+    in
+    raise "inner"
+
+funcA () =
+    let
+        raise : String -> A
+        raise val = A val
+        result = funcB ()
+    in
+    case result of
+        B s -> "OK: " ++ s
+        A _ -> "BUG: got A"
+
+main = funcA ()
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "OK: inner"))
+        , test "FAITHFUL: recursive raise creates record with closure that calls another function with its own raise" <|
+            \_ ->
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type PV = PV PVOps
+type alias PVOps =
+    { createModule : () -> MV
+    , getResult : () -> String
+    }
+
+type MV = MV MVOps
+type alias MVOps =
+    { visit : String -> MV
+    , toProject : () -> PV
+    }
+
+createPV : List String -> PV
+createPV initialErrors =
+    let
+        raiseCache : List String -> PV
+        raiseCache errors =
+            PV
+                { createModule = \\() ->
+                    createMV (\\moduleErrors -> raiseCache moduleErrors)
+                , getResult = \\() -> String.join "," errors
+                }
+    in
+    raiseCache initialErrors
+
+createMV : (List String -> PV) -> MV
+createMV toProjectFn =
+    let
+        raise : List String -> MV
+        raise errors =
+            MV
+                { visit = \\item -> raise (item :: errors)
+                , toProject = \\() -> toProjectFn errors
+                }
+    in
+    raise []
+
+main =
+    let
+        (PV pvOps) = createPV []
+        mv = pvOps.createModule ()
+        (MV mvOps) = mv
+        mv2 = mvOps.visit "hello"
+        (MV mvOps2) = mv2
+        (PV pvOps2) = mvOps2.toProject ()
+    in
+    pvOps2.getResult ()
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "hello"))
+        , test "EXACT elm-review pattern: raise in project visitor closure calls function with its own raise" <|
+            \_ ->
+                -- The critical pattern: createRuleProjectVisitor's raise creates
+                -- a record with a field that, when called, invokes
+                -- createRuleModuleVisitor. That function defines its own raise.
+                -- The bug: the inner raise body gets the outer raise's body.
+                Eval.Module.eval
+                    """module Test exposing (main)
+
+type PV = PV { moduleCreator : () -> MV }
+type MV = MV { visit : String -> MV, toProject : () -> PV }
+
+createPV =
+    let
+        raise hidden =
+            PV
+                { moduleCreator = \\() ->
+                    createMV (\\errors -> raise { hidden | errors = errors })
+                }
+    in
+    raise { errors = [] }
+
+createMV toProjectFn =
+    let
+        raise errors =
+            MV
+                { visit = \\item -> raise (item :: errors)
+                , toProject = \\() -> toProjectFn errors
+                }
+    in
+    raise []
+
+main =
+    let
+        (PV pv) = createPV
+        mv = pv.moduleCreator ()
+    in
+    case mv of
+        MV ops ->
+            let
+                (MV ops2) = ops.visit "hello"
+            in
+            case ops2.toProject () of
+                PV _ -> "got PV"
+"""
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (String "got PV"))
         ]
 
 
