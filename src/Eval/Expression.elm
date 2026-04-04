@@ -465,15 +465,13 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                     continuation value
 
                 Nothing ->
-                    -- Check currentModuleFunctions before trampoline
-                    case Dict.get name env.currentModuleFunctions of
+                    -- Check letFunctions (scope-local self-recursive let-functions)
+                    case Dict.get name env.letFunctions of
                         Just function ->
                             if List.isEmpty function.arguments then
-                                -- Zero-arg thunk, needs trampoline for body eval
                                 Types.recurseThen ( fullExpr, cfg, env ) continuation
 
                             else
-                                -- Has args, return PartiallyApplied directly
                                 continuation
                                     (PartiallyApplied
                                         (if cfg.trace then
@@ -490,8 +488,30 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                     )
 
                         Nothing ->
-                            -- Need full resolution (imports, aliases, variants, etc.)
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            -- Check currentModuleFunctions (module-level functions)
+                            case Dict.get name env.currentModuleFunctions of
+                                Just function ->
+                                    if List.isEmpty function.arguments then
+                                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                                    else
+                                        continuation
+                                            (PartiallyApplied
+                                                (if cfg.trace then
+                                                    Environment.call env.currentModule name env
+
+                                                 else
+                                                    Environment.callNoStack env.currentModule name env
+                                                )
+                                                []
+                                                function.arguments
+                                                (Just { moduleName = env.currentModule, name = name })
+                                                (AstImpl function.expression)
+                                                (List.length function.arguments)
+                                            )
+
+                                Nothing ->
+                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
 
         Expression.ParenthesizedExpression inner ->
             evalOrRecurse ( inner, cfg, env ) continuation
@@ -1938,9 +1958,37 @@ evalQualifiedOrVariant : ModuleName -> String -> PartialEval Value
 evalQualifiedOrVariant moduleName name cfg env =
     case moduleName of
         [] ->
-            -- For unqualified names: check currentModuleFunctions first to
-            -- skip the expensive isVariant check (String.uncons + Char.toCode)
-            case Dict.get name env.currentModuleFunctions of
+            -- Check letFunctions first (scope-local let-functions for self-recursion),
+            -- then currentModuleFunctions (module-level functions)
+            case Dict.get name env.letFunctions of
+                Just function ->
+                    let
+                        qualifiedNameRef : QualifiedNameRef
+                        qualifiedNameRef =
+                            { moduleName = env.currentModule, name = name }
+
+                        callFn =
+                            if cfg.trace then
+                                Environment.call
+
+                            else
+                                Environment.callNoStack
+                    in
+                    if List.isEmpty function.arguments then
+                        call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+
+                    else
+                        PartiallyApplied
+                            (callFn env.currentModule name env)
+                            []
+                            function.arguments
+                            (Just qualifiedNameRef)
+                            (AstImpl function.expression)
+                            (List.length function.arguments)
+                            |> Types.succeedPartial
+
+                Nothing ->
+                    case Dict.get name env.currentModuleFunctions of
                         Just function ->
                             let
                                 qualifiedNameRef : QualifiedNameRef
@@ -2230,6 +2278,7 @@ evalNonVariant moduleName name cfg env =
                                         , currentModuleFunctions =
                                             Dict.get resolvedModuleKey env.shared.functions
                                                 |> Maybe.withDefault Dict.empty
+                                        , letFunctions = Dict.empty
                                         , values = Dict.empty
                                         , imports =
                                             Dict.get resolvedModuleKey env.shared.moduleImports
@@ -2586,7 +2635,7 @@ evalLetBlockFull letBlock cfg env =
                                                     Node.value declaration
                                             in
                                             if not (List.isEmpty impl.arguments) then
-                                                Environment.addLocalFunction impl e
+                                                Environment.addLetFunction impl e
 
                                             else
                                                 e
@@ -2648,25 +2697,23 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                                 List.length implementation.arguments
 
                             -- The CLOSURE env stores the function in BOTH:
-                            -- 1. currentModuleFunctions (for backward compat with
-                            --    evalQualifiedOrVariant lookup path)
-                            -- 2. values (survives callNoStack reset of currentModuleFunctions,
-                            --    enabling self-recursion even when currentModuleFunctions
-                            --    is reset to the module's original dict)
-                            envWithFnInModFunctions : Env
-                            envWithFnInModFunctions =
-                                Environment.addLocalFunction implementation env
+                            -- Use letFunctions (not currentModuleFunctions) for self-recursion.
+                            -- letFunctions is reset by callNoStack for same-module calls,
+                            -- preventing name collisions across different let scopes.
+                            envWithFn : Env
+                            envWithFn =
+                                Environment.addLetFunction implementation env
 
                             -- Create a placeholder PA for the values entry
                             -- (captures env with self in currentModuleFunctions)
                             pa : Value
                             pa =
-                                PartiallyApplied envWithFnInModFunctions [] implementation.arguments Nothing (AstImpl implementation.expression) arity
+                                PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) arity
 
                             -- Closure env: self in both currentModuleFunctions AND values
                             closureEnv : Env
                             closureEnv =
-                                Environment.addValue fnName pa envWithFnInModFunctions
+                                Environment.addValue fnName pa envWithFn
 
                             -- Final PA captures closureEnv (has self in both places)
                             paFinal : Value
@@ -2921,6 +2968,7 @@ evalOperator opName cfg env =
                                 , currentModuleFunctions =
                                     Dict.get (Environment.moduleKey resolvedRef.moduleName) env.shared.functions
                                         |> Maybe.withDefault Dict.empty
+                                , letFunctions = Dict.empty
                                 , values = Dict.empty
                                 , imports =
                                     Dict.get (Environment.moduleKey resolvedRef.moduleName) env.shared.moduleImports

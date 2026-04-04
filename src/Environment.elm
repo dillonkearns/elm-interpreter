@@ -1,4 +1,4 @@
-module Environment exposing (addFunction, addLocalFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, replaceValues, with, withBindings)
+module Environment exposing (addFunction, addLetFunction, addLocalFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, replaceValues, with, withBindings)
 
 import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -30,6 +30,7 @@ addValue name value env =
     , callStack = env.callStack
     , shared = env.shared
     , currentModuleFunctions = env.currentModuleFunctions
+    , letFunctions = env.letFunctions
     , values = Dict.insert name value env.values
     , imports = env.imports
     , callDepth = env.callDepth
@@ -46,6 +47,7 @@ replaceValues newValues env =
     , callStack = env.callStack
     , shared = env.shared
     , currentModuleFunctions = env.currentModuleFunctions
+    , letFunctions = env.letFunctions
     , values = newValues
     , imports = env.imports
     , callDepth = env.callDepth
@@ -62,6 +64,19 @@ addLocalFunction function env =
     { env
         | currentModuleFunctions =
             Dict.insert (Node.value function.name) function env.currentModuleFunctions
+    }
+
+
+{-| Add a let-defined function to the letFunctions dict.
+This is used for self-recursive lookups within the function's own body.
+Unlike addLocalFunction, letFunctions is reset by callNoStack for
+same-module calls, preventing name collisions across different scopes.
+-}
+addLetFunction : FunctionImplementation -> Env -> Env
+addLetFunction function env =
+    { env
+        | letFunctions =
+            Dict.insert (Node.value function.name) function env.letFunctions
     }
 
 
@@ -114,6 +129,7 @@ with newValues old =
     , callStack = old.callStack
     , shared = old.shared
     , currentModuleFunctions = old.currentModuleFunctions
+    , letFunctions = old.letFunctions
     , values = Dict.union newValues old.values
     , imports = old.imports
     , callDepth = old.callDepth
@@ -131,6 +147,7 @@ withBindings bindings old =
     , callStack = old.callStack
     , shared = old.shared
     , currentModuleFunctions = old.currentModuleFunctions
+    , letFunctions = old.letFunctions
     , values = List.foldl (\( k, v ) acc -> Dict.insert k v acc) old.values bindings
     , imports = old.imports
     , callDepth = old.callDepth
@@ -145,6 +162,7 @@ empty moduleName =
     , callStack = []
     , shared = { functions = Dict.empty, moduleImports = Dict.empty }
     , currentModuleFunctions = Dict.empty
+    , letFunctions = Dict.empty
     , values = Dict.empty
     , imports = emptyImports
     , callDepth = 0
@@ -180,6 +198,7 @@ callKernel moduleName name env =
     , currentModuleFunctions =
         Dict.get key env.shared.functions
             |> Maybe.withDefault Dict.empty
+    , letFunctions = Dict.empty
     , values = env.values
     , imports = env.imports
     , callDepth = env.callDepth + 1
@@ -202,6 +221,7 @@ call moduleName name env =
                 :: env.callStack
         , shared = env.shared
         , currentModuleFunctions = env.currentModuleFunctions
+    , letFunctions = env.letFunctions
         , values = env.values
         , imports = env.imports
         , callDepth = env.callDepth + 1
@@ -218,6 +238,7 @@ call moduleName name env =
         , currentModuleFunctions =
             Dict.get key env.shared.functions
                 |> Maybe.withDefault Dict.empty
+        , letFunctions = Dict.empty
         , values = env.values
         , imports =
             Dict.get key env.shared.moduleImports
@@ -243,6 +264,7 @@ callKernelNoStack moduleName _ env =
     , currentModuleFunctions =
         Dict.get key env.shared.functions
             |> Maybe.withDefault Dict.empty
+    , letFunctions = Dict.empty
     , values = env.values
     , imports = env.imports
     , callDepth = env.callDepth
@@ -270,6 +292,7 @@ callNoStack moduleName name env =
         , currentModuleFunctions =
             Dict.get key env.shared.functions
                 |> Maybe.withDefault Dict.empty
+        , letFunctions = Dict.empty
         , values = env.values
         , imports =
             Dict.get key env.shared.moduleImports

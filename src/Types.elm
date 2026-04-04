@@ -127,6 +127,7 @@ type alias Env =
     , currentModuleKey : String
     , shared : SharedContext
     , currentModuleFunctions : Dict String FunctionImplementation
+    , letFunctions : Dict String FunctionImplementation
     , values : EnvValues
     , callStack : List QualifiedNameRef
     , imports : ImportedNames

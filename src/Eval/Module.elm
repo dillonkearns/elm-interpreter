@@ -201,6 +201,7 @@ buildProjectEnvFromParsed parsedModules =
                         , callStack = []
                         , shared = { functions = coreFunctions, moduleImports = Dict.empty }
                         , currentModuleFunctions = Dict.empty
+                        , letFunctions = Dict.empty
                         , values = Dict.empty
                         , imports = emptyImports
                         , callDepth = 0
@@ -261,6 +262,7 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
                 , moduleImports = Dict.remove modKey projectEnv.env.shared.moduleImports
                 }
             , currentModuleFunctions = projectEnv.env.currentModuleFunctions
+            , letFunctions = Dict.empty
             , values = projectEnv.env.values
             , imports = projectEnv.env.imports
             , callDepth = projectEnv.env.callDepth
@@ -673,6 +675,7 @@ buildInitialEnv file =
             , callStack = []
             , shared = { functions = coreFunctions, moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports }
             , currentModuleFunctions = Dict.empty
+                        , letFunctions = Dict.empty
             , values = Dict.empty
             , imports = imports
             , callDepth = 0
@@ -952,6 +955,7 @@ evalProject sources expression =
                                 , callStack = []
                                 , shared = { functions = coreFunctions, moduleImports = Dict.empty }
                                 , currentModuleFunctions = Dict.empty
+                        , letFunctions = Dict.empty
                                 , values = Dict.empty
                                 , imports = emptyImports
                                 , callDepth = 0
