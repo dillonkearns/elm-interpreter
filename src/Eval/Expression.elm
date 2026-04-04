@@ -1408,11 +1408,25 @@ call maybeQualifiedName implementation cfg env =
 
 
 {-| Static analysis: check if a function body is tail-recursive with respect
-to a given function name. Returns True only if ALL self-calls appear in tail
-position (the outermost return expression of if/case branches).
+to a given function name. Returns True only if:
+1. The body CONTAINS at least one self-call (otherwise it's not recursive at all)
+2. ALL self-calls appear in tail position (outermost expression of if/case branches)
+
+Functions with zero self-calls return False — they're non-recursive and don't
+need TCO. This avoids wrapping every non-recursive function in a tcoLoop.
 -}
 isTailRecursive : String -> Node Expression -> Bool
-isTailRecursive funcName (Node _ expr) =
+isTailRecursive funcName ((Node _ expr) as node) =
+    -- First: must actually contain a self-call somewhere
+    containsSelfCall funcName expr
+        && isTailRecursiveHelper funcName node
+
+
+{-| Check the structure of a function body that's known to contain self-calls.
+Verifies all self-calls are in tail position.
+-}
+isTailRecursiveHelper : String -> Node Expression -> Bool
+isTailRecursiveHelper funcName (Node _ expr) =
     case expr of
         -- If/else: both branches must be tail-safe
         Expression.IfBlock _ (Node _ trueExpr) (Node _ falseExpr) ->
@@ -1426,15 +1440,15 @@ isTailRecursive funcName (Node _ expr) =
         -- and the body expression (the "in" part) must be tail-recursive
         Expression.LetExpression { declarations, expression } ->
             not (letDeclarationsContainSelfCall funcName declarations)
-                && isTailRecursive funcName expression
+                && isTailRecursiveHelper funcName expression
 
         -- A bare self-call at the top level is tail-recursive
         Expression.Application ((Node _ (Expression.FunctionOrValue [] name)) :: _) ->
             name == funcName
 
-        -- Anything else: only tail-recursive if it doesn't contain self-calls at all
+        -- Anything else with self-calls: NOT tail-recursive
         _ ->
-            not (containsSelfCall funcName expr)
+            False
 
 
 {-| Check if an expression in tail position is safe. An expression is tail-safe if:
