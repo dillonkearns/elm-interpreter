@@ -1,4 +1,4 @@
-module Environment exposing (addFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, replaceValues, with, withBindings)
+module Environment exposing (addFunction, addLocalFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, replaceValues, with, withBindings)
 
 import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -52,6 +52,18 @@ replaceValues newValues env =
     , moduleImports = env.moduleImports
     , callDepth = env.callDepth
     , recursionCheck = env.recursionCheck
+    }
+
+
+{-| Add a function only to currentModuleFunctions, NOT to the global
+functions dict. Used for let-functions where recursive self-reference
+is needed but the function shouldn't pollute the global namespace.
+-}
+addLocalFunction : FunctionImplementation -> Env -> Env
+addLocalFunction function env =
+    { env
+        | currentModuleFunctions =
+            Dict.insert (Node.value function.name) function env.currentModuleFunctions
     }
 
 

@@ -2448,20 +2448,15 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                             fnName =
                                 Node.value name
 
-                            -- Register in module functions (for recursive self-reference)
+                            -- Only update currentModuleFunctions (not the global
+                            -- functions dict) for recursive self-reference.
                             envWithFn : Env
                             envWithFn =
-                                Environment.addFunction env.currentModule implementation env
+                                Environment.addLocalFunction implementation env
                         in
-                        -- Store in env.values as a PartiallyApplied capturing the
-                        -- CURRENT env (definition-time). This ensures:
-                        -- 1. Correct lexical scoping: the closure captures the
-                        --    defining scope, not the call-site scope
-                        -- 2. Shadowing: values has higher lookup priority than
-                        --    currentModuleFunctions, so this shadows any
-                        --    module-level function with the same name
-                        -- 3. Prevents dynamic scoping: caller's values won't leak
-                        --    because the PA captures definition-time env
+                        -- Store in env.values as PartiallyApplied capturing the
+                        -- definition-time env. This ensures lexical scoping and
+                        -- prevents the caller's values from leaking through.
                         EvalResult.succeed <|
                             Environment.addValue fnName
                                 (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression))
