@@ -46,6 +46,7 @@ suite =
         , taskTests
         , bytesTests
         , tcoParserPatternTests
+        , letFunctionScopingTests
         ]
 
 
@@ -1385,4 +1386,97 @@ main = step 5 0
 
                     Err e ->
                         Expect.fail (Debug.toString e)
+        ]
+
+
+{-| Tests for let-function scoping: two let-defined functions with the same
+name in different nested scopes must not collide.
+-}
+letFunctionScopingTests : Test
+letFunctionScopingTests =
+    describe "Let-function scoping (same name in nested scopes)"
+        [ evalTestModule "two raise functions in nested let blocks"
+            -- Models the Review.Rule pattern: createProjectVisitor has a `raise`
+            -- that creates ProjectVisitor, and createModuleVisitor has a different
+            -- `raise` that creates ModuleVisitor. Both are in the same module.
+            -- The inner `raise` must shadow the outer in its own scope.
+            """module Temp exposing (main)
+
+type Visitor
+    = ProjectVisitor Int
+    | ModuleVisitor String
+
+createProjectVisitor : Int -> Visitor
+createProjectVisitor n =
+    let
+        raise x = ProjectVisitor x
+    in
+    raise n
+
+createModuleVisitor : String -> Visitor
+createModuleVisitor s =
+    let
+        raise x = ModuleVisitor x
+    in
+    raise s
+
+main =
+    case ( createProjectVisitor 42, createModuleVisitor "hello" ) of
+        ( ProjectVisitor n, ModuleVisitor s ) ->
+            String.fromInt n ++ " " ++ s
+
+        _ ->
+            "WRONG: got wrong visitor types"
+"""
+            String
+            "42 hello"
+        , evalTestModule "nested let blocks with same-named function used in closure"
+            -- The closure returned from outerFn captures the outer `process`.
+            -- The inner `process` in innerFn must not overwrite it.
+            """module Temp exposing (main)
+
+outerFn : Int -> (() -> Int)
+outerFn x =
+    let
+        process n = n * 10
+    in
+    \\() -> process x
+
+innerFn : Int -> Int
+innerFn x =
+    let
+        process n = n + 1
+    in
+    process x
+
+main =
+    let
+        closureFromOuter = outerFn 5
+    in
+    closureFromOuter () + innerFn 5
+"""
+            Int
+            56
+        , evalTestModule "three nested scopes with same let-function name"
+            """module Temp exposing (main)
+
+scope1 : Int
+scope1 =
+    let helper x = x * 2
+    in helper 10
+
+scope2 : Int
+scope2 =
+    let helper x = x + 100
+    in helper 10
+
+scope3 : Int
+scope3 =
+    let helper x = x - 5
+    in helper 10
+
+main = scope1 + scope2 + scope3
+"""
+            Int
+            135
         ]

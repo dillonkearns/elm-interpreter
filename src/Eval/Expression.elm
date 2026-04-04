@@ -2647,19 +2647,36 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                             arity =
                                 List.length implementation.arguments
 
-                            -- Register in currentModuleFunctions for self-recursion
-                            envWithFn : Env
-                            envWithFn =
+                            -- The CLOSURE env stores the function in BOTH:
+                            -- 1. currentModuleFunctions (for backward compat with
+                            --    evalQualifiedOrVariant lookup path)
+                            -- 2. values (survives callNoStack reset of currentModuleFunctions,
+                            --    enabling self-recursion even when currentModuleFunctions
+                            --    is reset to the module's original dict)
+                            envWithFnInModFunctions : Env
+                            envWithFnInModFunctions =
                                 Environment.addLocalFunction implementation env
+
+                            -- Create a placeholder PA for the values entry
+                            -- (captures env with self in currentModuleFunctions)
+                            pa : Value
+                            pa =
+                                PartiallyApplied envWithFnInModFunctions [] implementation.arguments Nothing (AstImpl implementation.expression) arity
+
+                            -- Closure env: self in both currentModuleFunctions AND values
+                            closureEnv : Env
+                            closureEnv =
+                                Environment.addValue fnName pa envWithFnInModFunctions
+
+                            -- Final PA captures closureEnv (has self in both places)
+                            paFinal : Value
+                            paFinal =
+                                PartiallyApplied closureEnv [] implementation.arguments Nothing (AstImpl implementation.expression) arity
                         in
-                        -- Also store in env.values for correct lexical scoping.
-                        -- values has higher lookup priority, so this shadows any
-                        -- previously-registered function with the same name in
-                        -- currentModuleFunctions (fixing the two-raise bug in Review.Rule).
+                        -- The RETURNED env gets the function in values only,
+                        -- with currentModuleFunctions UNCHANGED from the input env.
                         EvalResult.succeed <|
-                            Environment.addValue fnName
-                                (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) arity)
-                                envWithFn
+                            Environment.addValue fnName paFinal env
 
                     else
                         evalExpression expression cfg env
