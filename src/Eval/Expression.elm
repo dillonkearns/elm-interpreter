@@ -1373,12 +1373,13 @@ call maybeQualifiedName implementation cfg env =
                             tcoCfg =
                                 { cfg | tcoTarget = Just qualifiedName.name }
 
-                            -- TCO iteration limit: use 10x maxSteps (since each TCO iteration
-                            -- is much cheaper than a trampoline step), or 1M as safety net
+                            -- TCO iteration limit based on maxSteps.
+                            -- One tcoLoop iteration ≈ one function call, which is
+                            -- the unit of work the step limit is meant to bound.
                             limit =
                                 case cfg.maxSteps of
                                     Just n ->
-                                        n * 10
+                                        n
 
                                     Nothing ->
                                         1000000

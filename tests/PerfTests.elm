@@ -91,17 +91,17 @@ If TCO IS engaging, the step budget is sufficient and they pass.
 tcoProofTests : Test
 tcoProofTests =
     describe "TCO proof (step-budget bounded)"
-        [ test "module-level countdown 10000 within 5000 steps" <|
-            -- Without TCO: ~60-80k trampoline steps for 10000 iterations
-            -- With TCO: tcoLoop bypasses the trampoline entirely, ~0 steps
+        [ test "module-level countdown 100000 within 110000 steps" <|
+            -- Without TCO: ~200k+ trampoline steps for 100k iterations
+            -- With TCO: 100k tcoLoop iterations + small startup
             \_ ->
                 let
                     source =
-                        "module T exposing (main)\ncountdown n = if n <= 0 then 0 else countdown (n - 1)\nmain = countdown 10000"
+                        "module T exposing (main)\ncountdown n = if n <= 0 then 0 else countdown (n - 1)\nmain = countdown 100000"
                 in
                 case Eval.Module.buildProjectEnv [] of
                     Ok env ->
-                        Eval.Module.evalWithEnvAndLimit (Just 5000)
+                        Eval.Module.evalWithEnvAndLimit (Just 110000)
                             env
                             [ source ]
                             (Expression.FunctionOrValue [] "main")
@@ -109,35 +109,35 @@ tcoProofTests =
 
                     Err e ->
                         Expect.fail (Debug.toString e)
-        , test "module-level accumulator sum 5000 within 5000 steps" <|
+        , test "module-level accumulator sum 50000 within 55000 steps" <|
             \_ ->
                 let
                     source =
-                        "module T exposing (main)\nmySum acc n = if n <= 0 then acc else mySum (acc + n) (n - 1)\nmain = mySum 0 5000"
+                        "module T exposing (main)\nmySum acc n = if n <= 0 then acc else mySum (acc + n) (n - 1)\nmain = mySum 0 50000"
                 in
                 case Eval.Module.buildProjectEnv [] of
                     Ok env ->
-                        Eval.Module.evalWithEnvAndLimit (Just 5000)
+                        Eval.Module.evalWithEnvAndLimit (Just 55000)
                             env
                             [ source ]
                             (Expression.FunctionOrValue [] "main")
-                            |> Expect.equal (Ok (Int 12502500))
+                            |> Expect.equal (Ok (Int 1250025000))
 
                     Err e ->
                         Expect.fail (Debug.toString e)
-        , test "module-level list build 3000 within 5000 steps" <|
+        , test "module-level list build 30000 within 35000 steps" <|
             \_ ->
                 let
                     source =
-                        "module T exposing (main)\nbuild acc n = if n <= 0 then acc else build (n :: acc) (n - 1)\nmain = List.length (build [] 3000)"
+                        "module T exposing (main)\nbuild acc n = if n <= 0 then acc else build (n :: acc) (n - 1)\nmain = List.length (build [] 30000)"
                 in
                 case Eval.Module.buildProjectEnv [] of
                     Ok env ->
-                        Eval.Module.evalWithEnvAndLimit (Just 5000)
+                        Eval.Module.evalWithEnvAndLimit (Just 35000)
                             env
                             [ source ]
                             (Expression.FunctionOrValue [] "main")
-                            |> Expect.equal (Ok (Int 3000))
+                            |> Expect.equal (Ok (Int 30000))
 
                     Err e ->
                         Expect.fail (Debug.toString e)
@@ -167,4 +167,89 @@ tcoProofTests =
                 Eval.eval
                     "let fib n = if n <= 1 then n else fib (n - 1) + fib (n - 2) in fib 10"
                     |> Expect.equal (Ok (Int 55))
+
+        -- === Let-defined self-recursion (TCO proof) ===
+        , test "let-defined countdown 100000 within 110000 steps" <|
+            -- Without TCO: needs ~200k+ trampoline steps (2+ per iteration)
+            -- With TCO: needs 100k tcoLoop iterations + small trampoline startup
+            -- 110000 proves TCO is engaging (impossible with 2+ steps/iter)
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = let countdown n = if n <= 0 then 0 else countdown (n - 1) in countdown 100000"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 110000)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 0))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "let-defined accumulator 50000 within 55000 steps" <|
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = let mySum acc n = if n <= 0 then acc else mySum (acc + n) (n - 1) in mySum 0 50000"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 55000)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 1250025000))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "let non-tail-recursive fib still correct" <|
+            \_ ->
+                Eval.evalWithMaxSteps (Just 50000)
+                    "let fib n = if n <= 1 then n else fib (n - 1) + fib (n - 2) in fib 10"
+                    |> Expect.equal (Ok (Int 55))
+
+        -- === Mutual recursion (TCO proof) ===
+        , test "module-level mutual recursion isEven/isOdd 100000 within 110000 steps" <|
+            -- Without TCO: 100k mutual calls need ~200k+ trampoline steps
+            -- With TCO (via chained tcoLoops): each call = 1 iteration
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nisEven n = if n == 0 then True else isOdd (n - 1)\nisOdd n = if n == 0 then False else isEven (n - 1)\nmain = isEven 100000"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 110000)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Bool True))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "module-level mutual recursion correctness (odd input)" <|
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nisEven n = if n == 0 then True else isOdd (n - 1)\nisOdd n = if n == 0 then False else isEven (n - 1)\nmain = isEven 100001"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 110000)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Bool False))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+
+        -- === Pipe operators should NOT get TCO (per Elm compiler) ===
+        , test "pipe operator is not tail-optimized but still correct" <|
+            \_ ->
+                Eval.eval
+                    "let f n = if n <= 0 then 0 else (n - 1) |> f in f 100"
+                    |> Expect.equal (Ok (Int 0))
         ]
