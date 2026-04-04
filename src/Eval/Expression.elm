@@ -2521,19 +2521,42 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                             fnName =
                                 Node.value name
 
-                            -- Only update currentModuleFunctions (not the global
-                            -- functions dict) for recursive self-reference.
-                            envWithFn : Env
-                            envWithFn =
-                                Environment.addLocalFunction implementation env
+                            -- Check if the function body references itself
+                            -- (excluding parameter names which shadow outer scope).
+                            isSelfRecursive : Bool
+                            isSelfRecursive =
+                                Set.member fnName
+                                    (Set.diff (freeVariables implementation.expression)
+                                        (List.foldl (\p -> Set.union (patternDefinedVariables p))
+                                            Set.empty
+                                            implementation.arguments
+                                        )
+                                    )
                         in
-                        -- Store in env.values as PartiallyApplied capturing the
-                        -- definition-time env. This ensures lexical scoping and
-                        -- prevents the caller's values from leaking through.
-                        EvalResult.succeed <|
-                            Environment.addValue fnName
-                                (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) (List.length implementation.arguments))
-                                envWithFn
+                        if isSelfRecursive then
+                            -- Recursive: register in currentModuleFunctions so the
+                            -- body can find itself, then capture that env.
+                            let
+                                envWithFn : Env
+                                envWithFn =
+                                    Environment.addLocalFunction implementation env
+
+                                arity : Int
+                                arity =
+                                    List.length implementation.arguments
+                            in
+                            EvalResult.succeed <|
+                                Environment.addValue fnName
+                                    (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) arity)
+                                    envWithFn
+
+                        else
+                            -- Non-recursive: skip addLocalFunction entirely.
+                            -- Just store in values with the current env as closure.
+                            EvalResult.succeed <|
+                                Environment.addValue fnName
+                                    (PartiallyApplied env [] implementation.arguments Nothing (AstImpl implementation.expression) (List.length implementation.arguments))
+                                    env
 
                     else
                         evalExpression expression cfg env
