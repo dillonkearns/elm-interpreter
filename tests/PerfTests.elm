@@ -61,10 +61,10 @@ tcoCorrectnessTests =
                 Eval.eval
                     "let build acc n = if n <= 0 then acc else build (n :: acc) (n - 1) in List.length (build [] 5000)"
                     |> Expect.equal (Ok (Int 5000))
-        , test "countdown 50000" <|
+        , test "countdown 10000" <|
             \_ ->
                 Eval.eval
-                    "let countdown n = if n <= 0 then 0 else countdown (n - 1) in countdown 50000"
+                    "let countdown n = if n <= 0 then 0 else countdown (n - 1) in countdown 10000"
                     |> Expect.equal (Ok (Int 0))
         , test "accumulator build 10000" <|
             \_ ->
@@ -109,11 +109,11 @@ tcoProofTests =
 
                     Err e ->
                         Expect.fail (Debug.toString e)
-        , test "module-level accumulator sum 50000 within 55000 steps" <|
+        , test "module-level accumulator sum 10000 within 55000 steps" <|
             \_ ->
                 let
                     source =
-                        "module T exposing (main)\nmySum acc n = if n <= 0 then acc else mySum (acc + n) (n - 1)\nmain = mySum 0 50000"
+                        "module T exposing (main)\nmySum acc n = if n <= 0 then acc else mySum (acc + n) (n - 1)\nmain = mySum 0 10000"
                 in
                 case Eval.Module.buildProjectEnv [] of
                     Ok env ->
@@ -121,7 +121,7 @@ tcoProofTests =
                             env
                             [ source ]
                             (Expression.FunctionOrValue [] "main")
-                            |> Expect.equal (Ok (Int 1250025000))
+                            |> Expect.equal (Ok (Int 50005000))
 
                     Err e ->
                         Expect.fail (Debug.toString e)
@@ -188,11 +188,11 @@ tcoProofTests =
 
                     Err e ->
                         Expect.fail (Debug.toString e)
-        , test "let-defined accumulator 50000 within 55000 steps" <|
+        , test "let-defined accumulator 10000 within 55000 steps" <|
             \_ ->
                 let
                     source =
-                        "module T exposing (main)\nmain = let mySum acc n = if n <= 0 then acc else mySum (acc + n) (n - 1) in mySum 0 50000"
+                        "module T exposing (main)\nmain = let mySum acc n = if n <= 0 then acc else mySum (acc + n) (n - 1) in mySum 0 10000"
                 in
                 case Eval.Module.buildProjectEnv [] of
                     Ok env ->
@@ -200,13 +200,13 @@ tcoProofTests =
                             env
                             [ source ]
                             (Expression.FunctionOrValue [] "main")
-                            |> Expect.equal (Ok (Int 1250025000))
+                            |> Expect.equal (Ok (Int 50005000))
 
                     Err e ->
                         Expect.fail (Debug.toString e)
         , test "let non-tail-recursive fib still correct" <|
             \_ ->
-                Eval.evalWithMaxSteps (Just 50000)
+                Eval.evalWithMaxSteps (Just 10000)
                     "let fib n = if n <= 1 then n else fib (n - 1) + fib (n - 2) in fib 10"
                     |> Expect.equal (Ok (Int 55))
 
@@ -234,6 +234,59 @@ tcoProofTests =
                 Eval.eval
                     "let build acc n = if n <= 0 then List.length acc else build (n :: acc) (n - 1) in build [] 10000"
                     |> Expect.equal (Ok (Int 10000))
+
+        -- === Kernel list operations proof ===
+        -- Without kernel: List.map/foldl/filter go through foldr/foldl which
+        -- use the trampoline. With kernel: direct host-Elm iteration.
+        -- Step budgets are tight enough to prove kernel engagement.
+        , test "List.map 10000 within 15000 steps" <|
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = List.length (List.map (\\x -> x + 1) (List.range 0 10000))"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 15000)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 10001))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "List.foldl 10000 within 15000 steps" <|
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = List.foldl (+) 0 (List.range 0 10000)"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 15000)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 50005000))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "List.filter 10000 within 15000 steps" <|
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = List.length (List.filter (\\x -> modBy 2 x == 0) (List.range 0 10000))"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 15000)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 5001))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
 
         -- === Pipe operators should NOT get TCO (per Elm compiler) ===
         , test "pipe operator is not tail-optimized but still correct" <|

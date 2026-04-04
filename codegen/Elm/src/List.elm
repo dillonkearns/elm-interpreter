@@ -122,7 +122,7 @@ So `map func [ a, b, c ]` is the same as `[ func a, func b, func c ]`
 -}
 map : (a -> b) -> List a -> List b
 map f xs =
-  foldr (\x acc -> cons (f x) acc) [] xs
+  Elm.Kernel.List.map f xs
 
 
 {-| Same as `map` but the function is also applied to the index of each
@@ -149,12 +149,7 @@ So `foldl step state [1,2,3]` is like saying:
 -}
 foldl : (a -> b -> b) -> b -> List a -> b
 foldl func acc list =
-  case list of
-    [] ->
-      acc
-
-    x :: xs ->
-      foldl func (func x acc) xs
+  Elm.Kernel.List.foldl func acc list
 
 
 {-| Reduce a list from the right.
@@ -212,7 +207,7 @@ foldrHelper fn acc ctr ls =
 -}
 filter : (a -> Bool) -> List a -> List a
 filter isGood list =
-  foldr (\x xs -> if isGood x then cons x xs else xs) [] list
+  Elm.Kernel.List.filter isGood list
 
 
 {-| Filter out certain values. For example, maybe you have a bunch of strings

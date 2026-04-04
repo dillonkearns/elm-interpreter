@@ -1,4 +1,4 @@
-module Kernel.List exposing (range, sortBy, sortWith)
+module Kernel.List exposing (filter, foldl, map, range, sortBy, sortWith)
 
 {-| Native kernel implementations for List sorting.
 
@@ -10,7 +10,83 @@ insertion sort that correctly preserves the relative order of equal elements.
 
 import EvalResult
 import Kernel.Utils
-import Types exposing (Eval, Value(..))
+import Types exposing (Eval, EvalResult(..), Value(..))
+import Value
+
+
+{-| Kernel List.map: applies a function to every element.
+Iterates in host Elm, calling the interpreter function per element.
+-}
+map : (Value -> Eval Value) -> List Value -> Eval (List Value)
+map f xs cfg env =
+    mapHelp f xs [] cfg env
+
+
+mapHelp : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
+mapHelp f remaining acc cfg env =
+    case remaining of
+        [] ->
+            EvalResult.succeed (List.reverse acc)
+
+        x :: rest ->
+            case EvalResult.toResult (f x cfg env) of
+                Ok mapped ->
+                    mapHelp f rest (mapped :: acc) cfg env
+
+                Err e ->
+                    EvErr e
+
+
+{-| Kernel List.foldl: reduces a list from the left.
+-}
+foldl : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
+foldl f init xs cfg env =
+    foldlHelp f init xs cfg env
+
+
+foldlHelp : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
+foldlHelp f acc remaining cfg env =
+    case remaining of
+        [] ->
+            EvalResult.succeed acc
+
+        x :: rest ->
+            case EvalResult.toResult (f x cfg env) of
+                Err e ->
+                    EvErr e
+
+                Ok g ->
+                    case EvalResult.toResult (g acc cfg env) of
+                        Err e ->
+                            EvErr e
+
+                        Ok newAcc ->
+                            foldlHelp f newAcc rest cfg env
+
+
+{-| Kernel List.filter: keeps elements where the predicate returns True.
+-}
+filter : (Value -> Eval Bool) -> List Value -> Eval (List Value)
+filter pred xs cfg env =
+    filterHelp pred xs [] cfg env
+
+
+filterHelp : (Value -> Eval Bool) -> List Value -> List Value -> Eval (List Value)
+filterHelp pred remaining acc cfg env =
+    case remaining of
+        [] ->
+            EvalResult.succeed (List.reverse acc)
+
+        x :: rest ->
+            case EvalResult.toResult (pred x cfg env) of
+                Err e ->
+                    EvErr e
+
+                Ok True ->
+                    filterHelp pred rest (x :: acc) cfg env
+
+                Ok False ->
+                    filterHelp pred rest acc cfg env
 
 
 {-| Direct implementation of List.range. Produces the list without going
