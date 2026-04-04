@@ -28,11 +28,10 @@ addValue name value env =
     { currentModule = env.currentModule
     , currentModuleKey = env.currentModuleKey
     , callStack = env.callStack
-    , functions = env.functions
+    , shared = env.shared
     , currentModuleFunctions = env.currentModuleFunctions
     , values = Dict.insert name value env.values
     , imports = env.imports
-    , moduleImports = env.moduleImports
     , callDepth = env.callDepth
     , recursionCheck = env.recursionCheck
     }
@@ -45,11 +44,10 @@ replaceValues newValues env =
     { currentModule = env.currentModule
     , currentModuleKey = env.currentModuleKey
     , callStack = env.callStack
-    , functions = env.functions
+    , shared = env.shared
     , currentModuleFunctions = env.currentModuleFunctions
     , values = newValues
     , imports = env.imports
-    , moduleImports = env.moduleImports
     , callDepth = env.callDepth
     , recursionCheck = env.recursionCheck
     }
@@ -89,14 +87,17 @@ addFunction moduleName function env =
 
             else
                 Maybe.withDefault Dict.empty
-                    (Dict.get key env.functions)
+                    (Dict.get key env.shared.functions)
 
         newInner : Dict.Dict String FunctionImplementation
         newInner =
             Dict.insert funcName function currentInner
     in
     { env
-        | functions = Dict.insert key newInner env.functions
+        | shared =
+            { functions = Dict.insert key newInner env.shared.functions
+            , moduleImports = env.shared.moduleImports
+            }
         , currentModuleFunctions =
             if isCurrentModule then
                 newInner
@@ -111,11 +112,10 @@ with newValues old =
     { currentModule = old.currentModule
     , currentModuleKey = old.currentModuleKey
     , callStack = old.callStack
-    , functions = old.functions
+    , shared = old.shared
     , currentModuleFunctions = old.currentModuleFunctions
     , values = Dict.union newValues old.values
     , imports = old.imports
-    , moduleImports = old.moduleImports
     , callDepth = old.callDepth
     , recursionCheck = old.recursionCheck
     }
@@ -129,11 +129,10 @@ withBindings bindings old =
     { currentModule = old.currentModule
     , currentModuleKey = old.currentModuleKey
     , callStack = old.callStack
-    , functions = old.functions
+    , shared = old.shared
     , currentModuleFunctions = old.currentModuleFunctions
     , values = List.foldl (\( k, v ) acc -> Dict.insert k v acc) old.values bindings
     , imports = old.imports
-    , moduleImports = old.moduleImports
     , callDepth = old.callDepth
     , recursionCheck = old.recursionCheck
     }
@@ -144,11 +143,10 @@ empty moduleName =
     { currentModule = moduleName
     , currentModuleKey = moduleKey moduleName
     , callStack = []
-    , functions = Dict.empty
+    , shared = { functions = Dict.empty, moduleImports = Dict.empty }
     , currentModuleFunctions = Dict.empty
     , values = Dict.empty
     , imports = emptyImports
-    , moduleImports = Dict.empty
     , callDepth = 0
     , recursionCheck = Nothing
     }
@@ -178,13 +176,12 @@ callKernel moduleName name env =
     , callStack =
         { moduleName = moduleName, name = name }
             :: env.callStack
-    , functions = env.functions
+    , shared = env.shared
     , currentModuleFunctions =
-        Dict.get key env.functions
+        Dict.get key env.shared.functions
             |> Maybe.withDefault Dict.empty
     , values = env.values
     , imports = env.imports
-    , moduleImports = env.moduleImports
     , callDepth = env.callDepth + 1
     , recursionCheck = env.recursionCheck
     }
@@ -203,11 +200,10 @@ call moduleName name env =
         , callStack =
             { moduleName = moduleName, name = name }
                 :: env.callStack
-        , functions = env.functions
+        , shared = env.shared
         , currentModuleFunctions = env.currentModuleFunctions
         , values = env.values
         , imports = env.imports
-        , moduleImports = env.moduleImports
         , callDepth = env.callDepth + 1
         , recursionCheck = env.recursionCheck
         }
@@ -218,15 +214,14 @@ call moduleName name env =
         , callStack =
             { moduleName = moduleName, name = name }
                 :: env.callStack
-        , functions = env.functions
+        , shared = env.shared
         , currentModuleFunctions =
-            Dict.get key env.functions
+            Dict.get key env.shared.functions
                 |> Maybe.withDefault Dict.empty
         , values = env.values
         , imports =
-            Dict.get key env.moduleImports
+            Dict.get key env.shared.moduleImports
                 |> Maybe.withDefault env.imports
-        , moduleImports = env.moduleImports
         , callDepth = env.callDepth + 1
         , recursionCheck = env.recursionCheck
         }
@@ -244,13 +239,12 @@ callKernelNoStack moduleName _ env =
     { currentModule = moduleName
     , currentModuleKey = key
     , callStack = env.callStack
-    , functions = env.functions
+    , shared = env.shared
     , currentModuleFunctions =
-        Dict.get key env.functions
+        Dict.get key env.shared.functions
             |> Maybe.withDefault Dict.empty
     , values = env.values
     , imports = env.imports
-    , moduleImports = env.moduleImports
     , callDepth = env.callDepth
     , recursionCheck = env.recursionCheck
     }
@@ -272,15 +266,14 @@ callNoStack moduleName _ env =
         { currentModule = moduleName
         , currentModuleKey = key
         , callStack = env.callStack
-        , functions = env.functions
+        , shared = env.shared
         , currentModuleFunctions =
-            Dict.get key env.functions
+            Dict.get key env.shared.functions
                 |> Maybe.withDefault Dict.empty
         , values = env.values
         , imports =
-            Dict.get key env.moduleImports
+            Dict.get key env.shared.moduleImports
                 |> Maybe.withDefault env.imports
-        , moduleImports = env.moduleImports
         , callDepth = env.callDepth + 1
         , recursionCheck = env.recursionCheck
         }

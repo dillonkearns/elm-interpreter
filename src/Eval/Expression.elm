@@ -1927,7 +1927,7 @@ findRecordAliasConstructor moduleName name env =
                 Dict.get name env.currentModuleFunctions
 
             else
-                Dict.get resolvedModuleKey env.functions
+                Dict.get resolvedModuleKey env.shared.functions
                     |> Maybe.andThen (Dict.get name)
     in
     maybeFunc
@@ -2035,7 +2035,7 @@ evalNonVariant moduleName name cfg env =
                                 -- in evalQualifiedOrVariant, so go straight to imports.
                                 case Dict.get name env.imports.exposedValues of
                                     Just ( sourceModule, sourceModuleKey ) ->
-                                        Dict.get sourceModuleKey env.functions
+                                        Dict.get sourceModuleKey env.shared.functions
                                             |> Maybe.andThen (Dict.get name)
                                             |> Maybe.map (\f -> ( sourceModule, sourceModuleKey, f ))
 
@@ -2049,7 +2049,7 @@ evalNonVariant moduleName name cfg env =
                                         Environment.moduleKey moduleName
                                 in
                                 -- Try direct lookup first (common case: module not aliased)
-                                case Dict.get moduleNameKey env.functions of
+                                case Dict.get moduleNameKey env.shared.functions of
                                     Just moduleDict ->
                                         case Dict.get name moduleDict of
                                             Just f ->
@@ -2060,7 +2060,7 @@ evalNonVariant moduleName name cfg env =
                                                 -- Could be aliased to a different module.
                                                 case Dict.get moduleNameKey env.imports.aliases of
                                                     Just ( canonical, canonicalKey ) ->
-                                                        Dict.get canonicalKey env.functions
+                                                        Dict.get canonicalKey env.shared.functions
                                                             |> Maybe.andThen (Dict.get name)
                                                             |> Maybe.map (\f -> ( canonical, canonicalKey, f ))
 
@@ -2071,7 +2071,7 @@ evalNonVariant moduleName name cfg env =
                                         -- Module not found directly; try alias resolution
                                         case Dict.get moduleNameKey env.imports.aliases of
                                             Just ( canonical, canonicalKey ) ->
-                                                Dict.get canonicalKey env.functions
+                                                Dict.get canonicalKey env.shared.functions
                                                     |> Maybe.andThen (Dict.get name)
                                                     |> Maybe.map (\f -> ( canonical, canonicalKey, f ))
 
@@ -2124,15 +2124,14 @@ evalNonVariant moduleName name cfg env =
 
                                             else
                                                 env.callStack
-                                        , functions = env.functions
+                                        , shared = env.shared
                                         , currentModuleFunctions =
-                                            Dict.get resolvedModuleKey env.functions
+                                            Dict.get resolvedModuleKey env.shared.functions
                                                 |> Maybe.withDefault Dict.empty
                                         , values = Dict.empty
                                         , imports =
-                                            Dict.get resolvedModuleKey env.moduleImports
+                                            Dict.get resolvedModuleKey env.shared.moduleImports
                                                 |> Maybe.withDefault env.imports
-                                        , moduleImports = env.moduleImports
                                         , callDepth = env.callDepth + 1
                                         , recursionCheck = env.recursionCheck
                                         }
@@ -2342,7 +2341,7 @@ evalKernelFunctionFromAst moduleName name cfg env =
 
 evalKernelFunctionFromAstWithKey : String -> ModuleName -> String -> PartialEval Value
 evalKernelFunctionFromAstWithKey key moduleName name cfg env =
-    case Dict.get key env.functions of
+    case Dict.get key env.shared.functions of
         Nothing ->
             evalKernelFunctionWithKey key moduleName name cfg env
 
@@ -2769,11 +2768,11 @@ evalOperator opName cfg env =
                                 | currentModule = resolvedRef.moduleName
                                 , currentModuleKey = Environment.moduleKey resolvedRef.moduleName
                                 , currentModuleFunctions =
-                                    Dict.get (Environment.moduleKey resolvedRef.moduleName) env.functions
+                                    Dict.get (Environment.moduleKey resolvedRef.moduleName) env.shared.functions
                                         |> Maybe.withDefault Dict.empty
                                 , values = Dict.empty
                                 , imports =
-                                    Dict.get (Environment.moduleKey resolvedRef.moduleName) env.moduleImports
+                                    Dict.get (Environment.moduleKey resolvedRef.moduleName) env.shared.moduleImports
                                         |> Maybe.withDefault env.imports
                               }
                             )

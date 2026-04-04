@@ -116,15 +116,20 @@ type Implementation
     | KernelImpl ModuleName String (List Value -> Eval Value)
 
 
+type alias SharedContext =
+    { functions : Dict String (Dict String FunctionImplementation)
+    , moduleImports : Dict String ImportedNames
+    }
+
+
 type alias Env =
     { currentModule : ModuleName
     , currentModuleKey : String
-    , functions : Dict String (Dict String FunctionImplementation)
+    , shared : SharedContext
     , currentModuleFunctions : Dict String FunctionImplementation
     , values : EnvValues
     , callStack : List QualifiedNameRef
     , imports : ImportedNames
-    , moduleImports : Dict String ImportedNames
     , callDepth : Int
     , recursionCheck : Maybe (Dict String { fingerprint : Int, depth : Int, count : Int, size : Int, growCount : Int, argSizes : List Int, argFingerprints : List Int })
     }

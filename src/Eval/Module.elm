@@ -199,11 +199,10 @@ buildProjectEnvFromParsed parsedModules =
                         { currentModule = []
                         , currentModuleKey = ""
                         , callStack = []
-                        , functions = coreFunctions
+                        , shared = { functions = coreFunctions, moduleImports = Dict.empty }
                         , currentModuleFunctions = Dict.empty
                         , values = Dict.empty
                         , imports = emptyImports
-                        , moduleImports = Dict.empty
                         , callDepth = 0
                         , recursionCheck = Nothing
                         }
@@ -225,10 +224,10 @@ This is the incremental env building primitive: given a base env built from all
 modules, and a new version of one module, produce an updated env with only that
 module's declarations replaced. All other modules remain untouched.
 
-The key insight: `buildModuleEnv` adds declarations to `env.functions` keyed by
+The key insight: `buildModuleEnv` adds declarations to `env.shared.functions` keyed by
 module name. Replacing a module means:
 
-1.  Remove all function entries under the old module's key from env.functions
+1.  Remove all function entries under the old module's key from env.shared.functions
 2.  Remove the old module's import table from env.moduleImports
 3.  Re-run buildModuleEnv for the new module only
 4.  Update allInterfaces with the new module's interface
@@ -251,26 +250,19 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
         modKey =
             Environment.moduleKey newModule.moduleName
 
-        -- Remove the old module's functions from the env
-        cleanedFunctions : Dict.Dict String (Dict.Dict String Elm.Syntax.Expression.FunctionImplementation)
-        cleanedFunctions =
-            Dict.remove modKey projectEnv.env.functions
-
-        -- Remove the old module's import table
-        cleanedModuleImports : Dict.Dict String Types.ImportedNames
-        cleanedModuleImports =
-            Dict.remove modKey projectEnv.env.moduleImports
-
+        -- Remove the old module's functions and import table
         cleanedEnv : Env
         cleanedEnv =
             { currentModule = projectEnv.env.currentModule
             , currentModuleKey = projectEnv.env.currentModuleKey
             , callStack = projectEnv.env.callStack
-            , functions = cleanedFunctions
+            , shared =
+                { functions = Dict.remove modKey projectEnv.env.shared.functions
+                , moduleImports = Dict.remove modKey projectEnv.env.shared.moduleImports
+                }
             , currentModuleFunctions = projectEnv.env.currentModuleFunctions
             , values = projectEnv.env.values
             , imports = projectEnv.env.imports
-            , moduleImports = cleanedModuleImports
             , callDepth = projectEnv.env.callDepth
             , recursionCheck = projectEnv.env.recursionCheck
             }
@@ -404,7 +396,7 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                                 | currentModule = lastModule
                                 , currentModuleKey = lastModuleKey
                                 , currentModuleFunctions =
-                                    Dict.get lastModuleKey env.functions
+                                    Dict.get lastModuleKey env.shared.functions
                                         |> Maybe.withDefault Dict.empty
                                 , imports = finalImports
                             }
@@ -489,7 +481,7 @@ evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles ex
                         | currentModule = lastModule
                         , currentModuleKey = lastModuleKey
                         , currentModuleFunctions =
-                            Dict.get lastModuleKey env.functions
+                            Dict.get lastModuleKey env.shared.functions
                                 |> Maybe.withDefault Dict.empty
                         , imports = finalImports
                     }
@@ -638,7 +630,7 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                                 | currentModule = lastModule
                                 , currentModuleKey = lastModuleKey
                                 , currentModuleFunctions =
-                                    Dict.get lastModuleKey env.functions
+                                    Dict.get lastModuleKey env.shared.functions
                                         |> Maybe.withDefault Dict.empty
                                 , imports = finalImports
                             }
@@ -679,11 +671,10 @@ buildInitialEnv file =
             { currentModule = moduleName
             , currentModuleKey = Environment.moduleKey moduleName
             , callStack = []
-            , functions = coreFunctions
+            , shared = { functions = coreFunctions, moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports }
             , currentModuleFunctions = Dict.empty
             , values = Dict.empty
             , imports = imports
-            , moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports
             , callDepth = 0
             , recursionCheck = Nothing
             }
@@ -959,11 +950,10 @@ evalProject sources expression =
                                 { currentModule = []
                                 , currentModuleKey = ""
                                 , callStack = []
-                                , functions = coreFunctions
+                                , shared = { functions = coreFunctions, moduleImports = Dict.empty }
                                 , currentModuleFunctions = Dict.empty
                                 , values = Dict.empty
                                 , imports = emptyImports
-                                , moduleImports = Dict.empty
                                 , callDepth = 0
                                 , recursionCheck = Nothing
                                 }
@@ -1012,7 +1002,7 @@ evalProject sources expression =
                                 | currentModule = lastModule
                                 , currentModuleKey = lastModuleKey
                                 , currentModuleFunctions =
-                                    Dict.get lastModuleKey env.functions
+                                    Dict.get lastModuleKey env.shared.functions
                                         |> Maybe.withDefault Dict.empty
                                 , imports = finalImports
                             }
@@ -1047,7 +1037,7 @@ buildModuleEnv allInterfaces { file, moduleName } env =
 
         envWithModuleImports : Env
         envWithModuleImports =
-            { env | moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.moduleImports }
+            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports } }
 
         addDeclaration : Node Declaration -> Env -> Result Error Env
         addDeclaration (Node _ decl) envAcc =
