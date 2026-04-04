@@ -1172,6 +1172,186 @@ main = parseLoop consume (List.range 1 300) 0
 """
             Int
             45150
+        , test "sequential record-returning functions with recursive sub-call" <|
+            -- Models ParserFast.map4: sequences 4 record-returning functions,
+            -- the last of which contains a recursive sub-call. If TCO corrupts
+            -- the return value, .field access on the result would fail with
+            -- "Trying to access a field on a non-record value".
+            \_ ->
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnv env
+                            [ """module Parser exposing (run)
+
+type Step = Done Int | Loop Int
+
+loop : (Int -> Step) -> Int -> Int
+loop stepper state =
+    case stepper state of
+        Done val -> val
+        Loop newState -> loop stepper newState
+
+parse : String -> { value : Int, rest : String }
+parse input =
+    let
+        len = loop (\\n -> if n >= String.length input then Done n else if Char.isDigit (Maybe.withDefault ' ' (List.head (String.toList (String.dropLeft n input)))) then Loop (n + 1) else Done n) 0
+    in
+    { value = len, rest = String.dropLeft len input }
+
+run : String -> { a : Int, b : Int }
+run input =
+    let
+        r1 = parse input
+        r2 = parse r1.rest
+    in
+    { a = r1.value, b = r2.value }
+"""
+                            , """module Main exposing (main)
+
+import Parser
+
+main = let result = Parser.run "123abc" in result.a + result.b
+"""
+                            ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 3))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "parse function application expression via Elm.Parser pattern" <|
+            -- Simulates the parser pattern that fails on Debug.log "test" 42.
+            -- A map4 function sequences 4 parsers, the 4th of which is recursive.
+            -- If TCO corrupts the recursive parser's return value, the record
+            -- field access on the map4 result would fail.
+            \_ ->
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnv env
+                            [ """module Main exposing (main)
+
+type PStep a = Good a Int | Bad
+
+parseA : Int -> PStep String
+parseA s = Good "module" (s + 7)
+
+parseB : Int -> PStep String
+parseB s = Good "import" (s + 6)
+
+parseC : Int -> PStep (List Int)
+parseC s = Good [1, 2] (s + 3)
+
+-- Simulates loopWhileSucceedsHelp pattern: recursive with growing accumulator
+loopHelper : (Int -> PStep String) -> List String -> Int -> PStep (List String)
+loopHelper parseEl soFar s0 =
+    case parseEl s0 of
+        Good elResult s1 ->
+            loopHelper parseEl (elResult :: soFar) s1
+        Bad ->
+            Good (List.reverse soFar) s0
+
+simpleExprParser : Int -> PStep String
+simpleExprParser s =
+    if s < 50 then
+        Good ("expr" ++ String.fromInt s) (s + 5)
+    else
+        Bad
+
+map4 : (a -> b -> c -> d -> e) -> (Int -> PStep a) -> (Int -> PStep b) -> (Int -> PStep c) -> (Int -> PStep d) -> Int -> PStep e
+map4 f pa pb pc pd s0 =
+    case pa s0 of
+        Bad -> Bad
+        Good a s1 ->
+            case pb s1 of
+                Bad -> Bad
+                Good b s2 ->
+                    case pc s2 of
+                        Bad -> Bad
+                        Good c s3 ->
+                            case pd s3 of
+                                Bad -> Bad
+                                Good d s4 -> Good (f a b c d) s4
+
+main =
+    let
+        exprParser = loopHelper simpleExprParser
+    in
+    case map4 (\\a b c d -> { modu = a, imp = b, decls = c, expr = d }) parseA parseB parseC (\\s -> exprParser [] s) 0 of
+        Good r _ -> r.modu
+        Bad -> "failed"
+"""
+                            ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (String "module"))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "tcoTarget leak: non-TCO call inside tcoLoop" <|
+            -- Module has tail-recursive `helper` and non-tail-recursive `transform`.
+            -- `transform` calls a function ALSO named `helper` (different module).
+            -- If tcoTarget leaks through non-TCO calls, Inner.helper would
+            -- falsely trigger TailCall for Main.helper's tcoLoop.
+            \_ ->
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnv env
+                            [ """module Inner exposing (helper)
+
+helper : Int -> { value : Int }
+helper x = { value = x * 3 }
+"""
+                            , """module Main exposing (main)
+
+import Inner
+
+transform : Int -> Int
+transform x =
+    let r = Inner.helper x
+    in r.value
+
+helper : Int -> Int -> Int
+helper n acc =
+    if n <= 0 then
+        acc
+    else
+        helper (n - 1) (acc + transform n)
+
+main = helper 10 0
+"""
+                            ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 165))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "tail-recursive function with as-pattern destructuring in args" <|
+            -- Models ParserFast.loopWhileSucceedsHelp which has:
+            --   loopHelp ((Parser parseElement) as element) soFar ... =
+            -- The as-pattern creates BOTH parseElement and element bindings.
+            -- If TCO's tcoLoop doesn't preserve destructured bindings, the
+            -- body fails when it tries to use parseElement.
+            \_ ->
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnv env
+                            [ """module Main exposing (main)
+
+type Wrapper a = Wrapper (Int -> a)
+
+loopHelp : Wrapper a -> Int -> (a -> Int -> Int) -> Int -> Int
+loopHelp ((Wrapper unwrapped) as wrapper) acc reducer n =
+    if n <= 0 then
+        acc
+    else
+        loopHelp wrapper (reducer (unwrapped n) acc) reducer (n - 1)
+
+main = loopHelp (Wrapper (\\x -> x * 2)) 0 (+) 100
+"""
+                            ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 10100))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
         , test "TCO tcoTarget name collision: same function name in two modules" <|
             -- Module Helper has `step : Int -> Int` (non-recursive).
             -- Module Main has tail-recursive `step` that calls Helper.step.

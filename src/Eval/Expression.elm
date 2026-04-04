@@ -1520,11 +1520,14 @@ call maybeQualifiedName implementation cfg env =
                         Recursion.base (tcoLoop tcoKey expr limit tcoCfg newEnv)
 
                     else
-                        -- Not tail-recursive: normal trampoline
-                        Recursion.recurse ( expr, cfg, newEnv )
+                        -- Not tail-recursive: normal trampoline.
+                        -- Clear tcoTarget to prevent false TailCall signals from
+                        -- functions with the same name called deeper in the stack.
+                        Recursion.recurse ( expr, { cfg | tcoTarget = Nothing }, newEnv )
 
                 Nothing ->
-                    Recursion.recurse ( expr, cfg, env )
+                    -- Anonymous function: clear tcoTarget for same reason.
+                    Recursion.recurse ( expr, { cfg | tcoTarget = Nothing }, env )
 
         KernelImpl moduleName name f ->
             if cfg.trace then
