@@ -1941,34 +1941,34 @@ evalQualifiedOrVariant moduleName name cfg env =
             -- For unqualified names: check currentModuleFunctions first to
             -- skip the expensive isVariant check (String.uncons + Char.toCode)
             case Dict.get name env.currentModuleFunctions of
-                Just function ->
-                    let
-                        qualifiedNameRef : QualifiedNameRef
-                        qualifiedNameRef =
-                            { moduleName = env.currentModule, name = name }
+                        Just function ->
+                            let
+                                qualifiedNameRef : QualifiedNameRef
+                                qualifiedNameRef =
+                                    { moduleName = env.currentModule, name = name }
 
-                        callFn =
-                            if cfg.trace then
-                                Environment.call
+                                callFn =
+                                    if cfg.trace then
+                                        Environment.call
+
+                                    else
+                                        Environment.callNoStack
+                            in
+                            if List.isEmpty function.arguments then
+                                call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
 
                             else
-                                Environment.callNoStack
-                    in
-                    if List.isEmpty function.arguments then
-                        call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+                                PartiallyApplied
+                                    (callFn env.currentModule name env)
+                                    []
+                                    function.arguments
+                                    (Just qualifiedNameRef)
+                                    (AstImpl function.expression)
+                                    (List.length function.arguments)
+                                    |> Types.succeedPartial
 
-                    else
-                        PartiallyApplied
-                            (callFn env.currentModule name env)
-                            []
-                            function.arguments
-                            (Just qualifiedNameRef)
-                            (AstImpl function.expression)
-                            (List.length function.arguments)
-                            |> Types.succeedPartial
-
-                Nothing ->
-                    evalQualifiedOrVariantSlow moduleName name cfg env
+                        Nothing ->
+                            evalQualifiedOrVariantSlow moduleName name cfg env
 
         _ ->
             evalQualifiedOrVariantSlow moduleName name cfg env
@@ -2572,8 +2572,8 @@ evalLetBlockFull letBlock cfg env =
 
                 Ok sd ->
                     -- Two-pass processing for mutual recursion support:
-                    -- Pass 1: register all function declarations in currentModuleFunctions
-                    --         so they can find each other
+                    -- Two-pass processing for mutual recursion support:
+                    -- Pass 1: register all function declarations so they can find each other
                     -- Pass 2: create PartiallyApplied values and evaluate non-function decls
                     let
                         envWithAllFunctions =
@@ -2643,19 +2643,19 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                             fnName =
                                 Node.value name
 
-                            -- Check if the function body references itself
-                            -- (excluding parameter names which shadow outer scope).
-                            -- Always register in currentModuleFunctions so the
-                            -- body can find itself (self-recursion) AND so sibling
-                            -- let-functions can find it (mutual recursion).
-                            envWithFn : Env
-                            envWithFn =
-                                Environment.addLocalFunction implementation env
-
                             arity : Int
                             arity =
                                 List.length implementation.arguments
+
+                            -- Register in currentModuleFunctions for self-recursion
+                            envWithFn : Env
+                            envWithFn =
+                                Environment.addLocalFunction implementation env
                         in
+                        -- Also store in env.values for correct lexical scoping.
+                        -- values has higher lookup priority, so this shadows any
+                        -- previously-registered function with the same name in
+                        -- currentModuleFunctions (fixing the two-raise bug in Review.Rule).
                         EvalResult.succeed <|
                             Environment.addValue fnName
                                 (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) arity)
