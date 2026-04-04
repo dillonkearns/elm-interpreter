@@ -35,7 +35,7 @@ suite =
 
 userModule : String
 userModule =
-    "module Main exposing (main)\n\nimport Review.Rule as Rule exposing (Rule)\nimport Review.Project as Project\n\nmain =\n    let\n        rule : Rule\n        rule =\n            Rule.newModuleRuleSchema \"TestRule\" ()\n                |> Rule.withSimpleExpressionVisitor (\\_ -> [])\n                |> Rule.fromModuleRuleSchema\n\n        project =\n            Project.new\n                |> Project.addModule { path = \"src/A.elm\", source = \"module A exposing (..)\\na = 1\\n\" }\n\n        result =\n            Rule.reviewV2 [ rule ] Nothing project\n    in\n    case result.errors of\n        [] -> \"OK_NO_ERRORS\"\n        _ -> \"GOT_ERRORS\"\n"
+    "module Main exposing (main)\n\nimport Review.Rule as Rule exposing (Rule)\nimport Review.Project as Project\n\nmain =\n    let\n        rule : Rule\n        rule =\n            Rule.newModuleRuleSchema \"TestRule\" ()\n                |> Rule.withSimpleExpressionVisitor (\\_ -> [])\n                |> Rule.fromModuleRuleSchema\n\n        project =\n            Project.new\n                |> Project.addModule { path = \"src/A.elm\", source = \"module A exposing (..)\\na = String.fromInt 42\\n\" }\n\n        result =\n            Rule.reviewV2 [ rule ] Nothing project\n    in\n    case result.errors of\n        [] -> \"OK_NO_ERRORS\"\n        _ -> \"GOT_ERRORS\"\n"
 
 
 packageSources : List String

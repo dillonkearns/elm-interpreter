@@ -24,12 +24,16 @@ map f xs cfg env =
 
 mapHelp : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
 mapHelp f remaining acc cfg env =
+    let
+        innerCfg =
+            { cfg | tcoTarget = Nothing }
+    in
     case remaining of
         [] ->
             EvalResult.succeed (List.reverse acc)
 
         x :: rest ->
-            case EvalResult.toResult (f x cfg env) of
+            case EvalResult.toResult (f x innerCfg env) of
                 Ok mapped ->
                     mapHelp f rest (mapped :: acc) cfg env
 
@@ -46,17 +50,25 @@ foldl f init xs cfg env =
 
 foldlHelp : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
 foldlHelp f acc remaining cfg env =
+    let
+        -- Clear tcoTarget to prevent TailCall signals from escaping
+        -- the kernel loop. Without this, a function matching tcoTarget
+        -- called inside the fold would fire TailCall, which toResult
+        -- would catch as an error and propagate up incorrectly.
+        innerCfg =
+            { cfg | tcoTarget = Nothing }
+    in
     case remaining of
         [] ->
             EvalResult.succeed acc
 
         x :: rest ->
-            case EvalResult.toResult (f x cfg env) of
+            case EvalResult.toResult (f x innerCfg env) of
                 Err e ->
                     EvErr e
 
                 Ok g ->
-                    case EvalResult.toResult (g acc cfg env) of
+                    case EvalResult.toResult (g acc innerCfg env) of
                         Err e ->
                             EvErr e
 
@@ -73,12 +85,16 @@ filter pred xs cfg env =
 
 filterHelp : (Value -> Eval Bool) -> List Value -> List Value -> Eval (List Value)
 filterHelp pred remaining acc cfg env =
+    let
+        innerCfg =
+            { cfg | tcoTarget = Nothing }
+    in
     case remaining of
         [] ->
             EvalResult.succeed (List.reverse acc)
 
         x :: rest ->
-            case EvalResult.toResult (pred x cfg env) of
+            case EvalResult.toResult (pred x innerCfg env) of
                 Err e ->
                     EvErr e
 

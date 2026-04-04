@@ -260,28 +260,7 @@ callNoStack moduleName name env =
             moduleKey moduleName
     in
     if key == env.currentModuleKey then
-        -- For same-module calls: reset currentModuleFunctions to the module's
-        -- original dict IF the function being called is a module-level function
-        -- (exists in the shared functions dict). This clears let-function
-        -- pollution from addLocalFunction. Let-functions are accessible
-        -- through env.values instead.
-        --
-        -- If the function is NOT in the shared dict (it's a let-function
-        -- calling itself), keep currentModuleFunctions unchanged so the
-        -- self-reference in currentModuleFunctions is preserved.
-        case Dict.get key env.shared.functions of
-            Just moduleFunctions ->
-                if Dict.member name moduleFunctions then
-                    { env
-                        | callDepth = env.callDepth + 1
-                        , currentModuleFunctions = moduleFunctions
-                    }
-
-                else
-                    { env | callDepth = env.callDepth + 1 }
-
-            Nothing ->
-                { env | callDepth = env.callDepth + 1 }
+        { env | callDepth = env.callDepth + 1 }
 
     else
         { currentModule = moduleName
