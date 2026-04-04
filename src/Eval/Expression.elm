@@ -1382,7 +1382,7 @@ call maybeQualifiedName implementation cfg env =
                                         n
 
                                     Nothing ->
-                                        1000000
+                                        10000
                         in
                         Recursion.base (tcoLoop qualifiedName.name expr limit tcoCfg newEnv)
 
@@ -1459,9 +1459,17 @@ isTailRecursiveHelper funcName (Node _ expr) =
 isTailSafe : String -> Expression -> Bool
 isTailSafe funcName expr =
     case expr of
-        -- Self-call in tail position: this IS the tail call
-        Expression.Application ((Node _ (Expression.FunctionOrValue [] name)) :: _) ->
-            name == funcName || not (containsSelfCallInArgs funcName expr)
+        -- Self-call in tail position: the call itself is tail, but the ARGUMENTS
+        -- must not contain non-tail self-calls (e.g. Dict.foldl calls itself
+        -- in an argument: foldl func (... (foldl func acc left)) right)
+        Expression.Application ((Node _ (Expression.FunctionOrValue [] name)) :: args) ->
+            if name == funcName then
+                -- Tail self-call, but verify args don't have nested self-calls
+                not (List.any (\(Node _ a) -> containsSelfCall funcName a) args)
+
+            else
+                -- Not a self-call: safe only if no self-calls anywhere
+                not (containsSelfCall funcName expr)
 
         -- If/else: recurse into branches
         Expression.IfBlock _ (Node _ trueExpr) (Node _ falseExpr) ->
@@ -1610,7 +1618,16 @@ tcoLoop funcName body remaining cfg env =
             EvErr errData ->
                 case errData.error of
                     TailCall newValues ->
-                        tcoLoop funcName body (remaining - 1) cfg (Environment.replaceValues newValues env)
+                        if newValues == env.values then
+                            -- Identical args: infinite loop detected
+                            EvErr
+                                { currentModule = env.currentModule
+                                , callStack = env.callStack
+                                , error = TypeError ("Infinite recursion detected: " ++ funcName ++ " called with identical arguments")
+                                }
+
+                        else
+                            tcoLoop funcName body (remaining - 1) cfg (Environment.replaceValues newValues env)
 
                     _ ->
                         EvErr errData
@@ -1618,7 +1635,17 @@ tcoLoop funcName body remaining cfg env =
             EvErrTrace errData trees logs ->
                 case errData.error of
                     TailCall newValues ->
-                        tcoLoop funcName body (remaining - 1) cfg (Environment.replaceValues newValues env)
+                        if newValues == env.values then
+                            EvErrTrace
+                                { currentModule = env.currentModule
+                                , callStack = env.callStack
+                                , error = TypeError ("Infinite recursion detected: " ++ funcName ++ " called with identical arguments")
+                                }
+                                trees
+                                logs
+
+                        else
+                            tcoLoop funcName body (remaining - 1) cfg (Environment.replaceValues newValues env)
 
                     _ ->
                         EvErrTrace errData trees logs
