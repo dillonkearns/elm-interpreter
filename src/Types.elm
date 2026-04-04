@@ -37,6 +37,7 @@ type EvalResult out
 type alias Config =
     { trace : Bool
     , maxSteps : Maybe Int
+    , tcoTarget : Maybe String
     }
 
 
@@ -152,6 +153,7 @@ type EvalErrorKind
     | Unsupported String
     | NameError String
     | Todo String
+    | TailCall EnvValues
 
 
 evalErrorKindToString : EvalErrorKind -> String
@@ -168,4 +170,7 @@ evalErrorKindToString kind =
 
         Todo msg ->
             "Todo: " ++ msg
+
+        TailCall _ ->
+            "TailCall (internal TCO signal)"
 

@@ -104,6 +104,9 @@ evalErrorToString { callStack, error } =
                 Todo message ->
                     "Todo: " ++ message
 
+                TailCall _ ->
+                    "TailCall (internal TCO signal)"
+
     in
     messageWithType
         ++ "\nCall stack:\n - "

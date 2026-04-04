@@ -10,7 +10,7 @@ eval : String -> Result Error Value
 eval expressionSource =
     let
         ( result, _, _ ) =
-            traceOrEval { trace = True, maxSteps = Nothing } expressionSource
+            traceOrEval { trace = True, maxSteps = Nothing, tcoTarget = Nothing } expressionSource
     in
     result
 
@@ -19,14 +19,14 @@ evalWithMaxSteps : Maybe Int -> String -> Result Error Value
 evalWithMaxSteps maxSteps expressionSource =
     let
         ( result, _, _ ) =
-            traceOrEval { trace = False, maxSteps = maxSteps } expressionSource
+            traceOrEval { trace = False, maxSteps = maxSteps, tcoTarget = Nothing } expressionSource
     in
     result
 
 
 trace : String -> ( Result Error Value, Rope CallTree, Rope String )
 trace expressionSource =
-    traceOrEval { trace = True, maxSteps = Nothing } expressionSource
+    traceOrEval { trace = True, maxSteps = Nothing, tcoTarget = Nothing } expressionSource
 
 
 traceOrEval : Config -> String -> ( Result Error Value, Rope CallTree, Rope String )

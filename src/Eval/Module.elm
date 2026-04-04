@@ -43,14 +43,14 @@ eval : String -> Expression -> Result Error Value
 eval source expression =
     let
         ( result, _, _ ) =
-            traceOrEvalModule { trace = False, maxSteps = Nothing } source expression
+            traceOrEvalModule { trace = False, maxSteps = Nothing, tcoTarget = Nothing } source expression
     in
     result
 
 
 trace : String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 trace source expression =
-    traceOrEvalModule { trace = True, maxSteps = Nothing } source expression
+    traceOrEvalModule { trace = True, maxSteps = Nothing, tcoTarget = Nothing } source expression
 
 
 traceOrEvalModule : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
@@ -413,7 +413,7 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = maxSteps }
+                                { trace = False, maxSteps = maxSteps, tcoTarget = Nothing }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -497,7 +497,7 @@ evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles ex
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = maxSteps }
+                        { trace = False, maxSteps = maxSteps, tcoTarget = Nothing }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -646,7 +646,7 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         evalResult =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = True, maxSteps = Nothing }
+                                { trace = True, maxSteps = Nothing, tcoTarget = Nothing }
                                 finalEnv
 
                         ( result, callTrees, logLines ) =
@@ -1021,7 +1021,7 @@ evalProject sources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = Nothing }
+                                { trace = False, maxSteps = Nothing, tcoTarget = Nothing }
                                 finalEnv
                                 |> EvalResult.toResult
                     in

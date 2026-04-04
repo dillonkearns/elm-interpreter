@@ -22,7 +22,7 @@ import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
-import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalResult(..), Implementation(..), PartialEval, PartialResult, Value(..))
+import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), PartialEval, PartialResult, Value(..))
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -226,7 +226,7 @@ evalExpression initExpression initCfg initEnv =
                         (EvErr
                             { currentModule = env.currentModule
                             , callStack = env.callStack
-                            , error = Types.Unsupported "Step limit exceeded"
+                            , error = Unsupported "Step limit exceeded"
                             }
                         )
 
@@ -1357,7 +1357,37 @@ call maybeQualifiedName implementation cfg env =
                         newEnv =
                             callFn qualifiedName.moduleName qualifiedName.name env
                     in
-                    Recursion.recurse ( expr, cfg, newEnv )
+                    if cfg.tcoTarget == Just qualifiedName.name then
+                        -- Inside a tcoLoop: signal TailCall to the loop
+                        Recursion.base
+                            (EvErr
+                                { currentModule = env.currentModule
+                                , callStack = env.callStack
+                                , error = TailCall env.values
+                                }
+                            )
+
+                    else if isTailRecursive qualifiedName.name expr && cfg.maxSteps /= Nothing then
+                        -- Static analysis confirmed tail-recursive: use tcoLoop
+                        let
+                            tcoCfg =
+                                { cfg | tcoTarget = Just qualifiedName.name }
+
+                            -- TCO iteration limit: use 10x maxSteps (since each TCO iteration
+                            -- is much cheaper than a trampoline step), or 1M as safety net
+                            limit =
+                                case cfg.maxSteps of
+                                    Just n ->
+                                        n * 10
+
+                                    Nothing ->
+                                        1000000
+                        in
+                        Recursion.base (tcoLoop qualifiedName.name expr limit tcoCfg newEnv)
+
+                    else
+                        -- Not tail-recursive: normal trampoline
+                        Recursion.recurse ( expr, cfg, newEnv )
 
                 Nothing ->
                     Recursion.recurse ( expr, cfg, env )
@@ -1374,6 +1404,212 @@ call maybeQualifiedName implementation cfg env =
             else
                 Recursion.base (f [] cfg env)
 
+
+
+{-| Static analysis: check if a function body is tail-recursive with respect
+to a given function name. Returns True only if ALL self-calls appear in tail
+position (the outermost return expression of if/case branches).
+-}
+isTailRecursive : String -> Node Expression -> Bool
+isTailRecursive funcName (Node _ expr) =
+    case expr of
+        -- If/else: both branches must be tail-safe
+        Expression.IfBlock _ (Node _ trueExpr) (Node _ falseExpr) ->
+            isTailSafe funcName trueExpr && isTailSafe funcName falseExpr
+
+        -- Case: all branches must be tail-safe
+        Expression.CaseExpression { cases } ->
+            List.all (\( _, Node _ branchExpr ) -> isTailSafe funcName branchExpr) cases
+
+        -- Let: declarations must NOT contain self-calls (they're not in tail position),
+        -- and the body expression (the "in" part) must be tail-recursive
+        Expression.LetExpression { declarations, expression } ->
+            not (letDeclarationsContainSelfCall funcName declarations)
+                && isTailRecursive funcName expression
+
+        -- A bare self-call at the top level is tail-recursive
+        Expression.Application ((Node _ (Expression.FunctionOrValue [] name)) :: _) ->
+            name == funcName
+
+        -- Anything else: only tail-recursive if it doesn't contain self-calls at all
+        _ ->
+            not (containsSelfCall funcName expr)
+
+
+{-| Check if an expression in tail position is safe. An expression is tail-safe if:
+1. It's a self-call (tail call — good), OR
+2. It doesn't contain any self-calls (base case — good), OR
+3. It's a branching expression where all branches are tail-safe (if/case/let)
+-}
+isTailSafe : String -> Expression -> Bool
+isTailSafe funcName expr =
+    case expr of
+        -- Self-call in tail position: this IS the tail call
+        Expression.Application ((Node _ (Expression.FunctionOrValue [] name)) :: _) ->
+            name == funcName || not (containsSelfCallInArgs funcName expr)
+
+        -- If/else: recurse into branches
+        Expression.IfBlock _ (Node _ trueExpr) (Node _ falseExpr) ->
+            isTailSafe funcName trueExpr && isTailSafe funcName falseExpr
+
+        -- Case: recurse into all branches
+        Expression.CaseExpression { cases } ->
+            List.all (\( _, Node _ branchExpr ) -> isTailSafe funcName branchExpr) cases
+
+        -- Let: declarations must not contain self-calls, body must be tail-safe
+        Expression.LetExpression { declarations, expression } ->
+            let
+                (Node _ bodyExpr) =
+                    expression
+            in
+            not (letDeclarationsContainSelfCall funcName declarations)
+                && isTailSafe funcName bodyExpr
+
+        -- Parenthesized: unwrap
+        Expression.ParenthesizedExpression (Node _ inner) ->
+            isTailSafe funcName inner
+
+        -- Anything else: safe only if no self-calls
+        _ ->
+            not (containsSelfCall funcName expr)
+
+
+{-| Check if an expression contains a call to funcName anywhere (not in tail position).
+-}
+containsSelfCall : String -> Expression -> Bool
+containsSelfCall funcName expr =
+    case expr of
+        Expression.Application ((Node _ (Expression.FunctionOrValue [] name)) :: args) ->
+            name == funcName || List.any (\(Node _ e) -> containsSelfCall funcName e) args
+
+        Expression.Application exprs ->
+            List.any (\(Node _ e) -> containsSelfCall funcName e) exprs
+
+        Expression.IfBlock (Node _ cond) (Node _ t) (Node _ f) ->
+            containsSelfCall funcName cond || containsSelfCall funcName t || containsSelfCall funcName f
+
+        Expression.CaseExpression { expression, cases } ->
+            let
+                (Node _ caseExpr) =
+                    expression
+            in
+            containsSelfCall funcName caseExpr
+                || List.any (\( _, Node _ branchExpr ) -> containsSelfCall funcName branchExpr) cases
+
+        Expression.OperatorApplication _ _ (Node _ l) (Node _ r) ->
+            containsSelfCall funcName l || containsSelfCall funcName r
+
+        Expression.FunctionOrValue [] name ->
+            name == funcName
+
+        Expression.LetExpression { declarations, expression } ->
+            let
+                (Node _ bodyExpr) =
+                    expression
+            in
+            containsSelfCall funcName bodyExpr
+
+        Expression.TupledExpression exprs ->
+            List.any (\(Node _ e) -> containsSelfCall funcName e) exprs
+
+        Expression.ParenthesizedExpression (Node _ inner) ->
+            containsSelfCall funcName inner
+
+        Expression.ListExpr exprs ->
+            List.any (\(Node _ e) -> containsSelfCall funcName e) exprs
+
+        Expression.RecordExpr fields ->
+            List.any (\(Node _ ( _, Node _ e )) -> containsSelfCall funcName e) fields
+
+        Expression.Negation (Node _ inner) ->
+            containsSelfCall funcName inner
+
+        Expression.LambdaExpression { expression } ->
+            let
+                (Node _ lambdaBody) =
+                    expression
+            in
+            containsSelfCall funcName lambdaBody
+
+        Expression.RecordAccess (Node _ inner) _ ->
+            containsSelfCall funcName inner
+
+        _ ->
+            False
+
+
+{-| Check if any let declaration body contains a self-call.
+-}
+letDeclarationsContainSelfCall : String -> List (Node Expression.LetDeclaration) -> Bool
+letDeclarationsContainSelfCall funcName declarations =
+    List.any
+        (\(Node _ decl) ->
+            case decl of
+                Expression.LetFunction { declaration } ->
+                    let
+                        (Node _ funcDecl) =
+                            declaration
+                    in
+                    containsSelfCall funcName (Node.value funcDecl.expression)
+
+                Expression.LetDestructuring _ (Node _ expr) ->
+                    containsSelfCall funcName expr
+        )
+        declarations
+
+
+{-| Check if args of a self-call application contain further self-calls.
+-}
+containsSelfCallInArgs : String -> Expression -> Bool
+containsSelfCallInArgs funcName expr =
+    case expr of
+        Expression.Application (_ :: args) ->
+            List.any (\(Node _ e) -> containsSelfCall funcName e) args
+
+        _ ->
+            False
+
+
+{-| TCO loop: evaluates body expression in a tight loop using nested
+evalExpression calls. Each iteration is a complete evaluation; self-calls
+are detected and caught as TailCall errors, then rebound and looped.
+
+This is tail-recursive in Elm, compiled to a while loop by the host compiler.
+-}
+tcoLoop : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
+tcoLoop funcName body remaining cfg env =
+    if remaining <= 0 then
+        EvErr
+            { currentModule = env.currentModule
+            , callStack = env.callStack
+            , error = Unsupported "Step limit exceeded"
+            }
+
+    else
+        let
+            -- Disable inner step limit — tcoLoop's iteration counter is the limit
+            innerCfg =
+                { cfg | maxSteps = Nothing }
+        in
+        case evalExpression body innerCfg env of
+            EvErr errData ->
+                case errData.error of
+                    TailCall newValues ->
+                        tcoLoop funcName body (remaining - 1) cfg (Environment.replaceValues newValues env)
+
+                    _ ->
+                        EvErr errData
+
+            EvErrTrace errData trees logs ->
+                case errData.error of
+                    TailCall newValues ->
+                        tcoLoop funcName body (remaining - 1) cfg (Environment.replaceValues newValues env)
+
+                    _ ->
+                        EvErrTrace errData trees logs
+
+            other ->
+                other
 
 
 evalFunctionOrValue : ModuleName -> String -> PartialEval Value
