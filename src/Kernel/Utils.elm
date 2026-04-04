@@ -1,4 +1,4 @@
-module Kernel.Utils exposing (append, compare, comparison, innerCompare)
+module Kernel.Utils exposing (append, compare, comparison, equal, innerCompare)
 
 import Array
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -289,6 +289,14 @@ dictToSortedListHelp value acc =
 
         _ ->
             acc
+
+
+{-| Direct equality check for two values. Used by inlined == operator.
+-}
+equal : Value -> Value -> Env -> Result EvalErrorData Bool
+equal l r env =
+    innerCompare l r env
+        |> Result.map (\order -> order == EQ)
 
 
 comparison : List Order -> ModuleName -> ( Int, List Value -> Eval Value )

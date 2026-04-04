@@ -10,7 +10,7 @@ eval : String -> Result Error Value
 eval expressionSource =
     let
         ( result, _, _ ) =
-            traceOrEval { trace = True, maxSteps = Nothing, tcoTarget = Nothing } expressionSource
+            traceOrEval { trace = False, maxSteps = Nothing, tcoTarget = Nothing } expressionSource
     in
     result
 

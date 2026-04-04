@@ -234,7 +234,12 @@ evalExpression initExpression initCfg initEnv =
                     let
                         cfg : Config
                         cfg =
-                            { cfg0 | maxSteps = Maybe.map (\n -> n - 1) cfg0.maxSteps }
+                            case cfg0.maxSteps of
+                                Nothing ->
+                                    cfg0
+
+                                Just n ->
+                                    { cfg0 | maxSteps = Just (n - 1) }
 
                         result : PartialResult Value
                         result =
@@ -509,6 +514,60 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                             v ->
                                                 Types.failPartial <| typeError env <| "&& applied to non-Bool " ++ Value.toString v
                                     )
+
+                    "==" ->
+                        -- Fast path for equality: inline primitive comparison
+                        case evalSimple l env of
+                            Just lValue ->
+                                case evalSimple r env of
+                                    Just rValue ->
+                                        case Kernel.Utils.equal lValue rValue env of
+                                            Ok True ->
+                                                continuation (Bool True)
+
+                                            Ok False ->
+                                                continuation (Bool False)
+
+                                            Err e ->
+                                                Recursion.base (EvErr e)
+
+                                    Nothing ->
+                                        Types.recurseThen ( r, cfg, env )
+                                            (\rValue ->
+                                                case Kernel.Utils.equal lValue rValue env of
+                                                    Ok True ->
+                                                        continuation (Bool True)
+
+                                                    Ok False ->
+                                                        continuation (Bool False)
+
+                                                    Err e ->
+                                                        Recursion.base (EvErr e)
+                                            )
+
+                            Nothing ->
+                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                    "/=" ->
+                        case evalSimple l env of
+                            Just lValue ->
+                                case evalSimple r env of
+                                    Just rValue ->
+                                        case Kernel.Utils.equal lValue rValue env of
+                                            Ok True ->
+                                                continuation (Bool False)
+
+                                            Ok False ->
+                                                continuation (Bool True)
+
+                                            Err e ->
+                                                Recursion.base (EvErr e)
+
+                                    Nothing ->
+                                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+
+                            Nothing ->
+                                Types.recurseThen ( fullExpr, cfg, env ) continuation
 
                     _ ->
                         case resolveOperator opName of
