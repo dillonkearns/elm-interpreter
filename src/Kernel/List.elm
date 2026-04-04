@@ -1,4 +1,4 @@
-module Kernel.List exposing (filter, foldl, map, range, sortBy, sortWith)
+module Kernel.List exposing (append, filter, foldl, foldr, map, range, sortBy, sortWith)
 
 {-| Native kernel implementations for List sorting.
 
@@ -104,6 +104,27 @@ rangeHelp lo hi acc =
 
     else
         acc
+
+
+{-| Kernel List.foldr: reduces a list from the right.
+Reverses the list, then folds left. Tail-recursive.
+-}
+foldr : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
+foldr f init xs cfg env =
+    foldlHelp f init (List.reverse xs) cfg env
+
+
+{-| Kernel List.append: concatenates two lists.
+Pure — no interpreter callback needed.
+-}
+append : List Value -> List Value -> List Value
+append xs ys =
+    case ys of
+        [] ->
+            xs
+
+        _ ->
+            List.foldr (::) ys xs
 
 
 {-| Stable sortBy: wraps the toComparable function into a comparison

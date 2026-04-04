@@ -137,9 +137,11 @@ functions evalFunction =
 
     -- Elm.Kernel.List
     , ( [ "Elm", "Kernel", "List" ]
-      , [ ( "cons", two anything anyList to anyList (::) Core.List.cons )
+      , [ ( "append", two anyList anyList to anyList Kernel.List.append Core.List.append )
+        , ( "cons", two anything anyList to anyList (::) Core.List.cons )
         , ( "filter", twoWithError (function evalFunction anything to bool) anyList to anyList Kernel.List.filter Core.List.filter )
         , ( "foldl", threeWithError (function2 evalFunction anything anything to anything) anything anyList to anything Kernel.List.foldl Core.List.foldl )
+        , ( "foldr", threeWithError (function2 evalFunction anything anything to anything) anything anyList to anything Kernel.List.foldr Core.List.foldr )
         , ( "fromArray", one (jsArray anything) to anyList Array.toList Core.Array.toList )
         , ( "map", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.map Core.List.map )
         , ( "range", two int int to anyList Kernel.List.range Core.List.range )

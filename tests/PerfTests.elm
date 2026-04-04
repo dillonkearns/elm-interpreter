@@ -288,6 +288,62 @@ tcoProofTests =
                     Err e ->
                         Expect.fail (Debug.toString e)
 
+        -- === Kernel List.length, List.foldr, List.append proof ===
+        -- Step budgets prove kernel engagement (too tight for interpreted path)
+        , test "List.length 100000 within 100 steps" <|
+            -- List.length uses kernel foldl — uses ~0 trampoline steps for iteration
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = List.length (List.range 0 100000)"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 100)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 100001))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "List.foldr 50000 within 500 steps" <|
+            -- Without kernel foldr: 50k elements via foldrHelper needs ~12500 TCO iterations
+            -- With kernel: ~0 trampoline steps
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = List.foldr (+) 0 (List.range 0 50000)"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 500)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 1250025000))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "List.append 50000+50000 within 500 steps" <|
+            -- Without kernel: foldr over 50k elements needs many steps
+            -- With kernel: direct list concatenation, ~0 trampoline steps
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = List.length (List.append (List.range 0 50000) (List.range 50001 100000))"
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 500)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 100001))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+
         -- === Pipe operators should NOT get TCO (per Elm compiler) ===
         , test "pipe operator is not tail-optimized but still correct" <|
             \_ ->

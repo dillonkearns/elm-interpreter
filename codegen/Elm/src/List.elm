@@ -166,7 +166,7 @@ So `foldr step state [1,2,3]` is like saying:
 -}
 foldr : (a -> b -> b) -> b -> List a -> b
 foldr fn acc ls =
-    foldrHelper fn acc 0 ls
+    Elm.Kernel.List.foldr fn acc ls
 
 
 foldrHelper : (a -> b -> b) -> b -> Int -> List a -> b
@@ -365,12 +365,7 @@ You can also use [the `(++)` operator](Basics#++) to append lists.
 -}
 append : List a -> List a -> List a
 append xs ys =
-  case ys of
-    [] ->
-      xs
-
-    _ ->
-      foldr cons ys xs
+  Elm.Kernel.List.append xs ys
 
 
 {-| Concatenate a bunch of lists into a single list:
