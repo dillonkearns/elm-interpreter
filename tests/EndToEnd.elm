@@ -688,12 +688,10 @@ main =
         -- Known elm-syntax parser limitation: negative at start of list literal
         -- needs a space. [-3] fails to parse but [ -3 ] works.
         -- See issues/002-negative-list-literal-parse.md
-        , Test.skip <|
-            -- Blocked: stil4m/elm-syntax master doesn't handle [ before negation yet
-            evalTest "negative at start of list literal"
-                "List.sum [-3, 5, -1]"
-                Int
-                1
+        , evalTest "negative at start of list literal"
+            "List.sum [-3, 5, -1]"
+            Int
+            1
         ]
 
 
