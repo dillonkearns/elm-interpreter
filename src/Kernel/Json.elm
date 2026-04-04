@@ -821,15 +821,12 @@ Uses the interpreter's evalFunction to handle the actual evaluation.
 applyFunction : EvalFunction -> Value -> Value -> Types.Config -> Types.Env -> Result String Value
 applyFunction evalFn func arg cfg _ =
     case func of
-        PartiallyApplied closureEnv oldArgs patterns maybeName implementation ->
+        PartiallyApplied closureEnv oldArgs patterns maybeName implementation arity ->
             let
                 newArgs =
                     oldArgs ++ [ arg ]
-
-                needed =
-                    List.length patterns
             in
-            if List.length newArgs >= needed then
+            if List.length newArgs >= arity then
                 case evalFn newArgs patterns maybeName implementation cfg closureEnv of
                     EvOk val ->
                         Ok val
@@ -844,7 +841,7 @@ applyFunction evalFn func arg cfg _ =
                         Err (Types.evalErrorKindToString e.error)
 
             else
-                Ok (PartiallyApplied closureEnv newArgs patterns maybeName implementation)
+                Ok (PartiallyApplied closureEnv newArgs patterns maybeName implementation arity)
 
         Custom qualifiedName args ->
             -- Constructor application (e.g., Just value, Tuple.pair a b)

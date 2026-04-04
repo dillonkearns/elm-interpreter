@@ -1,8 +1,9 @@
-module Value exposing (eqValue, fromOrder, gtValue, ltValue, nameError, nothingValue, toArray, toExpression, toOrder, toString, todo, typeError, unsupported)
+module Value exposing (eqValue, fromOrder, gtValue, ltValue, mkPartiallyApplied, nameError, nothingValue, toArray, toExpression, toOrder, toString, todo, typeError, unsupported)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression as Expression exposing (Expression)
 import Elm.Syntax.Node exposing (Node)
+import Elm.Syntax.Pattern exposing (Pattern, QualifiedNameRef)
 import FastDict as Dict
 import Syntax exposing (fakeNode)
 import Types exposing (Env, EvalErrorData, EvalErrorKind(..), Implementation(..), JsonDecoder(..), JsonVal(..), Value(..))
@@ -34,6 +35,13 @@ error env msg =
     , callStack = env.callStack
     , error = msg
     }
+
+
+{-| Construct a PartiallyApplied with cached arity.
+-}
+mkPartiallyApplied : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> Value
+mkPartiallyApplied env args patterns maybeName impl =
+    PartiallyApplied env args patterns maybeName impl (List.length patterns)
 
 
 toExpression : Value -> Node Expression
@@ -112,10 +120,10 @@ toExpression value =
             BytesValue _ ->
                 Expression.FunctionOrValue [ "Bytes" ] "bytes"
 
-            PartiallyApplied _ [] _ (Just qualifiedName) _ ->
+            PartiallyApplied _ [] _ (Just qualifiedName) _ _ ->
                 Expression.FunctionOrValue qualifiedName.moduleName qualifiedName.name
 
-            PartiallyApplied _ args _ (Just qualifiedName) _ ->
+            PartiallyApplied _ args _ (Just qualifiedName) _ _ ->
                 (fakeNode
                     (Expression.FunctionOrValue
                         qualifiedName.moduleName
@@ -125,7 +133,7 @@ toExpression value =
                 )
                     |> Expression.Application
 
-            PartiallyApplied _ [] patterns Nothing implementation ->
+            PartiallyApplied _ [] patterns Nothing implementation _ ->
                 case implementation of
                     AstImpl expr ->
                         Expression.LambdaExpression
@@ -136,7 +144,7 @@ toExpression value =
                     KernelImpl moduleName name _ ->
                         Expression.FunctionOrValue moduleName name
 
-            PartiallyApplied _ args patterns Nothing implementation ->
+            PartiallyApplied _ args patterns Nothing implementation _ ->
                 case implementation of
                     AstImpl expr ->
                         (fakeNode
@@ -352,7 +360,7 @@ toString value =
         BytesValue arr ->
             "<" ++ String.fromInt (Array.length arr) ++ " bytes>"
 
-        PartiallyApplied _ _ _ _ _ ->
+        PartiallyApplied _ _ _ _ _ _ ->
             "<function>"
 
 

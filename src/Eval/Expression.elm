@@ -315,7 +315,7 @@ evalExpression initExpression initCfg initEnv =
                                     evalCase caseExpr cfg env
 
                                 Expression.LambdaExpression lambda ->
-                                    Types.succeedPartial <| PartiallyApplied env [] lambda.args Nothing (AstImpl lambda.expression)
+                                    Types.succeedPartial <| Value.mkPartiallyApplied env [] lambda.args Nothing (AstImpl lambda.expression)
 
                                 Expression.RecordExpr fields ->
                                     evalRecord fields cfg env
@@ -395,7 +395,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
 
         Expression.FunctionOrValue [] name ->
             case Dict.get name env.values of
-                Just (PartiallyApplied _ [] [] _ _) ->
+                Just (PartiallyApplied _ [] [] _ _ _) ->
                     -- Zero-arg thunk, needs call path via trampoline
                     Types.recurseThen ( fullExpr, cfg, env ) continuation
 
@@ -424,6 +424,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                         function.arguments
                                         (Just { moduleName = env.currentModule, name = name })
                                         (AstImpl function.expression)
+                                        (List.length function.arguments)
                                     )
 
                         Nothing ->
@@ -434,7 +435,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
             evalOrRecurse ( inner, cfg, env ) continuation
 
         Expression.LambdaExpression lambda ->
-            continuation (PartiallyApplied env [] lambda.args Nothing (AstImpl lambda.expression))
+            continuation (Value.mkPartiallyApplied env [] lambda.args Nothing (AstImpl lambda.expression))
 
         Expression.RecordAccessFunction field ->
             continuation (evalRecordAccessFunction field)
@@ -736,7 +737,7 @@ evalSimple (Node _ expr) env =
 
         Expression.FunctionOrValue [] name ->
             case Dict.get name env.values of
-                Just (PartiallyApplied _ [] [] _ _) ->
+                Just (PartiallyApplied _ [] [] _ _ _) ->
                     Nothing
 
                 Just value ->
@@ -1114,7 +1115,7 @@ evalApplication first rest cfg env =
                             -- 2+ patterns: still partially applied after 1 arg
                             evalOrRecurse ( singleArg, cfg, env )
                                 (\argValue ->
-                                    Types.succeedPartial <| PartiallyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation
+                                    Types.succeedPartial <| Value.mkPartiallyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation
                                 )
 
                         [] ->
@@ -1140,7 +1141,7 @@ evalApplication first rest cfg env =
                                 (\val1 ->
                                     evalOrRecurse ( arg2, cfg, env )
                                         (\val2 ->
-                                            Types.succeedPartial <| PartiallyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation
+                                            Types.succeedPartial <| Value.mkPartiallyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation
                                         )
                                 )
 
@@ -1158,7 +1159,7 @@ evalApplication first rest cfg env =
                     Types.recurseMapThen ( rest, cfg, env )
                         (\values -> Types.succeedPartial <| Custom name (customArgs ++ values))
 
-                PartiallyApplied localEnv oldArgs patterns maybeQualifiedName implementation ->
+                PartiallyApplied localEnv oldArgs patterns maybeQualifiedName implementation _ ->
                     inner localEnv oldArgs patterns maybeQualifiedName implementation
 
                 other ->
@@ -1213,7 +1214,7 @@ evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv 
                 in
                 if oldArgsLength + restLength < patternsLength then
                     -- Still not enough
-                    Types.succeedPartial <| PartiallyApplied localEnv args patterns maybeQualifiedName implementation
+                    Types.succeedPartial <| Value.mkPartiallyApplied localEnv args patterns maybeQualifiedName implementation
 
                 else
                     -- Just right, we special case this for TCO
@@ -1822,7 +1823,7 @@ evalFunctionOrValue moduleName name cfg env =
             -- Fast path: local value lookup before isVariant check.
             -- Avoids String.uncons + Char.toCode for the most common case.
             case Dict.get name env.values of
-                Just (PartiallyApplied localEnv [] [] maybeName implementation) ->
+                Just (PartiallyApplied localEnv [] [] maybeName implementation _) ->
                     call maybeName implementation cfg localEnv
 
                 Just value ->
@@ -1865,6 +1866,7 @@ evalQualifiedOrVariant moduleName name cfg env =
                             function.arguments
                             (Just qualifiedNameRef)
                             (AstImpl function.expression)
+                            (List.length function.arguments)
                             |> Types.succeedPartial
 
                 Nothing ->
@@ -1889,6 +1891,7 @@ evalQualifiedOrVariantSlow moduleName name cfg env =
                         function.arguments
                         (Just { moduleName = resolvedModule, name = name })
                         (AstImpl function.expression)
+                        (List.length function.arguments)
                         |> Types.succeedPartial
 
             Nothing ->
@@ -2105,6 +2108,7 @@ evalNonVariant moduleName name cfg env =
                                         function.arguments
                                         (Just qualifiedNameRef)
                                         (AstImpl function.expression)
+                                        (List.length function.arguments)
                                         |> Types.succeedPartial
 
                             else
@@ -2146,6 +2150,7 @@ evalNonVariant moduleName name cfg env =
                                         function.arguments
                                         (Just qualifiedNameRef)
                                         (AstImpl function.expression)
+                                        (List.length function.arguments)
                                         |> Types.succeedPartial
 
                         Nothing ->
@@ -2221,7 +2226,7 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
     in
     if oldArgsLength < patternsLength then
         -- Still not enough
-        EvalResult.succeed <| PartiallyApplied localEnv oldArgs patterns functionName implementation
+        EvalResult.succeed <| Value.mkPartiallyApplied localEnv oldArgs patterns functionName implementation
 
     else
         -- Just right, we special case this for TCO
@@ -2329,6 +2334,7 @@ evalKernelFunctionWithKey key moduleName name cfg env =
                             (List.repeat argCount (fakeNode AllPattern))
                             (Just { moduleName = moduleName, name = name })
                             (KernelImpl moduleName name f)
+                            argCount
                             |> Types.succeedPartial
 
 
@@ -2365,6 +2371,7 @@ evalKernelFunctionFromAstWithKey key moduleName name cfg env =
                         function.arguments
                         (Just { moduleName = moduleName, name = name })
                         (AstImpl function.expression)
+                        (List.length function.arguments)
                         |> Types.succeedPartial
 
 
@@ -2525,7 +2532,7 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                         -- prevents the caller's values from leaking through.
                         EvalResult.succeed <|
                             Environment.addValue fnName
-                                (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression))
+                                (PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) (List.length implementation.arguments))
                                 envWithFn
 
                     else
@@ -2704,6 +2711,7 @@ evalRecordAccessFunction field =
                     (fakeNode <| Expression.FunctionOrValue [] "$r")
                     (fakeNode <| String.dropLeft 1 field)
         )
+        1
 
 
 evalRecordUpdate : Node String -> List (Node Expression.RecordSetter) -> PartialEval Value
@@ -2792,6 +2800,7 @@ evalOperator opName cfg env =
                             function.arguments
                             (Just { moduleName = resolvedRef.moduleName, name = resolvedRef.name })
                             (AstImpl function.expression)
+                            (List.length function.arguments)
                             |> Types.succeedPartial
 
                 Nothing ->
@@ -2817,6 +2826,7 @@ evalOperator opName cfg env =
                                     , fakeNode <| Expression.FunctionOrValue [] "$r"
                                     ]
                         )
+                        2
                         |> Types.succeedPartial
 
 

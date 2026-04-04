@@ -200,10 +200,10 @@ innerCompare l r env =
         ( Unit, _ ) ->
             uncomparable ()
 
-        ( PartiallyApplied _ _ _ _ _, PartiallyApplied _ _ _ _ _ ) ->
+        ( PartiallyApplied _ _ _ _ _ _, PartiallyApplied _ _ _ _ _ _ ) ->
             Err <| typeError env "Cannot compare functions"
 
-        ( PartiallyApplied _ _ _ _ _, _ ) ->
+        ( PartiallyApplied _ _ _ _ _ _, _ ) ->
             uncomparable ()
 
         ( JsonValue _, _ ) ->

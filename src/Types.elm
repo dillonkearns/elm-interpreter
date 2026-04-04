@@ -66,7 +66,7 @@ type Value
     | Triple Value Value Value
     | Record (Dict String Value)
     | Custom QualifiedNameRef (List Value)
-    | PartiallyApplied Env (List Value) (List (Node Pattern)) (Maybe QualifiedNameRef) Implementation
+    | PartiallyApplied Env (List Value) (List (Node Pattern)) (Maybe QualifiedNameRef) Implementation Int {- cached arity (List.length patterns) -}
     | JsArray (Array Value)
     | List (List Value)
     | JsonValue JsonVal

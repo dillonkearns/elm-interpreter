@@ -561,7 +561,7 @@ function evalFunctionWith inSelector _ outSelector =
         fromValue : Value -> Maybe (from -> Eval to)
         fromValue value =
             case value of
-                PartiallyApplied localEnv oldArgs patterns maybeName implementation ->
+                PartiallyApplied localEnv oldArgs patterns maybeName implementation _ ->
                     Just
                         (\arg cfg _ ->
                             evalFunctionWith (oldArgs ++ [ inSelector.toValue arg ]) patterns maybeName implementation cfg localEnv
@@ -843,6 +843,7 @@ partiallyApply moduleName args implementation =
                     }
                 )
                 (AstImpl implementation.expression)
+                (List.length implementation.arguments)
 
 
 twoNumbers :
@@ -961,7 +962,7 @@ regexReplaceAtMost evalFn _ =
         case args of
             [ Int n, regexVal, replacerVal, String str ] ->
                 case replacerVal of
-                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation ->
+                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
                         let
                             applyReplacer : Value -> Eval Value
                             applyReplacer matchVal c _ =
@@ -1127,7 +1128,7 @@ bytesDecodeKernel evalFn _ =
         case args of
             [ decoderFn, bsArg ] ->
                 case decoderFn of
-                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation ->
+                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
                         let
                             applyDecoder : Value -> Eval (Value -> Eval Value)
                             applyDecoder arg c _ =
@@ -1135,7 +1136,7 @@ bytesDecodeKernel evalFn _ =
                                     |> EvalResult.onValue
                                         (\result ->
                                             case result of
-                                                PartiallyApplied cEnv oArgs pats mName impl ->
+                                                PartiallyApplied cEnv oArgs pats mName impl _ ->
                                                     Ok (\arg2 c2 _ -> evalFn (oArgs ++ [ arg2 ]) pats mName impl c2 cEnv)
 
                                                 _ ->
@@ -1255,7 +1256,7 @@ writeStub4 _ _ =
 applyPredicate : EvalFunction -> Value -> Value -> Types.Config -> Types.Env -> Types.EvalResult Bool
 applyPredicate evalFn predicate charArg cfg env =
     case predicate of
-        PartiallyApplied closureEnv oldArgs patterns maybeName implementation ->
+        PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
             evalFn (oldArgs ++ [ charArg ]) patterns maybeName implementation cfg closureEnv
                 |> EvalResult.onValue
                     (\result ->
