@@ -282,7 +282,16 @@ callNoStack moduleName name env =
             moduleKey moduleName
     in
     if key == env.currentModuleKey then
-        { env | callDepth = env.callDepth + 1 }
+        -- Reset letFunctions when calling a MODULE-LEVEL function
+        -- (one that exists in the shared functions dict). This prevents
+        -- let-function names from leaking across scope boundaries.
+        -- When calling a LET-function (not in shared dict), keep
+        -- letFunctions so self-recursion works.
+        if Dict.member name (Dict.get key env.shared.functions |> Maybe.withDefault Dict.empty) then
+            { env | callDepth = env.callDepth + 1, letFunctions = Dict.empty }
+
+        else
+            { env | callDepth = env.callDepth + 1 }
 
     else
         { currentModule = moduleName

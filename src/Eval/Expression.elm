@@ -456,39 +456,42 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
             continuation Unit
 
         Expression.FunctionOrValue [] name ->
-            case Dict.get name env.values of
-                Just (PartiallyApplied _ [] [] _ _ _) ->
-                    -- Zero-arg thunk, needs call path via trampoline
-                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+            -- Check letFunctions FIRST (let-defined functions for current scope).
+            -- This ensures inner let-functions shadow same-named entries in values
+            -- that may come from record destructuring in an outer scope.
+            -- Skip the dict lookup when letFunctions is empty (the common case).
+            case (if Dict.isEmpty env.letFunctions then Nothing else Dict.get name env.letFunctions) of
+                Just function ->
+                    if List.isEmpty function.arguments then
+                        Types.recurseThen ( fullExpr, cfg, env ) continuation
 
-                Just value ->
-                    continuation value
+                    else
+                        continuation
+                            (PartiallyApplied
+                                (if cfg.trace then
+                                    Environment.call env.currentModule name env
+
+                                 else
+                                    Environment.callNoStack env.currentModule name env
+                                )
+                                []
+                                function.arguments
+                                (Just { moduleName = env.currentModule, name = name })
+                                (AstImpl function.expression)
+                                (List.length function.arguments)
+                            )
 
                 Nothing ->
-                    -- Check letFunctions (scope-local self-recursive let-functions)
-                    case Dict.get name env.letFunctions of
-                        Just function ->
-                            if List.isEmpty function.arguments then
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                    -- Then check values (local bindings, parameters, record destructuring)
+                    case Dict.get name env.values of
+                        Just (PartiallyApplied _ [] [] _ _ _) ->
+                            Types.recurseThen ( fullExpr, cfg, env ) continuation
 
-                            else
-                                continuation
-                                    (PartiallyApplied
-                                        (if cfg.trace then
-                                            Environment.call env.currentModule name env
-
-                                         else
-                                            Environment.callNoStack env.currentModule name env
-                                        )
-                                        []
-                                        function.arguments
-                                        (Just { moduleName = env.currentModule, name = name })
-                                        (AstImpl function.expression)
-                                        (List.length function.arguments)
-                                    )
+                        Just value ->
+                            continuation value
 
                         Nothing ->
-                            -- Check currentModuleFunctions (module-level functions)
+                            -- Then check currentModuleFunctions (module-level functions)
                             case Dict.get name env.currentModuleFunctions of
                                 Just function ->
                                     if List.isEmpty function.arguments then
@@ -1938,17 +1941,33 @@ evalFunctionOrValue : ModuleName -> String -> PartialEval Value
 evalFunctionOrValue moduleName name cfg env =
     case moduleName of
         [] ->
-            -- Fast path: local value lookup before isVariant check.
-            -- Avoids String.uncons + Char.toCode for the most common case.
-            case Dict.get name env.values of
-                Just (PartiallyApplied localEnv [] [] maybeName implementation _) ->
-                    call maybeName implementation cfg localEnv
+            -- Check letFunctions first (inner let-functions shadow outer bindings)
+            case Dict.get name env.letFunctions of
+                Just function ->
+                    if List.isEmpty function.arguments then
+                        call (Just { moduleName = env.currentModule, name = name }) (AstImpl function.expression) cfg env
 
-                Just value ->
-                    Types.succeedPartial value
+                    else
+                        Types.succeedPartial <|
+                            PartiallyApplied
+                                (Environment.callNoStack env.currentModule name env)
+                                []
+                                function.arguments
+                                (Just { moduleName = env.currentModule, name = name })
+                                (AstImpl function.expression)
+                                (List.length function.arguments)
 
                 Nothing ->
-                    evalQualifiedOrVariant [] name cfg env
+                    -- Then check values (local bindings, parameters)
+                    case Dict.get name env.values of
+                        Just (PartiallyApplied localEnv [] [] maybeName implementation _) ->
+                            call maybeName implementation cfg localEnv
+
+                        Just value ->
+                            Types.succeedPartial value
+
+                        Nothing ->
+                            evalQualifiedOrVariant [] name cfg env
 
         _ ->
             evalQualifiedOrVariant moduleName name cfg env
@@ -2704,26 +2723,20 @@ addLetDeclaration ((Node _ letDeclaration) as node) cfg env =
                             envWithFn =
                                 Environment.addLetFunction implementation env
 
-                            -- Create a placeholder PA for the values entry
-                            -- (captures env with self in currentModuleFunctions)
-                            pa : Value
-                            pa =
-                                PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) arity
-
-                            -- Closure env: self in both currentModuleFunctions AND values
-                            closureEnv : Env
-                            closureEnv =
-                                Environment.addValue fnName pa envWithFn
-
-                            -- Final PA captures closureEnv (has self in both places)
+                            -- The PA captures envWithFn which has the function in
+                            -- letFunctions for self-recursion. NOT in values — this
+                            -- prevents the let-function from leaking through the
+                            -- closure env into other scopes via callNoStack.
                             paFinal : Value
                             paFinal =
-                                PartiallyApplied closureEnv [] implementation.arguments Nothing (AstImpl implementation.expression) arity
+                                PartiallyApplied envWithFn [] implementation.arguments Nothing (AstImpl implementation.expression) arity
                         in
-                        -- The RETURNED env gets the function in values only,
-                        -- with currentModuleFunctions UNCHANGED from the input env.
+                        -- The RETURNED env gets the function in letFunctions only.
+                        -- NOT in values — this prevents the let-function from
+                        -- leaking into closures captured in the enclosing scope.
+                        -- The let body finds it through the letFunctions lookup path.
                         EvalResult.succeed <|
-                            Environment.addValue fnName paFinal env
+                            Environment.addLetFunction implementation env
 
                     else
                         evalExpression expression cfg env
