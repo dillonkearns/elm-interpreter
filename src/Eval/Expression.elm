@@ -1580,8 +1580,27 @@ need TCO. This avoids wrapping every non-recursive function in a tcoLoop.
 -}
 isTailRecursive : String -> Node Expression -> Bool
 isTailRecursive funcName ((Node _ expr) as node) =
-    -- First: must actually contain a self-call somewhere
-    containsSelfCall funcName expr
+    -- Quick reject: bodies that can't possibly be tail-recursive
+    -- (no branching or application structure). This avoids the
+    -- expensive containsSelfCall AST walk for simple expressions.
+    (case expr of
+        Expression.IfBlock _ _ _ ->
+            True
+
+        Expression.CaseExpression _ ->
+            True
+
+        Expression.LetExpression _ ->
+            True
+
+        Expression.Application _ ->
+            True
+
+        _ ->
+            False
+    )
+        -- Only do the full AST walk if the body has the right structure
+        && containsSelfCall funcName expr
         && isTailRecursiveHelper funcName node
 
 
