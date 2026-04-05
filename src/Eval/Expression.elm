@@ -1668,7 +1668,7 @@ call maybeQualifiedName implementation cfg env =
                         -- Static analysis confirmed tail-recursive: use tcoLoop
                         let
                             tcoCfg =
-                                { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey }
+                                { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts }
 
                             limit =
                                 case cfg.maxSteps of
@@ -1686,11 +1686,11 @@ call maybeQualifiedName implementation cfg env =
                         -- Not tail-recursive: normal trampoline.
                         -- Clear tcoTarget to prevent false TailCall signals from
                         -- functions with the same name called deeper in the stack.
-                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing }, newEnv )
+                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, newEnv )
 
                 Nothing ->
                     -- Anonymous function: clear tcoTarget for same reason.
-                    Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing }, env )
+                    Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, env )
 
         KernelImpl moduleName name f ->
             if cfg.trace then
@@ -1938,7 +1938,7 @@ tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
     else
         let
             innerCfg =
-                { trace = cfg.trace, maxSteps = Nothing, tcoTarget = cfg.tcoTarget }
+                { trace = cfg.trace, maxSteps = Nothing, tcoTarget = cfg.tcoTarget, callCounts = cfg.callCounts, intercepts = cfg.intercepts }
 
             result =
                 evalExpression body innerCfg env
