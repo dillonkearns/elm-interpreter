@@ -80,10 +80,11 @@ fingerprintValue value =
             Array.length arr * 73 + 13
 
         PartiallyApplied closureEnv args _ maybeName _ arity ->
-            -- Fingerprint based on arity, applied args, function identity,
-            -- AND captured environment values. This ensures closures at
-            -- different parser positions (different captured state) produce
-            -- different fingerprints, preventing false cycle detection.
+            -- Fingerprint based on arity, applied args count, function name,
+            -- and a cheap summary of the captured environment (size only, not
+            -- deep value walk). This is fast O(1) per PA instead of O(N).
+            -- False positives are handled by Category A's threshold (3 or 500
+            -- depending on whether args contain closures).
             let
                 nameHash =
                     case maybeName of
@@ -92,28 +93,8 @@ fingerprintValue value =
 
                         Nothing ->
                             0
-
-                argsHash =
-                    List.foldl (\a acc -> Bitwise.xor (acc * 31) (fingerprintValue a)) 0 args
-
-                -- Include captured env values in fingerprint.
-                -- This is the key fix for parser combinators: the parser state
-                -- (position offset) lives in the captured env, not in the args.
-                envHash =
-                    Dict.foldl
-                        (\_ v acc ->
-                            case v of
-                                PartiallyApplied _ _ _ _ _ _ ->
-                                    -- Don't recurse into nested closures (expensive + cycles)
-                                    acc + 17
-
-                                _ ->
-                                    Bitwise.xor (acc * 31) (fingerprintValue v)
-                        )
-                        0
-                        closureEnv.values
             in
-            Bitwise.xor (arity * 83 + List.length args * 89 + nameHash + 14) (Bitwise.xor argsHash envHash)
+            arity * 83 + List.length args * 89 + nameHash + Dict.size closureEnv.values * 97 + 14
 
         _ ->
             0
@@ -181,25 +162,38 @@ checkAndUpdateCycle qualifiedName args callDepth checkDict =
         fnKey =
             Syntax.qualifiedNameToString qualifiedName
 
+        -- Always compute fingerprint (cheap for most value types)
         fp =
             fingerprintArgs args
-
-        sz =
-            sizeOfArgs args
-
-        perArgSzs =
-            List.map sizeOfValue args
-
-        perArgFps =
-            List.map fingerprintValue args
     in
     case Dict.get fnKey checkDict of
         Nothing ->
+            -- First call: compute everything for baseline
+            let
+                sz =
+                    sizeOfArgs args
+
+                perArgSzs =
+                    List.map sizeOfValue args
+
+                perArgFps =
+                    List.map fingerprintValue args
+            in
             Continue (Dict.insert fnKey { fingerprint = fp, depth = callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } checkDict)
 
         Just entry ->
             if entry.depth >= callDepth then
-                -- Not recursive (function returned and was called again)
+                -- Not recursive: only compute what we need for the new entry
+                let
+                    sz =
+                        sizeOfArgs args
+
+                    perArgSzs =
+                        List.map sizeOfValue args
+
+                    perArgFps =
+                        List.map fingerprintValue args
+                in
                 Continue (Dict.insert fnKey { fingerprint = fp, depth = callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } checkDict)
 
             else if entry.fingerprint == fp then
@@ -241,7 +235,17 @@ checkAndUpdateCycle qualifiedName args callDepth checkDict =
 
             else
                 -- Fingerprint changed. Check Category B: is total size growing?
+                -- Only compute size/per-arg data here (deferred from above).
                 let
+                    sz =
+                        sizeOfArgs args
+
+                    perArgSzs =
+                        List.map sizeOfValue args
+
+                    perArgFps =
+                        List.map fingerprintValue args
+
                     -- "Bounded progress" = any arg has constant size but changing fingerprint.
                     -- This detects countdown variables (Int decreasing toward base case)
                     -- whose size stays 1 but whose value changes each call.
@@ -1582,8 +1586,27 @@ need TCO. This avoids wrapping every non-recursive function in a tcoLoop.
 -}
 isTailRecursive : String -> Node Expression -> Bool
 isTailRecursive funcName ((Node _ expr) as node) =
-    -- First: must actually contain a self-call somewhere
-    containsSelfCall funcName expr
+    -- Quick reject: bodies that can't possibly be tail-recursive
+    -- (no branching or application structure). This avoids the
+    -- expensive containsSelfCall AST walk for simple expressions.
+    (case expr of
+        Expression.IfBlock _ _ _ ->
+            True
+
+        Expression.CaseExpression _ ->
+            True
+
+        Expression.LetExpression _ ->
+            True
+
+        Expression.Application _ ->
+            True
+
+        _ ->
+            False
+    )
+        -- Only do the full AST walk if the body has the right structure
+        && containsSelfCall funcName expr
         && isTailRecursiveHelper funcName node
 
 

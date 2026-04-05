@@ -1,4 +1,4 @@
-module Kernel.List exposing (append, filter, foldl, foldr, map, range, sortBy, sortWith)
+module Kernel.List exposing (all, any, append, concatMap, filter, filterMap, foldl, foldr, indexedMap, map, range, sortBy, sortWith)
 
 {-| Native kernel implementations for List sorting.
 
@@ -217,3 +217,150 @@ insert compare x sorted cfg env =
                                 insert compare x rest cfg env
                                     |> EvalResult.map (\inserted -> y :: inserted)
                     )
+
+
+{-| Kernel List.concatMap: map then flatten. Iterates in host Elm.
+-}
+concatMap : (Value -> Eval (List Value)) -> List Value -> Eval (List Value)
+concatMap f xs cfg env =
+    concatMapHelp f xs [] cfg env
+
+
+concatMapHelp : (Value -> Eval (List Value)) -> List Value -> List Value -> Eval (List Value)
+concatMapHelp f remaining acc cfg env =
+    let
+        innerCfg =
+            { cfg | tcoTarget = Nothing }
+    in
+    case remaining of
+        [] ->
+            EvalResult.succeed (List.reverse acc)
+
+        x :: rest ->
+            case EvalResult.toResult (f x innerCfg env) of
+                Ok mapped ->
+                    concatMapHelp f rest (List.foldl (::) acc mapped) cfg env
+
+                Err e ->
+                    EvErr e
+
+
+{-| Kernel List.filterMap: map with Maybe filter. Iterates in host Elm.
+-}
+filterMap : (Value -> Eval Value) -> List Value -> Eval (List Value)
+filterMap f xs cfg env =
+    filterMapHelp f xs [] cfg env
+
+
+filterMapHelp : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
+filterMapHelp f remaining acc cfg env =
+    let
+        innerCfg =
+            { cfg | tcoTarget = Nothing }
+    in
+    case remaining of
+        [] ->
+            EvalResult.succeed (List.reverse acc)
+
+        x :: rest ->
+            case EvalResult.toResult (f x innerCfg env) of
+                Ok result ->
+                    case result of
+                        Custom { name } [ value ] ->
+                            if name == "Just" then
+                                filterMapHelp f rest (value :: acc) cfg env
+
+                            else
+                                filterMapHelp f rest acc cfg env
+
+                        Custom { name } [] ->
+                            if name == "Nothing" then
+                                filterMapHelp f rest acc cfg env
+
+                            else
+                                filterMapHelp f rest acc cfg env
+
+                        _ ->
+                            filterMapHelp f rest acc cfg env
+
+                Err e ->
+                    EvErr e
+
+
+{-| Kernel List.indexedMap: map with index. Iterates in host Elm.
+-}
+indexedMap : (Value -> Eval (Value -> Eval Value)) -> List Value -> Eval (List Value)
+indexedMap f xs cfg env =
+    indexedMapHelp f 0 xs [] cfg env
+
+
+indexedMapHelp : (Value -> Eval (Value -> Eval Value)) -> Int -> List Value -> List Value -> Eval (List Value)
+indexedMapHelp f index remaining acc cfg env =
+    let
+        innerCfg =
+            { cfg | tcoTarget = Nothing }
+    in
+    case remaining of
+        [] ->
+            EvalResult.succeed (List.reverse acc)
+
+        x :: rest ->
+            case EvalResult.toResult (f (Int index) innerCfg env) of
+                Ok g ->
+                    case EvalResult.toResult (g x innerCfg env) of
+                        Ok mapped ->
+                            indexedMapHelp f (index + 1) rest (mapped :: acc) cfg env
+
+                        Err e ->
+                            EvErr e
+
+                Err e ->
+                    EvErr e
+
+
+{-| Kernel List.any: short-circuiting search. Iterates in host Elm.
+-}
+any : (Value -> Eval Bool) -> List Value -> Eval Bool
+any pred xs cfg env =
+    let
+        innerCfg =
+            { cfg | tcoTarget = Nothing }
+    in
+    case xs of
+        [] ->
+            EvalResult.succeed False
+
+        x :: rest ->
+            case EvalResult.toResult (pred x innerCfg env) of
+                Ok True ->
+                    EvalResult.succeed True
+
+                Ok False ->
+                    any pred rest cfg env
+
+                Err e ->
+                    EvErr e
+
+
+{-| Kernel List.all: short-circuiting check. Iterates in host Elm.
+-}
+all : (Value -> Eval Bool) -> List Value -> Eval Bool
+all pred xs cfg env =
+    let
+        innerCfg =
+            { cfg | tcoTarget = Nothing }
+    in
+    case xs of
+        [] ->
+            EvalResult.succeed True
+
+        x :: rest ->
+            case EvalResult.toResult (pred x innerCfg env) of
+                Ok True ->
+                    all pred rest cfg env
+
+                Ok False ->
+                    EvalResult.succeed False
+
+                Err e ->
+                    EvErr e

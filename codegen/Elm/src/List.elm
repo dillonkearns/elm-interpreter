@@ -132,7 +132,7 @@ element (starting at zero).
 -}
 indexedMap : (Int -> a -> b) -> List a -> List b
 indexedMap f xs =
-  map2 f (range 0 (length xs - 1)) xs
+  Elm.Kernel.List.indexedMap f xs
 
 
 {-| Reduce a list from the left.
@@ -222,7 +222,7 @@ from an untrusted source and you want to turn them into numbers:
 -}
 filterMap : (a -> Maybe b) -> List a -> List b
 filterMap f xs =
-  foldr (maybeCons f) [] xs
+  Elm.Kernel.List.filterMap f xs
 
 
 maybeCons : (a -> Maybe b) -> a -> List b -> List b
@@ -274,7 +274,7 @@ member x xs =
 -}
 all : (a -> Bool) -> List a -> Bool
 all isOkay list =
-  not (any (not << isOkay) list)
+  Elm.Kernel.List.all isOkay list
 
 
 {-| Determine if any elements satisfy some test.
@@ -285,17 +285,7 @@ all isOkay list =
 -}
 any : (a -> Bool) -> List a -> Bool
 any isOkay list =
-  case list of
-    [] ->
-      False
-
-    x :: xs ->
-      -- note: (isOkay x || any isOkay xs) would not get TCO
-      if isOkay x then
-        True
-
-      else
-        any isOkay xs
+  Elm.Kernel.List.any isOkay list
 
 
 {-| Find the maximum element in a non-empty list.
@@ -383,7 +373,7 @@ concat lists =
 -}
 concatMap : (a -> List b) -> List a -> List b
 concatMap f list =
-  concat (map f list)
+  Elm.Kernel.List.concatMap f list
 
 
 {-| Places the given value between all members of the given list.

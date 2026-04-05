@@ -4,3 +4,4 @@ dist
 generated
 build
 package-lock.json
+benchmark/benchmark.js
