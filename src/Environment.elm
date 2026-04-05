@@ -288,10 +288,30 @@ callNoStack moduleName name env =
         -- When calling a LET-function (not in shared dict), keep
         -- letFunctions so self-recursion works.
         if Dict.member name (Dict.get key env.shared.functions |> Maybe.withDefault Dict.empty) then
-            { env | callDepth = env.callDepth + 1, letFunctions = Dict.empty }
+            { currentModule = env.currentModule
+            , currentModuleKey = env.currentModuleKey
+            , callStack = env.callStack
+            , shared = env.shared
+            , currentModuleFunctions = env.currentModuleFunctions
+            , letFunctions = Dict.empty
+            , values = env.values
+            , imports = env.imports
+            , callDepth = env.callDepth + 1
+            , recursionCheck = env.recursionCheck
+            }
 
         else
-            { env | callDepth = env.callDepth + 1 }
+            { currentModule = env.currentModule
+            , currentModuleKey = env.currentModuleKey
+            , callStack = env.callStack
+            , shared = env.shared
+            , currentModuleFunctions = env.currentModuleFunctions
+            , letFunctions = env.letFunctions
+            , values = env.values
+            , imports = env.imports
+            , callDepth = env.callDepth + 1
+            , recursionCheck = env.recursionCheck
+            }
 
     else
         { currentModule = moduleName
