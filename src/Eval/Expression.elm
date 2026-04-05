@@ -1650,47 +1650,60 @@ call maybeQualifiedName implementation cfg env =
                         newEnv =
                             callFn qualifiedName.moduleName qualifiedName.name env
                     in
-                    let
-                        tcoKey =
-                            Syntax.qualifiedNameToString qualifiedName
-                    in
-                    if cfg.tcoTarget == Just tcoKey then
-                        -- Inside a tcoLoop: signal TailCall to the loop
-                        Recursion.base
-                            (EvErr
-                                { currentModule = env.currentModule
-                                , callStack = env.callStack
-                                , error = TailCall env.values
-                                }
-                            )
+                    case cfg.tcoTarget of
+                        Just target ->
+                            let
+                                tcoKey =
+                                    Syntax.qualifiedNameToString qualifiedName
+                            in
+                            if target == tcoKey then
+                                -- Inside a tcoLoop: signal TailCall
+                                Recursion.base
+                                    (EvErr
+                                        { currentModule = env.currentModule
+                                        , callStack = env.callStack
+                                        , error = TailCall env.values
+                                        }
+                                    )
 
-                    else if isTailRecursive qualifiedName.name expr then
-                        -- Static analysis confirmed tail-recursive: use tcoLoop
-                        let
-                            tcoCfg =
-                                { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts }
+                            else if isTailRecursive qualifiedName.name expr then
+                                let
+                                    limit =
+                                        case cfg.maxSteps of
+                                            Just n -> n
+                                            Nothing -> 500000
+                                in
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts } newEnv)
 
-                            limit =
-                                case cfg.maxSteps of
-                                    Just n ->
-                                        n
+                            else
+                                -- Not tail-recursive: clear tcoTarget
+                                Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, newEnv )
 
-                                    Nothing ->
-                                        -- No step limit: use generous default for legitimate programs.
-                                        -- Infinite loops are caught by cycle detection in tcoLoop.
-                                        500000
-                        in
-                        Recursion.base (tcoLoop tcoKey expr limit tcoCfg newEnv)
+                        Nothing ->
+                            -- No tcoTarget: skip qualifiedNameToString for tcoKey
+                            if isTailRecursive qualifiedName.name expr then
+                                let
+                                    tcoKey =
+                                        Syntax.qualifiedNameToString qualifiedName
 
-                    else
-                        -- Not tail-recursive: normal trampoline.
-                        -- Clear tcoTarget to prevent false TailCall signals from
-                        -- functions with the same name called deeper in the stack.
-                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, newEnv )
+                                    limit =
+                                        case cfg.maxSteps of
+                                            Just n -> n
+                                            Nothing -> 500000
+                                in
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts } newEnv)
+
+                            else
+                                -- Common case: not TCO, no tcoTarget — pass cfg as-is
+                                Recursion.recurse ( expr, cfg, newEnv )
 
                 Nothing ->
-                    -- Anonymous function: clear tcoTarget for same reason.
-                    Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, env )
+                    -- Anonymous function
+                    if cfg.tcoTarget == Nothing then
+                        Recursion.recurse ( expr, cfg, env )
+
+                    else
+                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, env )
 
         KernelImpl moduleName name f ->
             if cfg.trace then

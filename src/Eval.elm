@@ -2,6 +2,7 @@ module Eval exposing (eval, evalWithMaxSteps, indent, toModule, trace)
 
 import Elm.Syntax.Expression as Expression exposing (Expression)
 import Eval.Module
+import FastDict as Dict
 import Rope exposing (Rope)
 import Types exposing (CallTree, Config, Error, Value)
 
