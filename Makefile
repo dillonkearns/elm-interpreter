@@ -28,22 +28,26 @@ build/%.tar.gz:
 build/src/%/elm.json: build/%.tar.gz
 	mkdir -p $(@D)
 	tar -xf $< --strip-components=1 -C $(@D) -m
+	@# Remove files that have source overrides, so the override copy rules fire
+	@for f in $(CORE_SRC_OVERRIDES); do rm -f "$$f"; done
 
 $(KERNEL_PATH)/src/Elm/Kernel/List.elm: $(wildcard codegen/Elm/Kernel/*.elm)
 	mkdir -p $(KERNEL_PATH)/src/Elm
 	cp -r codegen/Elm/Kernel $(KERNEL_PATH)/src/Elm/
 
-# Copy source overrides into downloaded library trees so codegen picks them up
-build/src/elm/core/1.0.5/src/Task.elm: codegen/Elm/src/Task.elm build/src/elm/core/1.0.5/elm.json
+# Copy source overrides into downloaded library trees so codegen picks them up.
+# Use order-only prerequisites (|) for elm.json since tar extraction with -m
+# creates files with current timestamps that would make overrides appear stale.
+build/src/elm/core/1.0.5/src/Task.elm: codegen/Elm/src/Task.elm | build/src/elm/core/1.0.5/elm.json
 	cp $< $@
 
-build/src/elm/core/1.0.5/src/List.elm: codegen/Elm/src/List.elm build/src/elm/core/1.0.5/elm.json
+build/src/elm/core/1.0.5/src/List.elm: codegen/Elm/src/List.elm | build/src/elm/core/1.0.5/elm.json
 	cp $< $@
 
-build/src/elm/bytes/1.0.8/src/Bytes/Decode.elm: codegen/Elm/src/Bytes/Decode.elm build/src/elm/bytes/1.0.8/elm.json
+build/src/elm/bytes/1.0.8/src/Bytes/Decode.elm: codegen/Elm/src/Bytes/Decode.elm | build/src/elm/bytes/1.0.8/elm.json
 	cp $< $@
 
-build/src/elm/bytes/1.0.8/src/Bytes/Encode.elm: codegen/Elm/src/Bytes/Encode.elm build/src/elm/bytes/1.0.8/elm.json
+build/src/elm/bytes/1.0.8/src/Bytes/Encode.elm: codegen/Elm/src/Bytes/Encode.elm | build/src/elm/bytes/1.0.8/elm.json
 	cp $< $@
 
 ALL_GENERATED = $(shell find generated -type f -name '*.elm')
