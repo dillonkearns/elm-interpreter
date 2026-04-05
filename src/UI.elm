@@ -741,7 +741,7 @@ update msg model =
 
                 ( result, callTree, logLines ) =
                     Eval.Module.traceOrEvalModule
-                        { trace = tracing, maxSteps = Nothing, tcoTarget = Nothing }
+                        { trace = tracing, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing }
                         moduleSource
                         (Expression.FunctionOrValue [] "main")
 

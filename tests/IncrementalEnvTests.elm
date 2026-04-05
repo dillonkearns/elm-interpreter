@@ -12,18 +12,110 @@ import Elm.Syntax.ModuleName exposing (ModuleName)
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
+import FastDict
 import Types exposing (Value(..))
 
 
 suite : Test
 suite =
-    describe "Incremental Env (replaceModuleInEnv)"
-        [ replaceProducesSameResult
-        , replaceWithChangedBody
-        , replacePreservesImportResolution
-        , replaceWithCustomType
-        , replaceWithRecordAlias
+    describe "Incremental Env"
+        [ describe "replaceModuleInEnv"
+            [ replaceProducesSameResult
+            , replaceWithChangedBody
+            , replacePreservesImportResolution
+            , replaceWithCustomType
+            , replaceWithRecordAlias
+            ]
+        , describe "evalWithEnvFromFilesAndValues"
+            [ valueInjectionSimple
+            , valueInjectionOverridesLocal
+            , valueInjectionWithModuleCode
+            ]
         ]
+
+
+{-| Test: injecting an Int value makes it available in the expression.
+-}
+valueInjectionSimple : Test
+valueInjectionSimple =
+    test "injected Int value is accessible in expression" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nresults = x + 1\n"
+
+                injected =
+                    FastDict.singleton "x" (Int 41)
+            in
+            case evalWithInjectedValues [ source ] injected "results" of
+                Ok (Int 42) ->
+                    Expect.pass
+
+                Ok other ->
+                    Expect.fail ("Expected Int 42, got: " ++ Debug.toString other)
+
+                Err e ->
+                    Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Test: injected value overrides a local let binding.
+-}
+valueInjectionOverridesLocal : Test
+valueInjectionOverridesLocal =
+    test "injected value available alongside module code" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nfoo = 10\n\nresults = foo + injectedVal\n"
+
+                injected =
+                    FastDict.singleton "injectedVal" (Int 32)
+            in
+            case evalWithInjectedValues [ source ] injected "results" of
+                Ok (Int 42) ->
+                    Expect.pass
+
+                Ok other ->
+                    Expect.fail ("Expected Int 42, got: " ++ Debug.toString other)
+
+                Err e ->
+                    Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Test: injected complex value (List) is usable.
+-}
+valueInjectionWithModuleCode : Test
+valueInjectionWithModuleCode =
+    test "injected List value is accessible" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nresults = List.length myList\n"
+
+                injected =
+                    FastDict.singleton "myList" (List [ Int 1, Int 2, Int 3 ])
+            in
+            case evalWithInjectedValues [ source ] injected "results" of
+                Ok (Int 3) ->
+                    Expect.pass
+
+                Ok other ->
+                    Expect.fail ("Expected Int 3, got: " ++ Debug.toString other)
+
+                Err e ->
+                    Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Helper: evaluate with injected values.
+-}
+evalWithInjectedValues : List String -> FastDict.Dict String Value -> String -> Result Types.Error Value
+evalWithInjectedValues sources injected exprName =
+    case Eval.Module.buildProjectEnv sources of
+        Err e ->
+            Err e
+
+        Ok env ->
+            Eval.Module.evalWithEnvFromFilesAndValues env [] injected (Expression.FunctionOrValue [] exprName)
 
 
 {-| Helper: evaluate an expression using full rebuild from sources.

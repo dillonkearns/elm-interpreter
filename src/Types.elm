@@ -1,4 +1,4 @@
-module Types exposing (CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
+module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -38,6 +38,16 @@ type alias Config =
     { trace : Bool
     , maxSteps : Maybe Int
     , tcoTarget : Maybe String
+    , callCounts : Maybe CallCounts
+    }
+
+
+{-| Lightweight call counting for profiling. Tracks how many times each
+qualified function is called, and how many of those had identical argument
+fingerprints (memoization candidates).
+-}
+type alias CallCounts =
+    { calls : Dict String { count : Int, uniqueFingerprints : Int, lastFingerprint : Int }
     }
 
 
