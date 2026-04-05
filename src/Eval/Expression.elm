@@ -80,10 +80,11 @@ fingerprintValue value =
             Array.length arr * 73 + 13
 
         PartiallyApplied closureEnv args _ maybeName _ arity ->
-            -- Fingerprint based on arity, applied args, function identity,
-            -- AND captured environment values. This ensures closures at
-            -- different parser positions (different captured state) produce
-            -- different fingerprints, preventing false cycle detection.
+            -- Fingerprint based on arity, applied args count, function name,
+            -- and a cheap summary of the captured environment (size only, not
+            -- deep value walk). This is fast O(1) per PA instead of O(N).
+            -- False positives are handled by Category A's threshold (3 or 500
+            -- depending on whether args contain closures).
             let
                 nameHash =
                     case maybeName of
@@ -92,28 +93,8 @@ fingerprintValue value =
 
                         Nothing ->
                             0
-
-                argsHash =
-                    List.foldl (\a acc -> Bitwise.xor (acc * 31) (fingerprintValue a)) 0 args
-
-                -- Include captured env values in fingerprint.
-                -- This is the key fix for parser combinators: the parser state
-                -- (position offset) lives in the captured env, not in the args.
-                envHash =
-                    Dict.foldl
-                        (\_ v acc ->
-                            case v of
-                                PartiallyApplied _ _ _ _ _ _ ->
-                                    -- Don't recurse into nested closures (expensive + cycles)
-                                    acc + 17
-
-                                _ ->
-                                    Bitwise.xor (acc * 31) (fingerprintValue v)
-                        )
-                        0
-                        closureEnv.values
             in
-            Bitwise.xor (arity * 83 + List.length args * 89 + nameHash + 14) (Bitwise.xor argsHash envHash)
+            arity * 83 + List.length args * 89 + nameHash + Dict.size closureEnv.values * 97 + 14
 
         _ ->
             0
