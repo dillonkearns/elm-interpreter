@@ -33,12 +33,25 @@ mapHelp f remaining acc cfg env =
             EvalResult.succeed (List.reverse acc)
 
         x :: rest ->
-            case EvalResult.toResult (f x innerCfg env) of
-                Ok mapped ->
-                    mapHelp f rest (mapped :: acc) cfg env
+            case f x innerCfg env of
+                EvYield tag payload resume ->
+                    EvYield tag payload
+                        (\v ->
+                            case EvalResult.toResult (resume v) of
+                                Ok mapped ->
+                                    mapHelp f rest (mapped :: acc) cfg env
 
-                Err e ->
-                    EvErr e
+                                Err e ->
+                                    EvErr e
+                        )
+
+                fxResult ->
+                    case EvalResult.toResult fxResult of
+                        Ok mapped ->
+                            mapHelp f rest (mapped :: acc) cfg env
+
+                        Err e ->
+                            EvErr e
 
 
 {-| Kernel List.foldl: reduces a list from the left.
@@ -63,17 +76,48 @@ foldlHelp f acc remaining cfg env =
             EvalResult.succeed acc
 
         x :: rest ->
-            case EvalResult.toResult (f x innerCfg env) of
-                Err e ->
-                    EvErr e
+            let
+                -- Apply the accumulator function to get the step result
+                applyStep g =
+                    case g acc innerCfg env of
+                        EvYield tag2 payload2 resume2 ->
+                            EvYield tag2 payload2
+                                (\v2 ->
+                                    case EvalResult.toResult (resume2 v2) of
+                                        Ok newAcc ->
+                                            foldlHelp f newAcc rest cfg env
 
-                Ok g ->
-                    case EvalResult.toResult (g acc innerCfg env) of
+                                        Err e ->
+                                            EvErr e
+                                )
+
+                        gResult ->
+                            case EvalResult.toResult gResult of
+                                Err e ->
+                                    EvErr e
+
+                                Ok newAcc ->
+                                    foldlHelp f newAcc rest cfg env
+            in
+            case f x innerCfg env of
+                EvYield tag payload resume ->
+                    EvYield tag payload
+                        (\v ->
+                            case EvalResult.toResult (resume v) of
+                                Ok g ->
+                                    applyStep g
+
+                                Err e ->
+                                    EvErr e
+                        )
+
+                fxResult ->
+                    case EvalResult.toResult fxResult of
                         Err e ->
                             EvErr e
 
-                        Ok newAcc ->
-                            foldlHelp f newAcc rest cfg env
+                        Ok g ->
+                            applyStep g
 
 
 {-| Kernel List.filter: keeps elements where the predicate returns True.
@@ -237,12 +281,25 @@ concatMapHelp f remaining acc cfg env =
             EvalResult.succeed (List.reverse acc)
 
         x :: rest ->
-            case EvalResult.toResult (f x innerCfg env) of
-                Ok mapped ->
-                    concatMapHelp f rest (List.foldl (::) acc mapped) cfg env
+            case f x innerCfg env of
+                EvYield tag payload resume ->
+                    EvYield tag payload
+                        (\v ->
+                            case EvalResult.toResult (resume v) of
+                                Ok mapped ->
+                                    concatMapHelp f rest (List.foldl (::) acc mapped) cfg env
 
-                Err e ->
-                    EvErr e
+                                Err e ->
+                                    EvErr e
+                        )
+
+                fxResult ->
+                    case EvalResult.toResult fxResult of
+                        Ok mapped ->
+                            concatMapHelp f rest (List.foldl (::) acc mapped) cfg env
+
+                        Err e ->
+                            EvErr e
 
 
 {-| Kernel List.filterMap: map with Maybe filter. Iterates in host Elm.
