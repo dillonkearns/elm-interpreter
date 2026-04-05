@@ -53,6 +53,9 @@ suite =
             , codecRoundTripRecord
             , codecRoundTripCustom
             , codecRoundTripList
+            , codecRoundTripNestedCustom
+            , codecRoundTripDict
+            , codecContentHashEquality
             ]
         ]
 
@@ -690,3 +693,115 @@ codecRoundTripList =
 
                 Nothing ->
                     Expect.fail "Failed to decode List of Records"
+
+
+codecRoundTripNestedCustom : Test
+codecRoundTripNestedCustom =
+    test "round-trip nested Custom types (ContentHash, ContextHash)" <|
+        \_ ->
+            let
+                -- Simulate ContentHash (Int 455258608)
+                contentHash =
+                    Custom { moduleName = [ "Review", "Cache", "ContentHash" ], name = "ContentHash" } [ Int 455258608 ]
+
+                -- Simulate ContextHash (Int 2104301476)
+                contextHash =
+                    Custom { moduleName = [ "Review", "Cache", "ContextHash" ], name = "ContextHash" } [ Int 2104301476 ]
+
+                -- Simulate ComparableContextHash [ContextHash ...]
+                comparableHash =
+                    Custom { moduleName = [ "Review", "Cache", "ContextHash" ], name = "ComparableContextHash" } [ List [ contextHash ] ]
+
+                -- Simulate a ModuleCacheEntry
+                entry =
+                    Custom { moduleName = [ "Review", "Cache", "Module" ], name = "Entry" }
+                        [ Record
+                            (FastDict.fromList
+                                [ ( "contentHash", contentHash )
+                                , ( "inputContextHashes", comparableHash )
+                                , ( "isFileIgnored", Bool False )
+                                , ( "isFileFixable", Bool False )
+                                , ( "errors", List [] )
+                                , ( "outputContext", Record (FastDict.fromList [ ( "unused", List [] ) ]) )
+                                , ( "outputContextHash", contextHash )
+                                ]
+                            )
+                        ]
+            in
+            case ValueCodec.encodeValue entry |> ValueCodec.decodeValue of
+                Just decoded ->
+                    Expect.equal entry decoded
+
+                Nothing ->
+                    Expect.fail "Failed to decode ModuleCacheEntry-shaped value"
+
+
+{-| Test that ContentHash and ContextHash survive round-trip with == equality.
+This is what elm-review's match function checks.
+-}
+codecContentHashEquality : Test
+codecContentHashEquality =
+    test "ContentHash/ContextHash round-trip preserves == equality" <|
+        \_ ->
+            let
+                contentHash =
+                    Custom { moduleName = [ "Review", "Cache", "ContentHash" ], name = "ContentHash" } [ Int 455258608 ]
+
+                contextHash =
+                    Custom { moduleName = [ "Review", "Cache", "ContextHash" ], name = "ContextHash" } [ Int 2104301476 ]
+
+                comparableHash =
+                    Custom { moduleName = [ "Review", "Cache", "ContextHash" ], name = "ComparableContextHash" }
+                        [ List [ contextHash, contextHash ] ]
+
+                -- Round-trip each
+                contentRoundTrip =
+                    ValueCodec.encodeValue contentHash |> ValueCodec.decodeValue
+
+                contextRoundTrip =
+                    ValueCodec.encodeValue contextHash |> ValueCodec.decodeValue
+
+                comparableRoundTrip =
+                    ValueCodec.encodeValue comparableHash |> ValueCodec.decodeValue
+            in
+            Expect.all
+                [ \_ -> Expect.equal (Just contentHash) contentRoundTrip
+                , \_ -> Expect.equal (Just contextHash) contextRoundTrip
+                , \_ -> Expect.equal (Just comparableHash) comparableRoundTrip
+                ]
+                ()
+
+
+codecRoundTripDict : Test
+codecRoundTripDict =
+    test "round-trip Dict tree (RBNode_elm_builtin)" <|
+        \_ ->
+            let
+                -- Simulate a small Dict with 2 entries (like moduleContexts)
+                leaf =
+                    Custom { moduleName = [ "Dict" ], name = "RBEmpty_elm_builtin" } []
+
+                node1 =
+                    Custom { moduleName = [ "Dict" ], name = "RBNode_elm_builtin" }
+                        [ Custom { moduleName = [ "Dict" ], name = "Black" } []
+                        , String "key1"
+                        , Int 100
+                        , leaf
+                        , leaf
+                        ]
+
+                node2 =
+                    Custom { moduleName = [ "Dict" ], name = "RBNode_elm_builtin" }
+                        [ Custom { moduleName = [ "Dict" ], name = "Black" } []
+                        , String "key2"
+                        , Int 200
+                        , node1
+                        , leaf
+                        ]
+            in
+            case ValueCodec.encodeValue node2 |> ValueCodec.decodeValue of
+                Just decoded ->
+                    Expect.equal node2 decoded
+
+                Nothing ->
+                    Expect.fail "Failed to decode Dict tree"
