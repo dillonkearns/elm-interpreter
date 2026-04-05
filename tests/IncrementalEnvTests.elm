@@ -9,7 +9,10 @@ import Elm.Parser
 import Elm.Syntax.Expression as Expression
 import Elm.Syntax.File exposing (File)
 import Elm.Syntax.ModuleName exposing (ModuleName)
+import Elm.Syntax.Pattern exposing (QualifiedNameRef)
+import Eval.Expression
 import Eval.Module
+import ValueCodec
 import Expect
 import Test exposing (Test, describe, test)
 import FastDict
@@ -35,6 +38,18 @@ suite =
             [ interceptReplacesResult
             , interceptReceivesArgs
             , interceptMissPassesThrough
+            ]
+        , describe "deepHashValue"
+            [ deepHashSameValue
+            , deepHashDifferentValues
+            , deepHashNestedStructure
+            , deepHashClosureSentinel
+            ]
+        , describe "ValueCodec"
+            [ codecRoundTripPrimitives
+            , codecRoundTripRecord
+            , codecRoundTripCustom
+            , codecRoundTripList
             ]
         ]
 
@@ -478,3 +493,131 @@ main = (Point.origin).x
             in
             incrementalResult
                 |> Expect.equal fullResult
+
+
+deepHashSameValue : Test
+deepHashSameValue =
+    test "same value produces same hash" <|
+        \_ ->
+            let
+                v1 =
+                    Record (FastDict.fromList [ ( "name", String "Alice" ), ( "age", Int 30 ) ])
+
+                v2 =
+                    Record (FastDict.fromList [ ( "name", String "Alice" ), ( "age", Int 30 ) ])
+            in
+            Eval.Expression.deepHashValue v1
+                |> Expect.equal (Eval.Expression.deepHashValue v2)
+
+
+deepHashDifferentValues : Test
+deepHashDifferentValues =
+    test "different values produce different hashes" <|
+        \_ ->
+            let
+                v1 =
+                    Record (FastDict.fromList [ ( "name", String "Alice" ) ])
+
+                v2 =
+                    Record (FastDict.fromList [ ( "name", String "Bob" ) ])
+            in
+            Eval.Expression.deepHashValue v1
+                |> Expect.notEqual (Eval.Expression.deepHashValue v2)
+
+
+deepHashNestedStructure : Test
+deepHashNestedStructure =
+    test "nested structures produce stable hashes" <|
+        \_ ->
+            let
+                inner =
+                    Record (FastDict.fromList [ ( "x", Int 1 ) ])
+
+                outer =
+                    List [ inner, inner ]
+            in
+            Eval.Expression.deepHashValue outer
+                |> Expect.equal (Eval.Expression.deepHashValue outer)
+
+
+deepHashClosureSentinel : Test
+deepHashClosureSentinel =
+    test "data-only values hash to non-zero" <|
+        \_ ->
+            let
+                dataOnly =
+                    List [ Int 1, String "hello", Bool True ]
+            in
+            Eval.Expression.deepHashValue dataOnly
+                |> Expect.notEqual 0
+
+
+codecRoundTripPrimitives : Test
+codecRoundTripPrimitives =
+    test "round-trip primitives" <|
+        \_ ->
+            let
+                values =
+                    [ String "hello", Int 42, Float 3.14, Bool True, Bool False, Unit, Char 'x' ]
+
+                roundTripped =
+                    values |> List.filterMap (\v -> ValueCodec.encodeValue v |> ValueCodec.decodeValue)
+            in
+            Expect.equal values roundTripped
+
+
+codecRoundTripRecord : Test
+codecRoundTripRecord =
+    test "round-trip Record with nested values" <|
+        \_ ->
+            let
+                value =
+                    Record
+                        (FastDict.fromList
+                            [ ( "name", String "Alice" )
+                            , ( "age", Int 30 )
+                            , ( "active", Bool True )
+                            ]
+                        )
+            in
+            case ValueCodec.encodeValue value |> ValueCodec.decodeValue of
+                Just decoded ->
+                    Expect.equal value decoded
+
+                Nothing ->
+                    Expect.fail "Failed to decode Record"
+
+
+codecRoundTripCustom : Test
+codecRoundTripCustom =
+    test "round-trip Custom type (Maybe Just)" <|
+        \_ ->
+            let
+                value =
+                    Custom { moduleName = [ "Maybe" ], name = "Just" } [ Int 42 ]
+            in
+            case ValueCodec.encodeValue value |> ValueCodec.decodeValue of
+                Just decoded ->
+                    Expect.equal value decoded
+
+                Nothing ->
+                    Expect.fail "Failed to decode Custom"
+
+
+codecRoundTripList : Test
+codecRoundTripList =
+    test "round-trip List of Records" <|
+        \_ ->
+            let
+                value =
+                    List
+                        [ Record (FastDict.fromList [ ( "x", Int 1 ) ])
+                        , Record (FastDict.fromList [ ( "x", Int 2 ) ])
+                        ]
+            in
+            case ValueCodec.encodeValue value |> ValueCodec.decodeValue of
+                Just decoded ->
+                    Expect.equal value decoded
+
+                Nothing ->
+                    Expect.fail "Failed to decode List of Records"

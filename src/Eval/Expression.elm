@@ -1,4 +1,4 @@
-module Eval.Expression exposing (evalExpression, evalFunction)
+module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction)
 
 import Array
 import Bitwise
@@ -135,6 +135,129 @@ sizeOfValue value =
 
         _ ->
             1
+
+
+{-| Deep hash of a Value — traverses the full structure for content-based
+hashing. Unlike `fingerprintValue` (O(1) shallow), this recursively hashes
+all nested values for cache key computation.
+
+Used for elm-review's `createContextHashMarker` intercept and for
+general-purpose memoization cache keys.
+
+Handles all data variants. PartiallyApplied (closures) return a sentinel
+hash (0) since closures can't be meaningfully compared by content.
+-}
+deepHashValue : Value -> Int
+deepHashValue value =
+    case value of
+        Int i ->
+            Bitwise.xor (i * 2654435761) 1
+
+        Float f ->
+            Bitwise.xor (round (f * 100000) * 2654435761) 2
+
+        String s ->
+            Bitwise.xor (hashString s) 3
+
+        Char c ->
+            Bitwise.xor (Char.toCode c * 2654435761) 4
+
+        Bool True ->
+            5381
+
+        Bool False ->
+            5382
+
+        Unit ->
+            7
+
+        Tuple a b ->
+            Bitwise.xor (deepHashValue a * 31) (deepHashValue b)
+                |> Bitwise.xor 8
+
+        Triple a b c ->
+            Bitwise.xor (deepHashValue a * 31) (deepHashValue b)
+                |> Bitwise.xor (deepHashValue c * 37)
+                |> Bitwise.xor 9
+
+        Record dict ->
+            Dict.foldl
+                (\k v acc ->
+                    Bitwise.xor acc (Bitwise.xor (hashString k * 31) (deepHashValue v))
+                )
+                10
+                dict
+
+        Custom ref args ->
+            List.foldl
+                (\v acc -> Bitwise.xor (acc * 31) (deepHashValue v))
+                (hashString (Syntax.qualifiedNameToString ref))
+                args
+
+        List items ->
+            List.foldl
+                (\v acc -> Bitwise.xor (acc * 31) (deepHashValue v))
+                12
+                items
+
+        JsArray arr ->
+            Array.foldl
+                (\v acc -> Bitwise.xor (acc * 31) (deepHashValue v))
+                13
+                arr
+
+        JsonValue jv ->
+            deepHashJsonValue jv
+
+        PartiallyApplied _ _ _ _ _ _ ->
+            0
+
+        JsonDecoderValue _ ->
+            0
+
+        RegexValue _ ->
+            0
+
+        BytesValue bytes ->
+            Array.foldl (\b acc -> Bitwise.xor (acc * 31) b) 14 bytes
+
+
+deepHashJsonValue : Types.JsonVal -> Int
+deepHashJsonValue jv =
+    case jv of
+        Types.JsonNull ->
+            15
+
+        Types.JsonBool True ->
+            16
+
+        Types.JsonBool False ->
+            17
+
+        Types.JsonInt i ->
+            i * 2654435761
+
+        Types.JsonFloat f ->
+            round (f * 100000) * 2654435761
+
+        Types.JsonString s ->
+            hashString s
+
+        Types.JsonArray items ->
+            List.foldl (\item acc -> Bitwise.xor (acc * 31) (deepHashJsonValue item)) 18 items
+
+        Types.JsonObject pairs ->
+            List.foldl
+                (\( k, v ) acc -> Bitwise.xor acc (Bitwise.xor (hashString k * 31) (deepHashJsonValue v)))
+                19
+                pairs
+
+
+{-| FNV-1a-style string hash for cache keys.
+-}
+hashString : String -> Int
+hashString s =
+    String.foldl (\c acc -> Bitwise.xor (acc * 16777619) (Char.toCode c)) 2166136261 s
 
 
 {-| Combined check + update for cycle detection. Returns either:
