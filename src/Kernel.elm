@@ -158,6 +158,11 @@ functions evalFunction =
         , ( "sortBy", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.sortBy Core.List.sortBy )
         , ( "sortWith", twoWithError (function2 evalFunction anything anything to order) anyList to anyList Kernel.List.sortWith Core.List.sortWith )
         , ( "toArray", one anyList to (jsArray anything) Array.fromList Core.Array.fromList )
+        , ( "concatMap", twoWithError (function evalFunction anything to anyList) anyList to anyList Kernel.List.concatMap Core.List.concatMap )
+        , ( "filterMap", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.filterMap Core.List.filterMap )
+        , ( "indexedMap", twoWithError (function2 evalFunction anything anything to anything) anyList to anyList Kernel.List.indexedMap Core.List.indexedMap )
+        , ( "any", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.any Core.List.any )
+        , ( "all", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.all Core.List.all )
         ]
       )
 
