@@ -205,3 +205,6 @@ replaceHelp matches replacerFn original offset acc cfg env =
 
                 EvErrTrace e t l ->
                     EvErrTrace e t l
+
+                EvYield tag payload _ ->
+                    EvYield tag payload (\_ -> EvalResult.succeed original)

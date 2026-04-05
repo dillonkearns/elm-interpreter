@@ -306,6 +306,9 @@ encodeListHelp func remaining acc cfg env =
                 Types.EvErrTrace e traces logs ->
                     Types.EvErrTrace e traces logs
 
+                Types.EvYield tag payload resume ->
+                    Types.EvYield tag payload resume
+
 
 {-| Json.Encode.object : List ( String, Value ) -> Value
 Build a JSON object from key-value pairs.
@@ -839,6 +842,9 @@ applyFunction evalFn func arg cfg _ =
 
                     EvErrTrace e _ _ ->
                         Err (Types.evalErrorKindToString e.error)
+
+                    EvYield _ _ _ ->
+                        Err "Cannot yield inside JSON decoder"
 
             else
                 Ok (PartiallyApplied closureEnv newArgs patterns maybeName implementation arity)

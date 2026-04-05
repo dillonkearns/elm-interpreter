@@ -32,6 +32,7 @@ type EvalResult out
     | EvErr EvalErrorData
     | EvOkTrace out (Rope CallTree) (Rope String)
     | EvErrTrace EvalErrorData (Rope CallTree) (Rope String)
+    | EvYield String Value (Value -> EvalResult out)
 
 
 type alias Config =

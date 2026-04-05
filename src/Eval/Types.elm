@@ -143,6 +143,9 @@ wrapThen f er =
         EvErrTrace e trees logs ->
             Recursion.base (EvErrTrace e trees logs)
 
+        EvYield tag payload _ ->
+            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield cannot resume inside recursion scheme" }))
+
 
 {-| Merge trace data from an outer evaluation into an inner result.
 -}
@@ -160,6 +163,9 @@ mergeTraceInto trees logs er =
 
         EvErrTrace e ft fl ->
             EvErrTrace e (Rope.appendTo trees ft) (Rope.appendTo fl logs)
+
+        EvYield tag payload resume ->
+            EvYield tag payload resume
 
 
 recurseMapThen :
@@ -193,6 +199,9 @@ recurseMapPlain items cfg env vacc f =
 
                         EvErrTrace e trees logs ->
                             Recursion.base (EvErrTrace e trees logs)
+
+                        EvYield tag payload resume ->
+                            Recursion.base (EvYield tag payload resume)
                 )
 
 
@@ -220,4 +229,7 @@ recurseMapTraced items cfg env vacc tacc lacc f =
 
                         EvErrTrace e trees logs ->
                             Recursion.base (EvErrTrace e (Rope.appendTo tacc trees) (Rope.appendTo lacc logs))
+
+                        EvYield tag payload resume ->
+                            Recursion.base (EvYield tag payload resume)
                 )

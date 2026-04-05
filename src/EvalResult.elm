@@ -1,7 +1,7 @@
 module EvalResult exposing (andThen, combine, fail, fromResult, map, map2, onValue, succeed, toResult, toTriple)
 
 import Rope exposing (Rope)
-import Types exposing (CallTree, EvalErrorData, EvalResult(..))
+import Types exposing (CallTree, EvalErrorData, EvalErrorKind(..), EvalResult(..))
 
 
 {-| Append two ropes, short-circuiting when either is empty.
@@ -54,6 +54,10 @@ toResult er =
         EvErrTrace e _ _ ->
             Err e
 
+        EvYield _ _ _ ->
+            -- Yield not handled at this level — framework driver should handle before toResult
+            Err { currentModule = [], callStack = [], error = Types.TypeError "Unhandled EvYield in toResult" }
+
 
 {-| Convert to the legacy triple format. Used at module boundaries
 where the caller expects (Result, Rope, Rope).
@@ -73,6 +77,9 @@ toTriple er =
         EvErrTrace e t l ->
             ( Err e, t, l )
 
+        EvYield _ _ _ ->
+            ( Err { currentModule = [], callStack = [], error = Types.TypeError "Unhandled EvYield" }, Rope.empty, Rope.empty )
+
 
 map : (a -> out) -> EvalResult a -> EvalResult out
 map f er =
@@ -89,6 +96,9 @@ map f er =
         EvErrTrace e t l ->
             EvErrTrace e t l
 
+        EvYield tag payload resume ->
+            EvYield tag payload (\v -> map f (resume v))
+
 
 andThen : (a -> EvalResult b) -> EvalResult a -> EvalResult b
 andThen f er =
@@ -104,6 +114,9 @@ andThen f er =
 
         EvErrTrace e trees logs ->
             EvErrTrace e trees logs
+
+        EvYield tag payload resume ->
+            EvYield tag payload (\v -> andThen f (resume v))
 
 
 {-| Merge trace data from an outer evaluation into an inner result.
@@ -123,6 +136,9 @@ mergeTraceInto trees logs er =
         EvErrTrace e t l ->
             EvErrTrace e (appendRopes trees t) (appendRopes logs l)
 
+        EvYield tag payload resume ->
+            EvYield tag payload (\v -> mergeTraceInto trees logs (resume v))
+
 
 map2 : (a -> b -> out) -> EvalResult a -> EvalResult b -> EvalResult out
 map2 f a b =
@@ -141,6 +157,9 @@ map2 f a b =
                 EvErrTrace e bt bl ->
                     EvErrTrace e bt bl
 
+                EvYield tag payload resume ->
+                    EvYield tag payload (\v -> map2 f (EvOk av) (resume v))
+
         EvErr e ->
             EvErr e
 
@@ -158,6 +177,9 @@ map2 f a b =
                 EvErrTrace e bt bl ->
                     EvErrTrace e (appendRopes at bt) (appendRopes al bl)
 
+                EvYield tag payload resume ->
+                    EvYield tag payload (\v -> map2 f (EvOkTrace av at al) (resume v))
+
         EvErrTrace e at al ->
             case b of
                 EvOk _ ->
@@ -171,6 +193,12 @@ map2 f a b =
 
                 EvErrTrace _ bt bl ->
                     EvErrTrace e (appendRopes at bt) (appendRopes al bl)
+
+                EvYield _ _ _ ->
+                    EvErrTrace e at al
+
+        EvYield tag payload resume ->
+            EvYield tag payload (\v -> map2 f (resume v) b)
 
 
 onValue : (a -> Result EvalErrorData out) -> EvalResult a -> EvalResult out
@@ -193,6 +221,9 @@ onValue f er =
         EvErrTrace e t l ->
             EvErrTrace e t l
 
+        EvYield tag payload resume ->
+            EvYield tag payload (\v -> onValue f (resume v))
+
 
 combine : List (EvalResult t) -> EvalResult (List t)
 combine ls =
@@ -212,6 +243,9 @@ combinePlain queue vacc =
 
         (EvErr e) :: _ ->
             EvErr e
+
+        (EvYield tag payload resume) :: tail ->
+            EvYield tag payload (\v -> combinePlain (resume v :: tail) vacc)
 
         _ ->
             -- Switch to traced path for remaining items
@@ -237,3 +271,6 @@ combineTraced queue vacc tacc lacc =
 
         (EvErrTrace e t l) :: _ ->
             EvErrTrace e (appendRopes tacc t) (appendRopes lacc l)
+
+        (EvYield tag payload resume) :: tail ->
+            EvYield tag payload (\v -> combineTraced (resume v :: tail) vacc tacc lacc)

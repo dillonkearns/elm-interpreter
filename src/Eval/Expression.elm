@@ -2750,6 +2750,9 @@ evalLetBlockSingle declaration body cfg env =
         EvErrTrace e trees logs ->
             Recursion.base (EvErrTrace e trees logs)
 
+        EvYield tag payload _ ->
+            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield cannot resume inside let binding" }))
+
 
 evalLetBlockFull : Expression.LetBlock -> PartialEval Value
 evalLetBlockFull letBlock cfg env =
@@ -2846,6 +2849,9 @@ evalLetBlockFull letBlock cfg env =
 
         EvErrTrace e trees logs ->
             Recursion.base (EvErrTrace e trees logs)
+
+        EvYield tag payload _ ->
+            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield cannot resume inside let binding" }))
 
 
 isLetDeclarationFunction : Node LetDeclaration -> Bool
