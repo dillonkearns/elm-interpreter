@@ -1479,25 +1479,32 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
         _ ->
             case maybeQualifiedName of
                 Just qualifiedName ->
-                    if env.callDepth < 200 then
-                        call maybeQualifiedName implementation cfg boundEnv
+                    -- Check function intercepts before normal evaluation.
+                    -- This is the hook point for framework callbacks and memoization.
+                    case Dict.get (Syntax.qualifiedNameToString qualifiedName) cfg.intercepts of
+                        Just (Types.Intercept interceptFn) ->
+                            Recursion.base (interceptFn args cfg boundEnv)
 
-                    else
-                        let
-                            currentCheck =
-                                Maybe.withDefault Dict.empty env.recursionCheck
-                        in
-                        case checkAndUpdateCycle qualifiedName args env.callDepth currentCheck of
-                            CycleDetected ->
-                                Types.failPartial <|
-                                    typeError env
-                                        ("Infinite recursion detected: "
-                                            ++ Syntax.qualifiedNameToString qualifiedName
-                                            ++ " called with identical arguments"
-                                        )
+                        Nothing ->
+                            if env.callDepth < 200 then
+                                call maybeQualifiedName implementation cfg boundEnv
 
-                            Continue updatedCheck ->
-                                call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = Just updatedCheck }
+                            else
+                                let
+                                    currentCheck =
+                                        Maybe.withDefault Dict.empty env.recursionCheck
+                                in
+                                case checkAndUpdateCycle qualifiedName args env.callDepth currentCheck of
+                                    CycleDetected ->
+                                        Types.failPartial <|
+                                            typeError env
+                                                ("Infinite recursion detected: "
+                                                    ++ Syntax.qualifiedNameToString qualifiedName
+                                                    ++ " called with identical arguments"
+                                                )
+
+                                    Continue updatedCheck ->
+                                        call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = Just updatedCheck }
 
                 Nothing ->
                     call maybeQualifiedName implementation cfg boundEnv

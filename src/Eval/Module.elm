@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndValues, extendWithFiles, fileModuleName, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndValues, evalWithIntercepts, extendWithFiles, fileModuleName, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Core
 import Dict as ElmDict
@@ -43,14 +43,14 @@ eval : String -> Expression -> Result Error Value
 eval source expression =
     let
         ( result, _, _ ) =
-            traceOrEvalModule { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing } source expression
+            traceOrEvalModule { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty } source expression
     in
     result
 
 
 trace : String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 trace source expression =
-    traceOrEvalModule { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing } source expression
+    traceOrEvalModule { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty } source expression
 
 
 traceOrEvalModule : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
@@ -407,7 +407,7 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing }
+                                { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -491,7 +491,7 @@ evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles ex
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing }
+                        { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -600,11 +600,122 @@ evalWithEnvFromFilesAndValues (ProjectEnv projectEnv) additionalFiles injectedVa
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing }
+                        { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
                         finalEnv
                         |> EvalResult.toResult
             in
             Result.mapError Types.EvalError result
+
+
+{-| Evaluate with function intercepts. Intercepts are checked before normal
+function evaluation. If a qualified function name matches an entry in the
+intercepts Dict, the intercept function is called instead of the AST.
+
+This is the general-purpose hook for framework callbacks (BackendTask, Test)
+and for memoization/caching (elm-review cache markers).
+-}
+evalWithIntercepts :
+    ProjectEnv
+    -> List String
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> Result Error Value
+evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expression =
+    let
+        parseResult =
+            additionalSources
+                |> List.map
+                    (\source ->
+                        Elm.Parser.parseToFile source
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineResults
+    in
+    case parseResult of
+        Err e ->
+            Err e
+
+        Ok parsedModules ->
+            let
+                modulesWithMeta =
+                    parsedModules
+                        |> List.map
+                            (\file ->
+                                { file = file
+                                , moduleName = fileModuleName file
+                                , interface = buildInterfaceFromFile file
+                                }
+                            )
+
+                additionalInterfaces =
+                    modulesWithMeta
+                        |> List.map (\m -> ( m.moduleName, m.interface ))
+                        |> ElmDict.fromList
+
+                allInterfaces =
+                    ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+                envResult =
+                    modulesWithMeta
+                        |> Result.MyExtra.combineFoldl
+                            (\parsedModule envAcc ->
+                                buildModuleEnv allInterfaces parsedModule envAcc
+                            )
+                            (Ok projectEnv.env)
+            in
+            case envResult of
+                Err e ->
+                    Err e
+
+                Ok env ->
+                    let
+                        lastModule =
+                            modulesWithMeta
+                                |> List.reverse
+                                |> List.head
+                                |> Maybe.map .moduleName
+                                |> Maybe.withDefault [ "Main" ]
+
+                        lastFile =
+                            parsedModules
+                                |> List.reverse
+                                |> List.head
+
+                        finalImports =
+                            case lastFile of
+                                Just file ->
+                                    (defaultImports ++ file.imports)
+                                        |> List.foldl (processImport allInterfaces) emptyImports
+
+                                Nothing ->
+                                    emptyImports
+
+                        lastModuleKey =
+                            Environment.moduleKey lastModule
+
+                        finalEnv =
+                            { env
+                                | currentModule = lastModule
+                                , currentModuleKey = lastModuleKey
+                                , currentModuleFunctions =
+                                    Dict.get lastModuleKey env.shared.functions
+                                        |> Maybe.withDefault Dict.empty
+                                , imports = finalImports
+                            }
+
+                        result =
+                            Eval.Expression.evalExpression
+                                (fakeNode expression)
+                                { trace = False
+                                , maxSteps = Nothing
+                                , tcoTarget = Nothing
+                                , callCounts = Nothing
+                                , intercepts = intercepts
+                                }
+                                finalEnv
+                                |> EvalResult.toResult
+                    in
+                    Result.mapError Types.EvalError result
 
 
 {-| Extend a ProjectEnv with additional pre-parsed Files, without evaluating
@@ -740,7 +851,7 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         evalResult =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing }
+                                { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
                                 finalEnv
 
                         ( result, callTrees, logLines ) =
@@ -1115,7 +1226,7 @@ evalProject sources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing }
+                                { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
                                 finalEnv
                                 |> EvalResult.toResult
                     in

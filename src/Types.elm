@@ -1,4 +1,4 @@
-module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
+module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -39,7 +39,19 @@ type alias Config =
     , maxSteps : Maybe Int
     , tcoTarget : Maybe String
     , callCounts : Maybe CallCounts
+    , intercepts : Dict String Intercept
     }
+
+
+{-| A function intercept: called instead of the normal AST evaluation
+when the interpreter encounters a registered qualified function name.
+
+Receives the fully-applied arguments and the current eval context.
+Framework authors use this for callbacks (BackendTask, Test, Cmd)
+and for memoization/caching hooks.
+-}
+type Intercept
+    = Intercept (List Value -> Config -> Env -> EvalResult Value)
 
 
 {-| Lightweight call counting for profiling. Tracks how many times each

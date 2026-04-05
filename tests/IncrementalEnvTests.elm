@@ -13,7 +13,7 @@ import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
 import FastDict
-import Types exposing (Value(..))
+import Types exposing (EvalResult(..), Intercept(..), Value(..))
 
 
 suite : Test
@@ -30,6 +30,11 @@ suite =
             [ valueInjectionSimple
             , valueInjectionOverridesLocal
             , valueInjectionWithModuleCode
+            ]
+        , describe "function intercepts"
+            [ interceptReplacesResult
+            , interceptReceivesArgs
+            , interceptMissPassesThrough
             ]
         ]
 
@@ -116,6 +121,119 @@ evalWithInjectedValues sources injected exprName =
 
         Ok env ->
             Eval.Module.evalWithEnvFromFilesAndValues env [] injected (Expression.FunctionOrValue [] exprName)
+
+
+{-| Helper: evaluate with function intercepts.
+-}
+evalWithIntercepts : List String -> FastDict.Dict String Types.Intercept -> String -> Result Types.Error Value
+evalWithIntercepts sources intercepts exprName =
+    case Eval.Module.buildProjectEnv sources of
+        Err e ->
+            Err e
+
+        Ok env ->
+            Eval.Module.evalWithIntercepts env [] intercepts (Expression.FunctionOrValue [] exprName)
+
+
+{-| Test: intercepted function returns replacement value.
+-}
+interceptReplacesResult : Test
+interceptReplacesResult =
+    test "intercept replaces function result" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = Helpers.greet \"world\"\n"
+
+                helperSource =
+                    "module Helpers exposing (greet)\n\ngreet name = \"Hello, \" ++ name ++ \"!\"\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.greet"
+                        (Intercept
+                            (\args _ _ ->
+                                -- Always return "INTERCEPTED" regardless of args
+                                EvOk (String "INTERCEPTED")
+                            )
+                        )
+            in
+            case evalWithIntercepts [ helperSource, source ] intercepts "results" of
+                Ok (String "INTERCEPTED") ->
+                    Expect.pass
+
+                Ok other ->
+                    Expect.fail ("Expected String \"INTERCEPTED\", got: " ++ Debug.toString other)
+
+                Err e ->
+                    Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Test: intercepted function receives the actual arguments.
+-}
+interceptReceivesArgs : Test
+interceptReceivesArgs =
+    test "intercept receives function arguments" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = Helpers.add 10 32\n"
+
+                helperSource =
+                    "module Helpers exposing (add)\n\nadd a b = a + b\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.add"
+                        (Intercept
+                            (\args _ _ ->
+                                -- Return the sum (proving we got the args)
+                                case args of
+                                    [ Int a, Int b ] ->
+                                        EvOk (Int (a + b + 100))
+
+                                    _ ->
+                                        EvOk (String "wrong args")
+                            )
+                        )
+            in
+            case evalWithIntercepts [ helperSource, source ] intercepts "results" of
+                Ok (Int 142) ->
+                    -- 10 + 32 + 100 = 142
+                    Expect.pass
+
+                Ok other ->
+                    Expect.fail ("Expected Int 142, got: " ++ Debug.toString other)
+
+                Err e ->
+                    Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Test: non-intercepted functions evaluate normally.
+-}
+interceptMissPassesThrough : Test
+interceptMissPassesThrough =
+    test "non-intercepted function evaluates normally" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = Helpers.add 10 32\n"
+
+                helperSource =
+                    "module Helpers exposing (add)\n\nadd a b = a + b\n"
+
+                -- Intercept a DIFFERENT function
+                intercepts =
+                    FastDict.singleton "Helpers.greet"
+                        (Intercept (\_ _ _ -> EvOk (String "INTERCEPTED")))
+            in
+            case evalWithIntercepts [ helperSource, source ] intercepts "results" of
+                Ok (Int 42) ->
+                    Expect.pass
+
+                Ok other ->
+                    Expect.fail ("Expected Int 42, got: " ++ Debug.toString other)
+
+                Err e ->
+                    Expect.fail ("Eval error: " ++ Debug.toString e)
 
 
 {-| Helper: evaluate an expression using full rebuild from sources.
