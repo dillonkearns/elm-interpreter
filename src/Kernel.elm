@@ -15,6 +15,7 @@ import Core.Json.Decode
 import Core.Json.Encode
 import Core.Elm.Kernel.Parser
 import Core.Regex
+import Core.Dict
 import Core.List
 import Core.String
 import Elm.Syntax.Expression as Expression exposing (Expression(..), FunctionImplementation)
@@ -26,6 +27,7 @@ import EvalResult
 import FastDict as Dict exposing (Dict)
 import Kernel.Basics
 import Kernel.Bytes
+import Kernel.Dict
 import Kernel.Debug
 import Kernel.JsArray
 import Kernel.Json
@@ -113,6 +115,14 @@ functions evalFunction =
       , [ ( "log", twoWithError string anything to anything Kernel.Debug.log Core.Debug.log )
         , ( "toString", one anything to string Value.toString Core.Debug.toString )
         , ( "todo", oneWithError string to anything Kernel.Debug.todo Core.Debug.todo )
+        ]
+      )
+
+    -- Elm.Kernel.Dict
+    , ( [ "Elm", "Kernel", "Dict" ]
+      , [ ( "foldl", threeWithError (function3 evalFunction anything anything anything to anything) anything anything to anything Kernel.Dict.foldl Core.Dict.foldl )
+        , ( "foldr", threeWithError (function3 evalFunction anything anything anything to anything) anything anything to anything Kernel.Dict.foldr Core.Dict.foldr )
+        , ( "map", twoWithError (function2 evalFunction anything anything to anything) anything to anything Kernel.Dict.map Core.Dict.map )
         ]
       )
 
@@ -600,6 +610,18 @@ function2 :
     -> InSelector (a -> Eval (b -> Eval to)) {}
 function2 evalFunction in1Selector in2Selector _ outSelector =
     function evalFunction in1Selector to (function evalFunction in2Selector to outSelector)
+
+
+function3 :
+    EvalFunction
+    -> OutSelector a xa
+    -> OutSelector b xb
+    -> OutSelector c xc
+    -> To
+    -> InSelector to xt
+    -> InSelector (a -> Eval (b -> Eval (c -> Eval to))) {}
+function3 evalFunction in1Selector in2Selector in3Selector _ outSelector =
+    function evalFunction in1Selector to (function evalFunction in2Selector to (function evalFunction in3Selector to outSelector))
 
 
 tuple : Selector a -> Selector b -> Selector ( a, b )

@@ -498,12 +498,7 @@ merge leftStep bothStep rightStep leftDict rightDict initialResult =
 -}
 map : (k -> a -> b) -> Dict k a -> Dict k b
 map func dict =
-  case dict of
-    RBEmpty_elm_builtin ->
-      RBEmpty_elm_builtin
-
-    RBNode_elm_builtin color key value left right ->
-      RBNode_elm_builtin color key (func key value) (map func left) (map func right)
+  Elm.Kernel.Dict.map func dict
 
 
 {-| Fold over the key-value pairs in a dictionary from lowest key to highest key.
@@ -522,12 +517,7 @@ map func dict =
 -}
 foldl : (k -> v -> b -> b) -> b -> Dict k v -> b
 foldl func acc dict =
-  case dict of
-    RBEmpty_elm_builtin ->
-      acc
-
-    RBNode_elm_builtin _ key value left right ->
-      foldl func (func key value (foldl func acc left)) right
+  Elm.Kernel.Dict.foldl func acc dict
 
 
 {-| Fold over the key-value pairs in a dictionary from highest key to lowest key.
@@ -546,12 +536,7 @@ foldl func acc dict =
 -}
 foldr : (k -> v -> b -> b) -> b -> Dict k v -> b
 foldr func acc t =
-  case t of
-    RBEmpty_elm_builtin ->
-      acc
-
-    RBNode_elm_builtin _ key value left right ->
-      foldr func (func key value (foldr func acc right)) left
+  Elm.Kernel.Dict.foldr func acc t
 
 
 {-| Keep only the key-value pairs that pass the given test. -}
