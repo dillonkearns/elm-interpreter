@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndValues, evalWithIntercepts, extendWithFiles, fileModuleName, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndValues, evalWithIntercepts, evalWithInterceptsRaw, extendWithFiles, fileModuleName, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Core
 import Dict as ElmDict
@@ -716,6 +716,121 @@ evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expressi
                                 |> EvalResult.toResult
                     in
                     Result.mapError Types.EvalError result
+
+
+{-| Like evalWithIntercepts but returns the raw EvalResult, preserving EvYield.
+
+The framework driver should handle EvYield in a loop (yield → handle effect →
+resume with result → check for more yields).
+-}
+evalWithInterceptsRaw :
+    ProjectEnv
+    -> List String
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> Types.EvalResult Value
+evalWithInterceptsRaw (ProjectEnv projectEnv) additionalSources intercepts expression =
+    let
+        parseResult =
+            additionalSources
+                |> List.map
+                    (\source ->
+                        Elm.Parser.parseToFile source
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineResults
+    in
+    case parseResult of
+        Err e ->
+            case e of
+                Types.ParsingError _ ->
+                    Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Parse error in evalWithInterceptsRaw" }
+
+                Types.EvalError evalErr ->
+                    Types.EvErr evalErr
+
+        Ok parsedModules ->
+            let
+                modulesWithMeta =
+                    parsedModules
+                        |> List.map
+                            (\file ->
+                                { file = file
+                                , moduleName = fileModuleName file
+                                , interface = buildInterfaceFromFile file
+                                }
+                            )
+
+                additionalInterfaces =
+                    modulesWithMeta
+                        |> List.map (\m -> ( m.moduleName, m.interface ))
+                        |> ElmDict.fromList
+
+                allInterfaces =
+                    ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+                envResult =
+                    modulesWithMeta
+                        |> Result.MyExtra.combineFoldl
+                            (\parsedModule envAcc ->
+                                buildModuleEnv allInterfaces parsedModule envAcc
+                            )
+                            (Ok projectEnv.env)
+            in
+            case envResult of
+                Err e ->
+                    case e of
+                        Types.ParsingError _ ->
+                            Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Env build parse error" }
+
+                        Types.EvalError evalErr ->
+                            Types.EvErr evalErr
+
+                Ok env ->
+                    let
+                        lastModule =
+                            modulesWithMeta
+                                |> List.reverse
+                                |> List.head
+                                |> Maybe.map .moduleName
+                                |> Maybe.withDefault [ "Main" ]
+
+                        lastFile =
+                            parsedModules
+                                |> List.reverse
+                                |> List.head
+
+                        finalImports =
+                            case lastFile of
+                                Just file ->
+                                    (defaultImports ++ file.imports)
+                                        |> List.foldl (processImport allInterfaces) emptyImports
+
+                                Nothing ->
+                                    emptyImports
+
+                        lastModuleKey =
+                            Environment.moduleKey lastModule
+
+                        finalEnv =
+                            { env
+                                | currentModule = lastModule
+                                , currentModuleKey = lastModuleKey
+                                , currentModuleFunctions =
+                                    Dict.get lastModuleKey env.shared.functions
+                                        |> Maybe.withDefault Dict.empty
+                                , imports = finalImports
+                            }
+                    in
+                    Eval.Expression.evalExpression
+                        (fakeNode expression)
+                        { trace = False
+                        , maxSteps = Nothing
+                        , tcoTarget = Nothing
+                        , callCounts = Nothing
+                        , intercepts = intercepts
+                        }
+                        finalEnv
 
 
 {-| Extend a ProjectEnv with additional pre-parsed Files, without evaluating
