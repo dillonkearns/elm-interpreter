@@ -181,25 +181,38 @@ checkAndUpdateCycle qualifiedName args callDepth checkDict =
         fnKey =
             Syntax.qualifiedNameToString qualifiedName
 
+        -- Always compute fingerprint (cheap for most value types)
         fp =
             fingerprintArgs args
-
-        sz =
-            sizeOfArgs args
-
-        perArgSzs =
-            List.map sizeOfValue args
-
-        perArgFps =
-            List.map fingerprintValue args
     in
     case Dict.get fnKey checkDict of
         Nothing ->
+            -- First call: compute everything for baseline
+            let
+                sz =
+                    sizeOfArgs args
+
+                perArgSzs =
+                    List.map sizeOfValue args
+
+                perArgFps =
+                    List.map fingerprintValue args
+            in
             Continue (Dict.insert fnKey { fingerprint = fp, depth = callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } checkDict)
 
         Just entry ->
             if entry.depth >= callDepth then
-                -- Not recursive (function returned and was called again)
+                -- Not recursive: only compute what we need for the new entry
+                let
+                    sz =
+                        sizeOfArgs args
+
+                    perArgSzs =
+                        List.map sizeOfValue args
+
+                    perArgFps =
+                        List.map fingerprintValue args
+                in
                 Continue (Dict.insert fnKey { fingerprint = fp, depth = callDepth, count = 1, size = sz, growCount = 0, argSizes = perArgSzs, argFingerprints = perArgFps } checkDict)
 
             else if entry.fingerprint == fp then
@@ -235,7 +248,17 @@ checkAndUpdateCycle qualifiedName args callDepth checkDict =
 
             else
                 -- Fingerprint changed. Check Category B: is total size growing?
+                -- Only compute size/per-arg data here (deferred from above).
                 let
+                    sz =
+                        sizeOfArgs args
+
+                    perArgSzs =
+                        List.map sizeOfValue args
+
+                    perArgFps =
+                        List.map fingerprintValue args
+
                     -- "Bounded progress" = any arg has constant size but changing fingerprint.
                     -- This detects countdown variables (Int decreasing toward base case)
                     -- whose size stays 1 but whose value changes each call.
