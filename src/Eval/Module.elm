@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndValues, evalWithIntercepts, evalWithInterceptsRaw, extendWithFiles, fileModuleName, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsRaw, extendWithFiles, fileModuleName, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Core
 import Dict as ElmDict
@@ -605,6 +605,107 @@ evalWithEnvFromFilesAndValues (ProjectEnv projectEnv) additionalFiles injectedVa
                         |> EvalResult.toResult
             in
             Result.mapError Types.EvalError result
+
+
+{-| Combined: injected Values + intercepts + raw EvalResult.
+Used by the BackendTask yield driver when both Value injection and
+intercept handling are needed in the same evaluation.
+-}
+evalWithEnvFromFilesAndValuesAndInterceptsRaw :
+    ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> Types.EvalResult Value
+evalWithEnvFromFilesAndValuesAndInterceptsRaw (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
+    let
+        parsedModules =
+            additionalFiles
+                |> List.map
+                    (\file ->
+                        { file = file
+                        , moduleName = fileModuleName file
+                        , interface = buildInterfaceFromFile file
+                        }
+                    )
+
+        additionalInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces =
+            ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+        envResult =
+            parsedModules
+                |> Result.MyExtra.combineFoldl
+                    (\parsedModule envAcc ->
+                        buildModuleEnv allInterfaces parsedModule envAcc
+                    )
+                    (Ok projectEnv.env)
+    in
+    case envResult of
+        Err e ->
+            case e of
+                Types.ParsingError _ ->
+                    Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Env build error" }
+
+                Types.EvalError evalErr ->
+                    Types.EvErr evalErr
+
+        Ok env ->
+            let
+                lastModule =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .moduleName
+                        |> Maybe.withDefault [ "Main" ]
+
+                lastFile =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .file
+
+                finalImports =
+                    case lastFile of
+                        Just file ->
+                            (defaultImports ++ file.imports)
+                                |> List.foldl (processImport allInterfaces) emptyImports
+
+                        Nothing ->
+                            emptyImports
+
+                lastModuleKey =
+                    Environment.moduleKey lastModule
+
+                finalEnv =
+                    { env
+                        | currentModule = lastModule
+                        , currentModuleKey = lastModuleKey
+                        , currentModuleFunctions =
+                            Dict.get lastModuleKey env.shared.functions
+                                |> Maybe.withDefault Dict.empty
+                        , imports = finalImports
+                        , values =
+                            Dict.foldl
+                                (\name value acc -> Dict.insert name value acc)
+                                env.values
+                                injectedValues
+                    }
+            in
+            Eval.Expression.evalExpression
+                (fakeNode expression)
+                { trace = False
+                , maxSteps = Nothing
+                , tcoTarget = Nothing
+                , callCounts = Nothing
+                , intercepts = intercepts
+                }
+                finalEnv
 
 
 {-| Evaluate with function intercepts. Intercepts are checked before normal
