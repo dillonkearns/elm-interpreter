@@ -144,37 +144,11 @@ wrapThen f er =
             Recursion.base (EvErrTrace e trees logs)
 
         EvYield tag payload resume ->
-            -- Pass yield through the recursion scheme.
-            -- The resume returns EvalResult value, but we need EvalResult a.
-            -- We can't apply f (which returns Rec, not EvalResult) inside the resume.
-            -- Instead, propagate the yield and let the let-binding handler
-            -- (which called wrapThen) catch it at its level.
-            Recursion.base
-                (EvYield tag
-                    payload
-                    (\resumeValue ->
-                        -- Return the resumed EvalResult unchanged.
-                        -- The type needs to be EvalResult a, but we have EvalResult value.
-                        -- Since yields only occur for intercepts (which return Value),
-                        -- and value = Value in practice, this cast is safe.
-                        -- TODO: make this type-safe by threading yield through Rec properly
-                        case resume resumeValue of
-                            EvOk _ ->
-                                EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield resume in wrapThen needs caller support" }
-
-                            EvErr e ->
-                                EvErr e
-
-                            EvOkTrace _ _ _ ->
-                                EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield resume in wrapThen needs caller support" }
-
-                            EvErrTrace e _ _ ->
-                                EvErr e
-
-                            EvYield t2 p2 _ ->
-                                EvYield t2 p2 (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "Nested EvYield in wrapThen" })
-                    )
-                )
+            -- Pass yield through. Resume returns EvalResult value, but we can't
+            -- apply f (which returns Rec) inside the resume lambda.
+            -- For simple let-binding yields, the let handler catches this first.
+            -- This fallback handles yields from operator expressions etc.
+            Recursion.base (EvYield tag payload (\rv -> EvalResult.andThen (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield in wrapThen - yield from this code position not yet supported" }) (resume rv)))
 
 
 {-| Merge trace data from an outer evaluation into an inner result.
