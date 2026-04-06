@@ -37,23 +37,7 @@ wrapThenWithEval evalFn f er =
             Recursion.base
                 (EvYield tag
                     payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvOk v ->
-                                resolveRecWithStep evalFn (f v)
-
-                            EvOkTrace v _ _ ->
-                                resolveRecWithStep evalFn (f v)
-
-                            EvErr e ->
-                                EvErr e
-
-                            EvErrTrace e _ _ ->
-                                EvErr e
-
-                            EvYield t2 p2 r2 ->
-                                EvYield t2 p2 r2
-                    )
+                    (resumeThenWithEval evalFn f resume)
                 )
 
 
@@ -70,6 +54,30 @@ resolveRecWithStep evalFn =
         (\( expr, cfg, env ) ->
             Recursion.base (evalFn expr cfg env)
         )
+
+
+resumeThenWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> (Value -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value))
+    -> (Value -> EvalResult Value)
+    -> (Value -> EvalResult Value)
+resumeThenWithEval evalFn f resume resumeValue =
+    case resume resumeValue of
+        EvOk v ->
+            resolveRecWithStep evalFn (f v)
+
+        EvOkTrace v trees logs ->
+            resolveRecWithStep evalFn (f v)
+                |> mergeTraceInto trees logs
+
+        EvErr e ->
+            EvErr e
+
+        EvErrTrace e trees logs ->
+            EvErrTrace e trees logs
+
+        EvYield tag payload nestedResume ->
+            EvYield tag payload (resumeThenWithEval evalFn f nestedResume)
 
 
 combineMap : (a -> Eval b) -> List a -> Eval (List b)

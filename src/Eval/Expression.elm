@@ -1602,15 +1602,14 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
         _ ->
             case maybeQualifiedName of
                 Just qualifiedName ->
-                    -- Check function intercepts before normal evaluation.
-                    -- This is the hook point for framework callbacks and memoization.
-                    case Dict.get (Syntax.qualifiedNameToString qualifiedName) cfg.intercepts of
-                        Just (Types.Intercept interceptFn) ->
-                            Recursion.base (interceptFn args cfg boundEnv)
+                    let
+                        qualifiedNameString =
+                            Syntax.qualifiedNameToString qualifiedName
 
-                        Nothing ->
+                        evaluateOriginal : () -> EvalResult Value
+                        evaluateOriginal () =
                             if env.callDepth < 200 then
-                                call maybeQualifiedName implementation cfg boundEnv
+                                Types.resolveRecWithStep evalExpression (call maybeQualifiedName implementation cfg boundEnv)
 
                             else
                                 let
@@ -1619,15 +1618,35 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                                 in
                                 case checkAndUpdateCycle qualifiedName args env.callDepth currentCheck of
                                     CycleDetected ->
-                                        Types.failPartial <|
-                                            typeError env
-                                                ("Infinite recursion detected: "
-                                                    ++ Syntax.qualifiedNameToString qualifiedName
-                                                    ++ " called with identical arguments"
-                                                )
+                                        Types.resolveRecWithStep evalExpression
+                                            (Types.failPartial <|
+                                                typeError env
+                                                    ("Infinite recursion detected: "
+                                                        ++ qualifiedNameString
+                                                        ++ " called with identical arguments"
+                                                    )
+                                            )
 
                                     Continue updatedCheck ->
-                                        call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = Just updatedCheck }
+                                        Types.resolveRecWithStep evalExpression
+                                            (call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = Just updatedCheck })
+                    in
+                    -- Check function intercepts before normal evaluation.
+                    -- This is the hook point for framework callbacks and memoization.
+                    case Dict.get qualifiedNameString cfg.intercepts of
+                        Just (Types.Intercept interceptFn) ->
+                            Recursion.base
+                                (interceptFn
+                                    { qualifiedName = qualifiedNameString
+                                    , evaluateOriginal = evaluateOriginal
+                                    }
+                                    args
+                                    cfg
+                                    boundEnv
+                                )
+
+                        Nothing ->
+                            Recursion.base (evaluateOriginal ())
 
                 Nothing ->
                     call maybeQualifiedName implementation cfg boundEnv

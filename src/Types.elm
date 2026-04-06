@@ -1,4 +1,4 @@
-module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
+module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), InterceptContext, JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -51,8 +51,14 @@ Receives the fully-applied arguments and the current eval context.
 Framework authors use this for callbacks (BackendTask, Test, Cmd)
 and for memoization/caching hooks.
 -}
+type alias InterceptContext =
+    { qualifiedName : String
+    , evaluateOriginal : () -> EvalResult Value
+    }
+
+
 type Intercept
-    = Intercept (List Value -> Config -> Env -> EvalResult Value)
+    = Intercept (InterceptContext -> List Value -> Config -> Env -> EvalResult Value)
 
 
 {-| Lightweight call counting for profiling. Tracks how many times each
@@ -202,4 +208,3 @@ evalErrorKindToString kind =
 
         TailCall _ ->
             "TailCall (internal TCO signal)"
-

@@ -50,6 +50,9 @@ suite =
             , yieldInLetBindingPropagates
             , yieldFromCalledFunctionInLet
             , multipleYieldsFromSequentialCalls
+            , yieldsAcrossNestedOperatorChain
+            , yieldsAcrossImportedZeroArgOperatorChain
+            , yieldsAcrossAnnotatedImportedZeroArgOperatorChain
             , multipleYieldsFromLetBindings
             , yieldInsideListFoldl
             , yieldInsideManualFold
@@ -358,7 +361,7 @@ interceptReplacesResult =
                 intercepts =
                     FastDict.singleton "Helpers.greet"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 -- Always return "INTERCEPTED" regardless of args
                                 EvOk (String "INTERCEPTED")
                             )
@@ -391,7 +394,7 @@ interceptReceivesArgs =
                 intercepts =
                     FastDict.singleton "Helpers.add"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 -- Return the sum (proving we got the args)
                                 case args of
                                     [ Int a, Int b ] ->
@@ -430,7 +433,7 @@ interceptMissPassesThrough =
                 -- Intercept a DIFFERENT function
                 intercepts =
                     FastDict.singleton "Helpers.greet"
-                        (Intercept (\_ _ _ -> EvOk (String "INTERCEPTED")))
+                        (Intercept (\_ _ _ _ -> EvOk (String "INTERCEPTED")))
             in
             case evalWithIntercepts [ helperSource, source ] intercepts "results" of
                 Ok (Int 42) ->
@@ -704,7 +707,7 @@ interceptCanYield =
                 intercepts =
                     FastDict.singleton "Helpers.fetch"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ String key ] ->
                                         -- Yield to framework: "please look up this key"
@@ -774,7 +777,7 @@ yieldInLetBindingPropagates =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 100)))
@@ -842,7 +845,7 @@ yieldFromCalledFunctionInLet =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 100)))
@@ -907,7 +910,7 @@ multipleYieldsFromSequentialCalls =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
@@ -954,6 +957,187 @@ multipleYieldsFromSequentialCalls =
                                 ()
 
 
+{-| Test: yields continue correctly across a nested left-associated operator chain.
+This matches the benchmark shape `a + b + c + d`, where the outer continuation
+must remain attached after each nested resume.
+-}
+yieldsAcrossNestedOperatorChain : Test
+yieldsAcrossNestedOperatorChain =
+    test "multiple yields across nested operator chain" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = Helpers.marker 1 + Helpers.marker 2 + Helpers.marker 3 + Helpers.marker 4\n"
+
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        driveResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                                |> (\rawResult -> driveYieldsSync rawResult [])
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ -> Expect.equal 4 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 100) ->
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 100, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
+                                ]
+                                ()
+
+
+{-| Test: yields continue correctly when the repeated operator chain lives inside
+an imported zero-argument value. This matches the benchmark shape
+`Wrapper.results = MemoBench.probeResults`.
+-}
+yieldsAcrossImportedZeroArgOperatorChain : Test
+yieldsAcrossImportedZeroArgOperatorChain =
+    test "multiple yields across imported zero-arg operator chain" <|
+        \_ ->
+            let
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                memoBenchSource =
+                    "module MemoBench exposing (probeResults)\n\nimport Helpers\n\nprobeResults = Helpers.marker 1 + Helpers.marker 2 + Helpers.marker 3 + Helpers.marker 4\n"
+
+                source =
+                    "module Main exposing (results)\n\nimport MemoBench\n\nresults = MemoBench.probeResults\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, memoBenchSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        driveResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                                |> (\rawResult -> driveYieldsSync rawResult [])
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ -> Expect.equal 4 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 100) ->
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 100, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
+                                ]
+                                ()
+
+
+{-| Test: yields continue correctly through the benchmark's annotated module shape.
+-}
+yieldsAcrossAnnotatedImportedZeroArgOperatorChain : Test
+yieldsAcrossAnnotatedImportedZeroArgOperatorChain =
+    test "multiple yields across annotated imported zero-arg operator chain" <|
+        \_ ->
+            let
+                helperSource =
+                    "module ExpensiveHelper exposing (probe)\n\nprobe : Int -> Int\nprobe n =\n    n + 1\n"
+
+                memoBenchSource =
+                    "module MemoBench exposing (probeResults)\n\nimport ExpensiveHelper\n\nprobeResults : Int\nprobeResults =\n    ExpensiveHelper.probe 1\n        + ExpensiveHelper.probe 2\n        + ExpensiveHelper.probe 3\n        + ExpensiveHelper.probe 4\n        + ExpensiveHelper.probe 5\n        + ExpensiveHelper.probe 6\n        + ExpensiveHelper.probe 7\n        + ExpensiveHelper.probe 8\n"
+
+                source =
+                    "module Main exposing (results)\n\nimport MemoBench\n\nresults : String\nresults =\n    MemoBench.probeResults\n"
+
+                intercepts =
+                    FastDict.singleton "ExpensiveHelper.probe"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n + 1)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, memoBenchSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        driveResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                                |> (\rawResult -> driveYieldsSync rawResult [])
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ -> Expect.equal 8 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 44) ->
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 44, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
+                                ]
+                                ()
+
+
 {-| Test: multiple yields from sequential let bindings.
     let x = marker 1
         y = marker 2
@@ -973,7 +1157,7 @@ multipleYieldsFromLetBindings =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
@@ -1036,7 +1220,7 @@ yieldInsideListFoldl =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
@@ -1123,7 +1307,7 @@ yieldInsideManualFold =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
@@ -1187,7 +1371,7 @@ yieldInsideListMap =
                 interceptsNoYield =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvOk (Int (n * 10))
@@ -1200,7 +1384,7 @@ yieldInsideListMap =
                 interceptsWithYield =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
