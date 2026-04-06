@@ -1,4 +1,4 @@
-module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseThen, succeedPartial)
+module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseThen, resolveRecWithStep, succeedPartial)
 
 import Elm.Syntax.Expression exposing (Expression)
 import Elm.Syntax.Node exposing (Node)
@@ -7,7 +7,73 @@ import Parser
 import Recursion exposing (Rec)
 import Rope exposing (Rope)
 import Syntax
-import Types exposing (Config, Env, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), PartialResult)
+import Types exposing (Config, Env, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), PartialResult, Value)
+
+
+{-| Like wrapThen but with an eval function for resolving yields.
+When a yield occurs, the resume can re-enter the trampoline via evalFn.
+-}
+wrapThenWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> (Value -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value))
+    -> EvalResult Value
+    -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value)
+wrapThenWithEval evalFn f er =
+    case er of
+        EvOk v ->
+            f v
+
+        EvErr e ->
+            Recursion.base (EvErr e)
+
+        EvOkTrace v trees logs ->
+            f v
+                |> Recursion.map (mergeTraceInto trees logs)
+
+        EvErrTrace e trees logs ->
+            Recursion.base (EvErrTrace e trees logs)
+
+        EvYield tag payload resume ->
+            Recursion.base
+                (EvYield tag
+                    payload
+                    (\resumeValue ->
+                        case resume resumeValue of
+                            EvOk v ->
+                                resolveRecWithStep evalFn (f v)
+
+                            EvOkTrace v _ _ ->
+                                resolveRecWithStep evalFn (f v)
+
+                            EvErr e ->
+                                EvErr e
+
+                            EvErrTrace e _ _ ->
+                                EvErr e
+
+                            EvYield t2 p2 r2 ->
+                                EvYield t2 p2 r2
+                    )
+                )
+
+
+{-| Resolve a Rec using the eval function from Config.
+Since Rec is opaque, we use runRecursion with a step function
+that delegates to evalFn for each expression step.
+-}
+resolveRecWithStep :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value)
+    -> EvalResult Value
+resolveRecWithStep evalFn =
+    Recursion.runRecursion
+        (\( expr, cfg, env ) ->
+            let
+                result =
+                    evalFn expr cfg env
+            in
+            Recursion.base result
+        )
 
 
 combineMap : (a -> Eval b) -> List a -> Eval (List b)
@@ -122,6 +188,20 @@ recurseThen expr f =
         (wrapThen f)
 
 
+{-| Like recurseThen but with an eval function for yield resolution.
+When a yield occurs inside the recursion and the resume needs to continue
+through the trampoline, this version can resolve it.
+-}
+recurseThenWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> ( Node Expression, Config, Env )
+    -> (Value -> PartialResult Value)
+    -> PartialResult Value
+recurseThenWithEval evalFn expr f =
+    Recursion.recurseThen expr
+        (wrapThenWithEval evalFn f)
+
+
 wrapThen :
     (value
      -> Rec r t (EvalResult a)
@@ -144,11 +224,29 @@ wrapThen f er =
             Recursion.base (EvErrTrace e trees logs)
 
         EvYield tag payload resume ->
-            -- Pass yield through. Resume returns EvalResult value, but we can't
-            -- apply f (which returns Rec) inside the resume lambda.
-            -- For simple let-binding yields, the let handler catches this first.
-            -- This fallback handles yields from operator expressions etc.
-            Recursion.base (EvYield tag payload (\rv -> EvalResult.andThen (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield in wrapThen - yield from this code position not yet supported" }) (resume rv)))
+            -- Yield from inside a recursion step. After resume, apply f
+            -- and resolve any trampoline steps manually.
+            Recursion.base
+                (EvYield tag
+                    payload
+                    (\resumeValue ->
+                        case resume resumeValue of
+                            EvOk v ->
+                                resolveRec (f v)
+
+                            EvOkTrace v _ _ ->
+                                resolveRec (f v)
+
+                            EvErr e ->
+                                EvErr e
+
+                            EvErrTrace e _ _ ->
+                                EvErr e
+
+                            EvYield t2 p2 r2 ->
+                                EvYield t2 p2 r2
+                    )
+                )
 
 
 {-| Merge trace data from an outer evaluation into an inner result.
