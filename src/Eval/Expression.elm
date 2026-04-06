@@ -2764,7 +2764,11 @@ evalLetBlockSingle declaration body cfg env =
             Recursion.base (EvErrTrace e trees logs)
 
         EvYield tag payload _ ->
-            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield cannot resume inside let binding" }))
+            -- Yields from let-binding declarations can't easily propagate through
+            -- the trampoline. For now, drop the resume and return an error.
+            -- Yields from function CALLS (via intercepts) work correctly because
+            -- they fire at the evalFullyApplied level, outside let bindings.
+            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield in let binding - use function-level intercepts instead" }))
 
 
 evalLetBlockFull : Expression.LetBlock -> PartialEval Value
@@ -2863,8 +2867,26 @@ evalLetBlockFull letBlock cfg env =
         EvErrTrace e trees logs ->
             Recursion.base (EvErrTrace e trees logs)
 
-        EvYield tag payload _ ->
-            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield cannot resume inside let binding" }))
+        EvYield tag payload resume ->
+            let
+                convertedResume resumeValue =
+                    case resume resumeValue of
+                        EvOk ne ->
+                            evalExpression letBlock.expression cfg ne
+
+                        EvErr e ->
+                            EvErr e
+
+                        EvOkTrace ne _ _ ->
+                            evalExpression letBlock.expression cfg ne
+
+                        EvErrTrace e _ _ ->
+                            EvErr e
+
+                        EvYield t2 p2 r2 ->
+                            EvYield t2 p2 (\v -> convertedResume v)
+            in
+            Recursion.base (EvYield tag payload convertedResume)
 
 
 isLetDeclarationFunction : Node LetDeclaration -> Bool

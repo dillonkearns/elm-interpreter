@@ -41,6 +41,9 @@ suite =
             ]
         , describe "EvYield"
             [ interceptCanYield
+            , yieldInLetBindingPropagates
+            , yieldFromCalledFunctionInLet
+            , multipleYieldsFromSequentialCalls
             ]
         , describe "deepHashValue"
             [ deepHashSameValue
@@ -566,6 +569,221 @@ interceptCanYield =
                         Ok _ ->
                             -- If we got Ok, the yield was somehow resolved (shouldn't happen without a driver)
                             Expect.fail "Expected yield to propagate, but got Ok"
+
+
+{-| Test: yield from a function called inside a let binding.
+This is the pattern elm-review uses for initialCacheMarker:
+    let
+        cache = initialCacheMarker name id emptyCache
+        ...
+    in result
+-}
+yieldInLetBindingPropagates : Test
+yieldInLetBindingPropagates =
+    test "yield from function called in let binding propagates to driver" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults =\n    let\n        x = Helpers.marker 1\n    in\n    x + 10\n"
+
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 100)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        rawResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                    in
+                    case rawResult of
+                        EvYield "test-yield" (Int 1) resume ->
+                            -- The yield propagated! Now resume with Unit
+                            case resume Unit of
+                                EvOk (Int 110) ->
+                                    -- 1 * 100 = 100, then 100 + 10 = 110
+                                    Expect.pass
+
+                                EvOk other ->
+                                    Expect.fail ("Expected Int 110 after resume, got: " ++ Debug.toString other)
+
+                                EvErr e ->
+                                    Expect.fail ("Error after resume: " ++ Debug.toString e)
+
+                                EvYield _ _ _ ->
+                                    Expect.fail "Got another yield after resume (expected final result)"
+
+                                _ ->
+                                    Expect.fail "Unexpected result after resume"
+
+                        EvOk _ ->
+                            Expect.fail "Yield didn't propagate (got EvOk directly)"
+
+                        EvErr e ->
+                            Expect.fail ("Error (yield swallowed?): " ++ Types.evalErrorKindToString e.error)
+
+                        _ ->
+                            Expect.fail "Unexpected result type"
+
+
+{-| Test: yield from a function that's called (not directly in let binding).
+    let
+        result = someFunc (marker 1)
+    in result
+-}
+yieldFromCalledFunctionInLet : Test
+yieldFromCalledFunctionInLet =
+    test "yield from function argument in let binding" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults =\n    let\n        x = Helpers.add (Helpers.marker 1) 10\n    in\n    x\n"
+
+                helperSource =
+                    "module Helpers exposing (marker, add)\n\nmarker n = n\n\nadd a b = a + b\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 100)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        rawResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                    in
+                    case rawResult of
+                        EvYield "test-yield" (Int 1) resume ->
+                            case resume Unit of
+                                EvOk (Int 110) ->
+                                    Expect.pass
+
+                                EvOk other ->
+                                    Expect.fail ("Expected Int 110, got: " ++ Debug.toString other)
+
+                                EvErr e ->
+                                    Expect.fail ("Error: " ++ Debug.toString e)
+
+                                _ ->
+                                    Expect.fail "Unexpected result"
+
+                        EvOk _ ->
+                            Expect.fail "Yield didn't propagate through let binding"
+
+                        EvErr e ->
+                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                        _ ->
+                            Expect.fail "Unexpected result"
+
+
+{-| Test: multiple functions that yield, called sequentially.
+This is the pattern for saving ALL rule caches:
+    let
+        cache1 = marker "rule1" emptyCache
+        cache2 = marker "rule2" emptyCache
+    in ...
+-}
+multipleYieldsFromSequentialCalls : Test
+multipleYieldsFromSequentialCalls =
+    test "multiple yields from sequential function calls" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = Helpers.marker 1 + Helpers.marker 2\n"
+
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        rawResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+
+                        -- Drive yields manually (simulating the BackendTask driver)
+                        driveResult =
+                            driveYieldsSync rawResult []
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ ->
+                                    -- Should have yielded twice (once per marker call)
+                                    Expect.atLeast 1 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 30) ->
+                                            -- marker 1 → 10, marker 2 → 20, total = 30
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 30, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail "Unexpected final result"
+                                ]
+                                ()
+
+
+{-| Synchronous yield driver for tests: drives yields until EvOk/EvErr,
+collecting all yield payloads along the way.
+-}
+driveYieldsSync : Types.EvalResult Value -> List ( String, Value ) -> { finalResult : Types.EvalResult Value, yields : List ( String, Value ) }
+driveYieldsSync result acc =
+    case result of
+        EvYield tag payload resume ->
+            -- Handle the yield (return Unit as resume value) and continue
+            driveYieldsSync (resume Unit) (( tag, payload ) :: acc)
+
+        other ->
+            { finalResult = other, yields = List.reverse acc }
 
 
 deepHashSameValue : Test
