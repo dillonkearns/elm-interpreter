@@ -9,6 +9,7 @@ insertion sort that correctly preserves the relative order of equal elements.
 -}
 
 import EvalResult
+import FastDict as Dict
 import Kernel.Utils
 import Types exposing (Eval, EvalResult(..), Value(..))
 import Value
@@ -24,6 +25,32 @@ map f xs cfg env =
 
 mapHelp : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
 mapHelp f remaining acc cfg env =
+    if Dict.isEmpty cfg.intercepts then
+        -- Fast path: no intercepts means no EvYield possible.
+        -- Tight loop with only EvOk/EvErr branches for V8 to optimize.
+        mapHelpFast f remaining acc { cfg | tcoTarget = Nothing } env
+
+    else
+        mapHelpWithYield f remaining acc cfg env
+
+
+mapHelpFast : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
+mapHelpFast f remaining acc cfg env =
+    case remaining of
+        [] ->
+            EvalResult.succeed (List.reverse acc)
+
+        x :: rest ->
+            case EvalResult.toResult (f x cfg env) of
+                Ok mapped ->
+                    mapHelpFast f rest (mapped :: acc) cfg env
+
+                Err e ->
+                    EvErr e
+
+
+mapHelpWithYield : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
+mapHelpWithYield f remaining acc cfg env =
     let
         innerCfg =
             { cfg | tcoTarget = Nothing }
@@ -39,7 +66,7 @@ mapHelp f remaining acc cfg env =
                         (\v ->
                             case EvalResult.toResult (resume v) of
                                 Ok mapped ->
-                                    mapHelp f rest (mapped :: acc) cfg env
+                                    mapHelpWithYield f rest (mapped :: acc) cfg env
 
                                 Err e ->
                                     EvErr e
@@ -48,7 +75,7 @@ mapHelp f remaining acc cfg env =
                 fxResult ->
                     case EvalResult.toResult fxResult of
                         Ok mapped ->
-                            mapHelp f rest (mapped :: acc) cfg env
+                            mapHelpWithYield f rest (mapped :: acc) cfg env
 
                         Err e ->
                             EvErr e
@@ -63,11 +90,36 @@ foldl f init xs cfg env =
 
 foldlHelp : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
 foldlHelp f acc remaining cfg env =
+    if Dict.isEmpty cfg.intercepts then
+        foldlHelpFast f acc remaining { cfg | tcoTarget = Nothing } env
+
+    else
+        foldlHelpWithYield f acc remaining cfg env
+
+
+foldlHelpFast : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
+foldlHelpFast f acc remaining cfg env =
+    case remaining of
+        [] ->
+            EvalResult.succeed acc
+
+        x :: rest ->
+            case EvalResult.toResult (f x cfg env) of
+                Err e ->
+                    EvErr e
+
+                Ok g ->
+                    case EvalResult.toResult (g acc cfg env) of
+                        Err e ->
+                            EvErr e
+
+                        Ok newAcc ->
+                            foldlHelpFast f newAcc rest cfg env
+
+
+foldlHelpWithYield : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
+foldlHelpWithYield f acc remaining cfg env =
     let
-        -- Clear tcoTarget to prevent TailCall signals from escaping
-        -- the kernel loop. Without this, a function matching tcoTarget
-        -- called inside the fold would fire TailCall, which toResult
-        -- would catch as an error and propagate up incorrectly.
         innerCfg =
             { cfg | tcoTarget = Nothing }
     in
@@ -77,7 +129,6 @@ foldlHelp f acc remaining cfg env =
 
         x :: rest ->
             let
-                -- Apply the accumulator function to get the step result
                 applyStep g =
                     case g acc innerCfg env of
                         EvYield tag2 payload2 resume2 ->
@@ -85,7 +136,7 @@ foldlHelp f acc remaining cfg env =
                                 (\v2 ->
                                     case EvalResult.toResult (resume2 v2) of
                                         Ok newAcc ->
-                                            foldlHelp f newAcc rest cfg env
+                                            foldlHelpWithYield f newAcc rest cfg env
 
                                         Err e ->
                                             EvErr e
@@ -97,7 +148,7 @@ foldlHelp f acc remaining cfg env =
                                     EvErr e
 
                                 Ok newAcc ->
-                                    foldlHelp f newAcc rest cfg env
+                                    foldlHelpWithYield f newAcc rest cfg env
             in
             case f x innerCfg env of
                 EvYield tag payload resume ->
@@ -272,6 +323,30 @@ concatMap f xs cfg env =
 
 concatMapHelp : (Value -> Eval (List Value)) -> List Value -> List Value -> Eval (List Value)
 concatMapHelp f remaining acc cfg env =
+    if Dict.isEmpty cfg.intercepts then
+        concatMapHelpFast f remaining acc { cfg | tcoTarget = Nothing } env
+
+    else
+        concatMapHelpWithYield f remaining acc cfg env
+
+
+concatMapHelpFast : (Value -> Eval (List Value)) -> List Value -> List Value -> Eval (List Value)
+concatMapHelpFast f remaining acc cfg env =
+    case remaining of
+        [] ->
+            EvalResult.succeed (List.reverse acc)
+
+        x :: rest ->
+            case EvalResult.toResult (f x cfg env) of
+                Ok mapped ->
+                    concatMapHelpFast f rest (List.foldl (::) acc mapped) cfg env
+
+                Err e ->
+                    EvErr e
+
+
+concatMapHelpWithYield : (Value -> Eval (List Value)) -> List Value -> List Value -> Eval (List Value)
+concatMapHelpWithYield f remaining acc cfg env =
     let
         innerCfg =
             { cfg | tcoTarget = Nothing }
@@ -287,7 +362,7 @@ concatMapHelp f remaining acc cfg env =
                         (\v ->
                             case EvalResult.toResult (resume v) of
                                 Ok mapped ->
-                                    concatMapHelp f rest (List.foldl (::) acc mapped) cfg env
+                                    concatMapHelpWithYield f rest (List.foldl (::) acc mapped) cfg env
 
                                 Err e ->
                                     EvErr e
@@ -296,7 +371,7 @@ concatMapHelp f remaining acc cfg env =
                 fxResult ->
                     case EvalResult.toResult fxResult of
                         Ok mapped ->
-                            concatMapHelp f rest (List.foldl (::) acc mapped) cfg env
+                            concatMapHelpWithYield f rest (List.foldl (::) acc mapped) cfg env
 
                         Err e ->
                             EvErr e
