@@ -1,10 +1,10 @@
-module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseThen, resolveRecWithStep, succeedPartial)
+module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseMapThenWithEval, recurseThen, recurseThenWithEval, resolveRecWithStep, succeedPartial)
 
 import Elm.Syntax.Expression exposing (Expression)
 import Elm.Syntax.Node exposing (Node)
 import EvalResult
 import Parser
-import Recursion exposing (Rec)
+import Recursion exposing (Rec, resolveRec)
 import Rope exposing (Rope)
 import Syntax
 import Types exposing (Config, Env, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), PartialResult, Value)
@@ -66,13 +66,9 @@ resolveRecWithStep :
     -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value)
     -> EvalResult Value
 resolveRecWithStep evalFn =
-    Recursion.runRecursion
+    resolveRec
         (\( expr, cfg, env ) ->
-            let
-                result =
-                    evalFn expr cfg env
-            in
-            Recursion.base result
+            Recursion.base (evalFn expr cfg env)
         )
 
 
@@ -223,30 +219,8 @@ wrapThen f er =
         EvErrTrace e trees logs ->
             Recursion.base (EvErrTrace e trees logs)
 
-        EvYield tag payload resume ->
-            -- Yield from inside a recursion step. After resume, apply f
-            -- and resolve any trampoline steps manually.
-            Recursion.base
-                (EvYield tag
-                    payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvOk v ->
-                                resolveRec (f v)
-
-                            EvOkTrace v _ _ ->
-                                resolveRec (f v)
-
-                            EvErr e ->
-                                EvErr e
-
-                            EvErrTrace e _ _ ->
-                                EvErr e
-
-                            EvYield t2 p2 r2 ->
-                                EvYield t2 p2 r2
-                    )
-                )
+        EvYield tag payload _ ->
+            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield cannot resume inside recursion scheme" }))
 
 
 {-| Merge trace data from an outer evaluation into an inner result.
@@ -270,12 +244,21 @@ mergeTraceInto trees logs er =
             EvYield tag payload resume
 
 
-recurseMapThen :
+recurseMapThen : 
     ( List (Node Expression), Config, Env )
     -> (List out -> PartialResult out)
     -> PartialResult out
 recurseMapThen ( exprs, cfg, env ) f =
     recurseMapPlain (List.reverse exprs) cfg env [] f
+
+
+recurseMapThenWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> ( List (Node Expression), Config, Env )
+    -> (List Value -> PartialResult Value)
+    -> PartialResult Value
+recurseMapThenWithEval evalFn ( exprs, cfg, env ) f =
+    recurseMapPlainWithEval evalFn (List.reverse exprs) cfg env [] f
 
 
 {-| Fast path: no trace data seen yet. Unwraps EvOk immediately during fold.
@@ -307,6 +290,26 @@ recurseMapPlain items cfg env vacc f =
                 )
 
 
+recurseMapPlainWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> List (Node Expression)
+    -> Config
+    -> Env
+    -> List Value
+    -> (List Value -> PartialResult Value)
+    -> PartialResult Value
+recurseMapPlainWithEval evalFn items cfg env vacc f =
+    case items of
+        [] ->
+            f vacc
+
+        item :: rest ->
+            recurseThenWithEval evalFn ( item, cfg, env )
+                (\v ->
+                    recurseMapPlainWithEval evalFn rest cfg env (v :: vacc) f
+                )
+
+
 {-| Traced path: accumulates trace data alongside values.
 -}
 recurseMapTraced : List (Node Expression) -> Config -> Env -> List out -> Rope Types.CallTree -> Rope String -> (List out -> PartialResult out) -> PartialResult out
@@ -334,4 +337,27 @@ recurseMapTraced items cfg env vacc tacc lacc f =
 
                         EvYield tag payload resume ->
                             Recursion.base (EvYield tag payload resume)
+                )
+
+
+recurseMapTracedWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> List (Node Expression)
+    -> Config
+    -> Env
+    -> List Value
+    -> Rope Types.CallTree
+    -> Rope String
+    -> (List Value -> PartialResult Value)
+    -> PartialResult Value
+recurseMapTracedWithEval evalFn items cfg env vacc tacc lacc f =
+    case items of
+        [] ->
+            f vacc
+                |> Recursion.map (mergeTraceInto tacc lacc)
+
+        item :: rest ->
+            recurseThenWithEval evalFn ( item, cfg, env )
+                (\v ->
+                    recurseMapTracedWithEval evalFn rest cfg env (v :: vacc) tacc lacc f
                 )

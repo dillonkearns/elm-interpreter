@@ -596,7 +596,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
             case (if Dict.isEmpty env.letFunctions then Nothing else Dict.get name env.letFunctions) of
                 Just function ->
                     if List.isEmpty function.arguments then
-                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     else
                         continuation
@@ -618,7 +618,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                     -- Then check values (local bindings, parameters, record destructuring)
                     case Dict.get name env.values of
                         Just (PartiallyApplied _ [] [] _ _ _) ->
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                         Just value ->
                             continuation value
@@ -628,7 +628,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             case Dict.get name env.currentModuleFunctions of
                                 Just function ->
                                     if List.isEmpty function.arguments then
-                                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                                     else
                                         continuation
@@ -647,7 +647,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                             )
 
                                 Nothing ->
-                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.ParenthesizedExpression inner ->
             evalOrRecurse ( inner, cfg, env ) continuation
@@ -672,19 +672,19 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             Types.failPartial <| typeError env "Trying to negate a non-number"
 
                 Nothing ->
-                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.OperatorApplication opName _ l r ->
             if cfg.trace then
-                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
             else
                 case opName of
                     "<|" ->
-                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     "|>" ->
-                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     "||" ->
                         case evalSimple l env of
@@ -692,21 +692,21 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                 continuation (Bool True)
 
                             Just (Bool False) ->
-                                Types.recurseThen ( r, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( r, cfg, env ) continuation
 
                             Just v ->
                                 Types.failPartial <| typeError env <| "|| applied to non-Bool " ++ Value.toString v
 
                             Nothing ->
                                 -- Left complex: trampoline left, then short-circuit
-                                Types.recurseThen ( l, cfg, env )
+                                Types.recurseThenWithEval evalExpression ( l, cfg, env )
                                     (\lValue ->
                                         case lValue of
                                             Bool True ->
                                                 continuation (Bool True)
 
                                             Bool False ->
-                                                Types.recurseThen ( r, cfg, env ) continuation
+                                                Types.recurseThenWithEval evalExpression ( r, cfg, env ) continuation
 
                                             v ->
                                                 Types.failPartial <| typeError env <| "|| applied to non-Bool " ++ Value.toString v
@@ -718,21 +718,21 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                 continuation (Bool False)
 
                             Just (Bool True) ->
-                                Types.recurseThen ( r, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( r, cfg, env ) continuation
 
                             Just v ->
                                 Types.failPartial <| typeError env <| "&& applied to non-Bool " ++ Value.toString v
 
                             Nothing ->
                                 -- Left complex: trampoline left, then short-circuit
-                                Types.recurseThen ( l, cfg, env )
+                                Types.recurseThenWithEval evalExpression ( l, cfg, env )
                                     (\lValue ->
                                         case lValue of
                                             Bool False ->
                                                 continuation (Bool False)
 
                                             Bool True ->
-                                                Types.recurseThen ( r, cfg, env ) continuation
+                                                Types.recurseThenWithEval evalExpression ( r, cfg, env ) continuation
 
                                             v ->
                                                 Types.failPartial <| typeError env <| "&& applied to non-Bool " ++ Value.toString v
@@ -755,7 +755,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                                 Recursion.base (EvErr e)
 
                                     Nothing ->
-                                        Types.recurseThen ( r, cfg, env )
+                                        Types.recurseThenWithEval evalExpression ( r, cfg, env )
                                             (\rValue ->
                                                 case Kernel.Utils.equal lValue rValue env of
                                                     Ok True ->
@@ -769,7 +769,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                             )
 
                             Nothing ->
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     "/=" ->
                         case evalSimple l env of
@@ -787,10 +787,10 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                                 Recursion.base (EvErr e)
 
                                     Nothing ->
-                                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                             Nothing ->
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     _ ->
                         case resolveOperator opName of
@@ -809,7 +809,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
 
                                             Nothing ->
                                                 -- Left simple, right complex: trampoline right only
-                                                Types.recurseThen ( r, cfg, env )
+                                                Types.recurseThenWithEval evalExpression ( r, cfg, env )
                                                     (\rValue ->
                                                         case kernelFn [ lValue, rValue ] cfg env of
                                                             EvOk v ->
@@ -823,7 +823,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                         case evalSimple r env of
                                             Just rValue ->
                                                 -- Left complex, right simple: trampoline left only
-                                                Types.recurseThen ( l, cfg, env )
+                                                Types.recurseThenWithEval evalExpression ( l, cfg, env )
                                                     (\lValue ->
                                                         case kernelFn [ lValue, rValue ] cfg env of
                                                             EvOk v ->
@@ -835,10 +835,10 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
 
                                             Nothing ->
                                                 -- Both complex: full trampoline
-                                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                             Nothing ->
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.RecordAccess recordExpr (Node _ field) ->
             case evalSimple recordExpr env of
@@ -854,7 +854,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                     Types.failPartial <| typeError env "Trying to access a field on a non-record value"
 
                 Nothing ->
-                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.TupledExpression exprs ->
             case exprs of
@@ -867,7 +867,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             continuation v
 
                         Nothing ->
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                 [ l, r ] ->
                     case evalSimple l env of
@@ -877,10 +877,10 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                     continuation (Tuple lValue rValue)
 
                                 Nothing ->
-                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                         Nothing ->
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                 [ l, m, r ] ->
                     case evalSimple l env of
@@ -892,40 +892,40 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                             continuation (Triple lValue mValue rValue)
 
                                         Nothing ->
-                                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                                 Nothing ->
-                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                         Nothing ->
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                 _ ->
                     Types.failPartial <| typeError env "Tuples with more than three elements are not supported"
 
         Expression.IfBlock cond true false ->
             if cfg.trace then
-                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
             else
                 case evalSimple cond env of
                     Just (Bool True) ->
-                        Types.recurseThen ( true, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( true, cfg, env ) continuation
 
                     Just (Bool False) ->
-                        Types.recurseThen ( false, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( false, cfg, env ) continuation
 
                     Just _ ->
                         Types.failPartial <| typeError env "ifThenElse condition was not a boolean"
 
                     Nothing ->
-                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.ListExpr [] ->
             continuation (List [])
 
         _ ->
-            Types.recurseThen ( fullExpr, cfg, env ) continuation
+            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
 
 {-| Try to evaluate a simple expression without recursion.
@@ -1374,7 +1374,7 @@ evalApplication first rest cfg env =
         (\firstValue ->
             case firstValue of
                 Custom name customArgs ->
-                    Types.recurseMapThen ( rest, cfg, env )
+                    Types.recurseMapThenWithEval evalExpression ( rest, cfg, env )
                         (\values -> Types.succeedPartial <| Custom name (customArgs ++ values))
 
                 PartiallyApplied localEnv oldArgs patterns maybeQualifiedName implementation _ ->
@@ -1423,7 +1423,7 @@ evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv 
             restLength =
                 List.length rest
         in
-        Types.recurseMapThen ( rest, cfg, env )
+        Types.recurseMapThenWithEval evalExpression ( rest, cfg, env )
             (\values ->
                 let
                     args : List Value
@@ -1956,87 +1956,179 @@ tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
             result =
                 evalExpression body innerCfg env
         in
-        case tcoExtractTailCall result of
-            Just newValues ->
-                -- Got a TailCall signal
-                let
-                    newSize =
-                        valuesSize newValues
+        case result of
+            EvYield tag payload resume ->
+                EvYield tag payload
+                    (\resumeValue ->
+                        tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume resumeValue)
+                    )
 
-                    newFingerprint =
-                        fingerprintValues newValues
+            _ ->
+                case tcoExtractTailCall result of
+                    Just newValues ->
+                        -- Got a TailCall signal
+                        let
+                            newSize =
+                                valuesSize newValues
 
-                    -- Category A: check if fingerprint is identical (NOT using ==
-                    -- on the values dict, which is unreliable for PartiallyApplied).
-                    identicalFingerprint =
-                        newFingerprint == lastFingerprint && newSize == lastSize
+                            newFingerprint =
+                                fingerprintValues newValues
 
-                    -- "Bounded progress": at least one value has constant size
-                    -- but changing fingerprint.
-                    boundedProgress =
-                        hasBoundedProgressInValues env.values newValues
+                            -- Category A: check if fingerprint is identical (NOT using ==
+                            -- on the values dict, which is unreliable for PartiallyApplied).
+                            identicalFingerprint =
+                                newFingerprint == lastFingerprint && newSize == lastSize
 
-                    newGrowCount =
-                        if boundedProgress then
-                            0
+                            -- "Bounded progress": at least one value has constant size
+                            -- but changing fingerprint.
+                            boundedProgress =
+                                hasBoundedProgressInValues env.values newValues
 
-                        else if newSize > lastSize && lastSize > 0 then
-                            growCount + 1
+                            newGrowCount =
+                                if boundedProgress then
+                                    0
 
-                        else if identicalFingerprint then
-                            -- Fingerprint didn't change — count toward Category A
-                            growCount + 1
+                                else if newSize > lastSize && lastSize > 0 then
+                                    growCount + 1
+
+                                else if identicalFingerprint then
+                                    -- Fingerprint didn't change — count toward Category A
+                                    growCount + 1
+
+                                else
+                                    0
+
+                            -- Use same threshold as checkAndUpdateCycle: 500 for closures
+                            hasClosures =
+                                Dict.foldl
+                                    (\_ v found ->
+                                        found
+                                            || (case v of
+                                                    PartiallyApplied _ _ _ _ _ _ ->
+                                                        True
+
+                                                    _ ->
+                                                        False
+                                               )
+                                    )
+                                    False
+                                    newValues
+
+                            threshold =
+                                if hasClosures then
+                                    500
+
+                                else
+                                    50
+                        in
+                        if newGrowCount >= threshold then
+                            EvErr
+                                { currentModule = env.currentModule
+                                , callStack = env.callStack
+                                , error =
+                                    TypeError
+                                        ("Infinite recursion detected: "
+                                            ++ funcName
+                                            ++ (if identicalFingerprint then
+                                                    " called with identical arguments"
+
+                                                else
+                                                    " arguments growing without bound"
+                                               )
+                                        )
+                                }
 
                         else
-                            0
+                            -- Continue loop
+                            tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
 
-                    -- Use same threshold as checkAndUpdateCycle: 500 for closures
-                    hasClosures =
-                        Dict.foldl
-                            (\_ v found ->
-                                found
-                                    || (case v of
-                                            PartiallyApplied _ _ _ _ _ _ ->
-                                                True
+                    Nothing ->
+                        -- Not a TailCall: return the result as-is
+                        result
 
-                                            _ ->
-                                                False
-                                       )
-                            )
-                            False
-                            newValues
 
-                    threshold =
-                        if hasClosures then
-                            500
+tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value -> EvalResult Value
+tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env result =
+    case result of
+        EvYield tag payload resume ->
+            EvYield tag payload
+                (\resumeValue ->
+                    tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume resumeValue)
+                )
 
-                        else
-                            50
-                in
-                if newGrowCount >= threshold then
-                    EvErr
-                        { currentModule = env.currentModule
-                        , callStack = env.callStack
-                        , error =
-                            TypeError
-                                ("Infinite recursion detected: "
-                                    ++ funcName
-                                    ++ (if identicalFingerprint then
-                                            " called with identical arguments"
+        _ ->
+            case tcoExtractTailCall result of
+                Just newValues ->
+                    let
+                        newSize =
+                            valuesSize newValues
 
-                                        else
-                                            " arguments growing without bound"
-                                       )
+                        newFingerprint =
+                            fingerprintValues newValues
+
+                        identicalFingerprint =
+                            newFingerprint == lastFingerprint && newSize == lastSize
+
+                        boundedProgress =
+                            hasBoundedProgressInValues env.values newValues
+
+                        newGrowCount =
+                            if boundedProgress then
+                                0
+
+                            else if newSize > lastSize && lastSize > 0 then
+                                growCount + 1
+
+                            else if identicalFingerprint then
+                                growCount + 1
+
+                            else
+                                0
+
+                        hasClosures =
+                            Dict.foldl
+                                (\_ v found ->
+                                    found
+                                        || (case v of
+                                                PartiallyApplied _ _ _ _ _ _ ->
+                                                    True
+
+                                                _ ->
+                                                    False
+                                           )
                                 )
-                        }
+                                False
+                                newValues
 
-                else
-                    -- Continue loop
-                    tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
+                        threshold =
+                            if hasClosures then
+                                500
 
-            Nothing ->
-                -- Not a TailCall: return the result as-is
-                result
+                            else
+                                50
+                    in
+                    if newGrowCount >= threshold then
+                        EvErr
+                            { currentModule = env.currentModule
+                            , callStack = env.callStack
+                            , error =
+                                TypeError
+                                    ("Infinite recursion detected: "
+                                        ++ funcName
+                                        ++ (if identicalFingerprint then
+                                                " called with identical arguments"
+
+                                            else
+                                                " arguments growing without bound"
+                                           )
+                                    )
+                            }
+
+                    else
+                        tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
+
+                Nothing ->
+                    result
 
 
 {-| Extract TailCall values from an EvalResult, or Nothing if not a TailCall.
@@ -2518,7 +2610,7 @@ evalIfBlock cond true false cfg env =
 
 evalList : List (Node Expression) -> PartialEval Value
 evalList elements cfg env =
-    Types.recurseMapThen ( elements, cfg, env )
+    Types.recurseMapThenWithEval evalExpression ( elements, cfg, env )
         (\values -> Types.succeedPartial <| List values)
 
 
@@ -2530,7 +2622,7 @@ evalRecord fields cfg env =
                 |> List.map (\(Node _ ( Node _ name, expression )) -> ( name, expression ))
                 |> List.unzip
     in
-    Types.recurseMapThen ( expressions, cfg, env )
+    Types.recurseMapThenWithEval evalExpression ( expressions, cfg, env )
         (\tuples ->
             tuples
                 |> List.map2 Tuple.pair fieldNames
@@ -2755,7 +2847,7 @@ evalLetBlockSingle declaration body cfg env =
             Recursion.base (EvErr e)
 
         EvOkTrace ne trees logs ->
-            Types.recurseThen ( body, cfg, ne )
+            Types.recurseThenWithEval evalExpression ( body, cfg, ne )
                 (\res ->
                     Recursion.base (EvOkTrace res trees logs)
                 )
@@ -2905,7 +2997,7 @@ evalLetBlockFull letBlock cfg env =
             Recursion.base (EvErr e)
 
         EvOkTrace ne trees logs ->
-            Types.recurseThen ( letBlock.expression, cfg, ne )
+            Types.recurseThenWithEval evalExpression ( letBlock.expression, cfg, ne )
                 (\res -> Recursion.base (EvOkTrace res trees logs))
 
         EvErrTrace e trees logs ->
@@ -3180,7 +3272,7 @@ evalRecordUpdate (Node range name) setters cfg env =
                                     )
                                 |> List.unzip
                     in
-                    Types.recurseMapThen ( fieldExpressions, cfg, env )
+                    Types.recurseMapThenWithEval evalExpression ( fieldExpressions, cfg, env )
                         (\fieldValues ->
                             let
                                 updates : Dict String Value
