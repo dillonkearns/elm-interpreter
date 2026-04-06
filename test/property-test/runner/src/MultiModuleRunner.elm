@@ -57,5 +57,6 @@ interpretModules flagsJson =
                                     Unsupported msg -> "Unsupported: " ++ msg
                                     NameError msg -> "NameError: " ++ msg
                                     Todo msg -> "Todo: " ++ msg
+                                    TailCall _ -> "TailCall (escaped)"
                                )
                         )
