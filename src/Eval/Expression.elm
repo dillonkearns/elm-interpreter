@@ -2763,12 +2763,56 @@ evalLetBlockSingle declaration body cfg env =
         EvErrTrace e trees logs ->
             Recursion.base (EvErrTrace e trees logs)
 
-        EvYield tag payload _ ->
-            -- Yields from let-binding declarations can't easily propagate through
-            -- the trampoline. For now, drop the resume and return an error.
-            -- Yields from function CALLS (via intercepts) work correctly because
-            -- they fire at the evalFullyApplied level, outside let bindings.
-            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield in let binding - use function-level intercepts instead" }))
+        EvYield tag payload resume ->
+            -- Yield from a let-binding declaration (e.g., `let x = marker 1 in ...`).
+            -- After the framework handles the yield, resume produces an Env.
+            -- We then evaluate the body with that Env via evalExpression
+            -- (which re-enters the trampoline).
+            Recursion.base
+                (EvYield tag
+                    payload
+                    (\resumeValue ->
+                        case resume resumeValue of
+                            EvOk ne ->
+                                evalExpression body cfg ne
+
+                            EvOkTrace ne _ _ ->
+                                evalExpression body cfg ne
+
+                            EvErr e ->
+                                EvErr e
+
+                            EvErrTrace e _ _ ->
+                                EvErr e
+
+                            EvYield t2 p2 r2 ->
+                                -- Nested yield from resume — wrap to continue with body
+                                EvYield t2 p2 (nestedLetResume r2 body cfg)
+                    )
+                )
+
+
+{-| Handle nested yields from let-binding resume. Each yield peels off
+one layer, then continues evaluating the body when we finally get an Env.
+-}
+nestedLetResume : (Value -> EvalResult Env) -> Node Expression -> Config -> (Value -> EvalResult Value)
+nestedLetResume innerResume body cfg =
+    \resumeValue ->
+        case innerResume resumeValue of
+            EvOk ne ->
+                evalExpression body cfg ne
+
+            EvOkTrace ne _ _ ->
+                evalExpression body cfg ne
+
+            EvErr e ->
+                EvErr e
+
+            EvErrTrace e _ _ ->
+                EvErr e
+
+            EvYield t p r ->
+                EvYield t p (nestedLetResume r body cfg)
 
 
 evalLetBlockFull : Expression.LetBlock -> PartialEval Value
@@ -2868,25 +2912,27 @@ evalLetBlockFull letBlock cfg env =
             Recursion.base (EvErrTrace e trees logs)
 
         EvYield tag payload resume ->
-            let
-                convertedResume resumeValue =
-                    case resume resumeValue of
-                        EvOk ne ->
-                            evalExpression letBlock.expression cfg ne
+            Recursion.base
+                (EvYield tag
+                    payload
+                    (\resumeValue ->
+                        case resume resumeValue of
+                            EvOk ne ->
+                                evalExpression letBlock.expression cfg ne
 
-                        EvErr e ->
-                            EvErr e
+                            EvOkTrace ne _ _ ->
+                                evalExpression letBlock.expression cfg ne
 
-                        EvOkTrace ne _ _ ->
-                            evalExpression letBlock.expression cfg ne
+                            EvErr e ->
+                                EvErr e
 
-                        EvErrTrace e _ _ ->
-                            EvErr e
+                            EvErrTrace e _ _ ->
+                                EvErr e
 
-                        EvYield t2 p2 r2 ->
-                            EvYield t2 p2 (\v -> convertedResume v)
-            in
-            Recursion.base (EvYield tag payload convertedResume)
+                            EvYield t2 p2 r2 ->
+                                EvYield t2 p2 (nestedLetResume r2 letBlock.expression cfg)
+                    )
+                )
 
 
 isLetDeclarationFunction : Node LetDeclaration -> Bool
