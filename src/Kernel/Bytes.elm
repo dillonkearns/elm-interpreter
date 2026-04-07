@@ -483,6 +483,31 @@ decode decoderFn bytesVal cfg env =
                 EvMemoStore payload next ->
                     EvMemoStore payload next
 
+                EvOkCoverage v _ ->
+                    case v of
+                        Tuple (Int newOffset) result ->
+                            case bytesVal of
+                                BytesValue arr ->
+                                    if newOffset >= 0 && newOffset <= Array.length arr then
+                                        EvalResult.succeed
+                                            (Custom { moduleName = [ "Maybe" ], name = "Just" } [ result ])
+
+                                    else
+                                        EvalResult.succeed
+                                            (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+
+                                _ ->
+                                    EvalResult.succeed
+                                        (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+
+                        _ ->
+                            EvalResult.succeed
+                                (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+
+                EvErrCoverage _ _ ->
+                    EvalResult.succeed
+                        (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+
         EvErr _ ->
             EvalResult.succeed
                 (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
@@ -521,6 +546,30 @@ decode decoderFn bytesVal cfg env =
         EvMemoStore payload _ ->
             EvMemoStore payload (EvalResult.succeed (Custom { moduleName = [ "Maybe" ], name = "Nothing" } []))
 
+        EvOkCoverage partialFn _ ->
+            case partialFn (Int 0) cfg env of
+                EvOk (Tuple (Int newOffset) result) ->
+                    case bytesVal of
+                        BytesValue arr ->
+                            if newOffset >= 0 && newOffset <= Array.length arr then
+                                EvalResult.succeed
+                                    (Custom { moduleName = [ "Maybe" ], name = "Just" } [ result ])
+
+                            else
+                                EvalResult.succeed
+                                    (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+
+                        _ ->
+                            EvalResult.succeed
+                                (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+
+                _ ->
+                    EvalResult.succeed
+                        (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+
+        EvErrCoverage _ _ ->
+            EvalResult.succeed
+                (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
 
 {-| Wrapper for `encode` that works with the kernel registration's `oneWithError` pattern.
 -}

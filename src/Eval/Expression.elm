@@ -778,7 +778,47 @@ evalExpression initExpression initCfg initEnv =
                                 Expression.GLSLExpression _ ->
                                     Types.failPartial <| unsupported env "GLSL not supported"
                     in
-                    if cfg.trace then
+                    if cfg.coverage then
+                        let
+                            isProbe : Bool
+                            isProbe =
+                                Set.isEmpty cfg.coverageProbeLines
+                                    || Set.member range.start.row cfg.coverageProbeLines
+                                    || Set.member range.end.row cfg.coverageProbeLines
+                        in
+                        if isProbe then
+                            result
+                                |> Recursion.map
+                                    (\evalResult ->
+                                        let
+                                            packedRange : Int
+                                            packedRange =
+                                                Types.packRange range
+
+                                            ( value, childSet ) =
+                                                EvalResult.toCoverageSet evalResult
+                                        in
+                                        if Set.member packedRange childSet then
+                                            evalResult
+
+                                        else
+                                            let
+                                                mergedSet : Set.Set Int
+                                                mergedSet =
+                                                    Set.insert packedRange childSet
+                                            in
+                                            case value of
+                                                Ok v ->
+                                                    EvOkCoverage v mergedSet
+
+                                                Err e ->
+                                                    EvErrCoverage e mergedSet
+                                    )
+
+                        else
+                            result
+
+                    else if cfg.trace then
                         result
                             |> Recursion.map
                                 (\evalResult ->
@@ -1975,11 +2015,11 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
 
                             else
                                 -- Not tail-recursive: clear tcoTarget
-                                Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, newEnv )
+                                Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, newEnv )
 
                         Nothing ->
                             -- No tcoTarget: skip qualifiedNameToString for tcoKey
@@ -1993,7 +2033,7 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
 
                             else
                                 -- Common case: not TCO, no tcoTarget — pass cfg as-is
@@ -2005,7 +2045,7 @@ call maybeQualifiedName implementation cfg env =
                         Recursion.recurse ( expr, cfg, env )
 
                     else
-                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, env )
+                        Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, env )
 
         KernelImpl moduleName name f ->
             if cfg.trace then
@@ -2248,6 +2288,8 @@ tcoLoop funcName body remaining cfg env =
         innerCfg : Config
         innerCfg =
             { trace = cfg.trace
+            , coverage = cfg.coverage
+            , coverageProbeLines = cfg.coverageProbeLines
             , maxSteps = Nothing
             , tcoTarget = cfg.tcoTarget
             , callCounts = cfg.callCounts
@@ -3335,6 +3377,15 @@ evalLetBlockSingle declaration body cfg env =
                     (continueLetResumeResult next body cfg)
                 )
 
+        EvOkCoverage ne s ->
+            Types.recurseThen ( body, cfg, ne )
+                (\res ->
+                    Recursion.base (EvOkCoverage res s)
+                )
+
+        EvErrCoverage e s ->
+            Recursion.base (EvErrCoverage e s)
+
 
 {-| Handle nested yields from let-binding resume. Each yield peels off
 one layer, then continues evaluating the body when we finally get an Env.
@@ -3374,6 +3425,12 @@ continueLetResumeResult envResult body cfg =
 
         EvMemoStore payload next ->
             EvMemoStore payload (continueLetResumeResult next body cfg)
+
+        EvOkCoverage ne _ ->
+            evalExpression body cfg ne
+
+        EvErrCoverage e _ ->
+            EvErr e
 
 
 evalLetBlockFull : Expression.LetBlock -> PartialEval Value
@@ -3490,6 +3547,13 @@ evalLetBlockFull letBlock cfg env =
                 (EvMemoStore payload
                     (continueLetResumeResult next letBlock.expression cfg)
                 )
+
+        EvOkCoverage ne s ->
+            Types.recurseThen ( letBlock.expression, cfg, ne )
+                (\res -> Recursion.base (EvOkCoverage res s))
+
+        EvErrCoverage e s ->
+            Recursion.base (EvErrCoverage e s)
 
 
 isLetDeclarationFunction : Node LetDeclaration -> Bool

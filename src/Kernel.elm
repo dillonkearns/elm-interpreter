@@ -1004,6 +1004,7 @@ threeWithError firstSelector secondSelector thirdSelector _ output f implementat
     )
 
 
+
 partiallyApply : ModuleName -> List Value -> FunctionImplementation -> EvalResult Value
 partiallyApply moduleName args implementation =
     EvalResult.fromResult <|

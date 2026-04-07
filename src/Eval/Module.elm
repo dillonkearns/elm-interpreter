@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Bitwise
 import Core
@@ -10,7 +10,7 @@ import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
 import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation)
 import Elm.Syntax.Import
 import Elm.Syntax.Pattern
-import Elm.Syntax.Range
+import Elm.Syntax.Range exposing (Range)
 import Elm.Syntax.Type
 import Elm.Syntax.TypeAlias exposing (TypeAlias)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
@@ -47,14 +47,14 @@ eval : String -> Expression -> Result Error Value
 eval source expression =
     let
         ( result, _, _ ) =
-            traceOrEvalModule { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False } source expression
+            traceOrEvalModule { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False } source expression
     in
     result
 
 
 trace : String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 trace source expression =
-    traceOrEvalModule { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False } source expression
+    traceOrEvalModule { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False } source expression
 
 
 traceOrEvalModule : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
@@ -464,7 +464,7 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -548,7 +548,7 @@ evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles ex
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -653,6 +653,8 @@ evalWithEnvFromFilesAndMemo (ProjectEnv projectEnv) additionalFiles memoizedFunc
             Eval.Expression.evalExpression
                 (fakeNode expression)
                 { trace = False
+                , coverage = False
+                , coverageProbeLines = Set.empty
                 , maxSteps = Nothing
                 , tcoTarget = Nothing
                 , callCounts = Nothing
@@ -764,7 +766,7 @@ evalWithEnvFromFilesAndValues (ProjectEnv projectEnv) additionalFiles injectedVa
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -862,6 +864,8 @@ evalWithEnvFromFilesAndValuesAndMemo (ProjectEnv projectEnv) additionalFiles inj
             Eval.Expression.evalExpression
                 (fakeNode expression)
                 { trace = False
+                , coverage = False
+                , coverageProbeLines = Set.empty
                 , maxSteps = Nothing
                 , tcoTarget = Nothing
                 , callCounts = Nothing
@@ -997,6 +1001,12 @@ driveInternalMemo memoCache memoStats evalResult =
                             , error = Types.Unsupported ("Unhandled non-memo yield in evalWithMemoizedFunctions: " ++ tag)
                             }
                         )
+
+        Types.EvOkCoverage value _ ->
+            Ok { value = value, memoCache = memoCache, memoStats = memoStats }
+
+        Types.EvErrCoverage evalErr _ ->
+            Err (Types.EvalError evalErr)
 
 
 handleInternalMemoYield :
@@ -1277,6 +1287,8 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw (ProjectEnv projectEnv) add
             Eval.Expression.evalExpression
                 (fakeNode expression)
                 { trace = False
+                , coverage = False
+                , coverageProbeLines = Set.empty
                 , maxSteps = Nothing
                 , tcoTarget = Nothing
                 , callCounts = Nothing
@@ -1387,6 +1399,8 @@ evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expressi
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
                                 { trace = False
+                                , coverage = False
+                                , coverageProbeLines = Set.empty
                                 , maxSteps = Nothing
                                 , tcoTarget = Nothing
                                 , callCounts = Nothing
@@ -1523,6 +1537,8 @@ evalWithInterceptsAndMemoRaw (ProjectEnv projectEnv) additionalSources intercept
                     Eval.Expression.evalExpression
                         (fakeNode expression)
                         { trace = False
+                        , coverage = False
+                        , coverageProbeLines = Set.empty
                         , maxSteps = Nothing
                         , tcoTarget = Nothing
                         , callCounts = Nothing
@@ -1666,7 +1682,7 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         evalResult =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                                { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                                 finalEnv
 
                         ( result, callTrees, logLines ) =
@@ -1675,6 +1691,117 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                     ( Result.mapError Types.EvalError result
                     , callTrees
                     , logLines
+                    )
+
+
+{-| Like `traceWithEnv`, but only collects evaluated source ranges (no full
+CallTree). Uses coverage mode in the interpreter to avoid building env/value
+data for each expression — dramatically reducing memory for large test suites.
+-}
+coverageWithEnv : ProjectEnv -> List String -> Expression -> ( Result Error Value, List Range )
+coverageWithEnv projectEnv additionalSources expression =
+    coverageWithEnvAndLimit Nothing Set.empty projectEnv additionalSources expression
+
+
+{-| Like `coverageWithEnv` but with probe line filtering. Only records
+coverage for expressions on the given lines. When probeLines is empty,
+records all expressions (backward compatible).
+-}
+coverageWithEnvAndLimit : Maybe Int -> Set Int -> ProjectEnv -> List String -> Expression -> ( Result Error Value, List Range )
+coverageWithEnvAndLimit maxSteps probeLines (ProjectEnv projectEnv) additionalSources expression =
+    let
+        parseResult =
+            additionalSources
+                |> List.map
+                    (\source ->
+                        source
+                            |> Elm.Parser.parseToFile
+                            |> Result.mapError ParsingError
+                            |> Result.andThen
+                                (\file ->
+                                    Ok
+                                        { file = file
+                                        , moduleName = fileModuleName file
+                                        , interface = buildInterfaceFromFile file
+                                        }
+                                )
+                    )
+                |> combineResults
+    in
+    case parseResult of
+        Err e ->
+            ( Err e, [] )
+
+        Ok parsedModules ->
+            let
+                additionalInterfaces =
+                    parsedModules
+                        |> List.map (\m -> ( m.moduleName, m.interface ))
+                        |> ElmDict.fromList
+
+                allInterfaces =
+                    ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+                envResult =
+                    parsedModules
+                        |> Result.MyExtra.combineFoldl
+                            (\parsedModule envAcc ->
+                                buildModuleEnv allInterfaces parsedModule envAcc
+                            )
+                            (Ok projectEnv.env)
+            in
+            case envResult of
+                Err e ->
+                    ( Err e, [] )
+
+                Ok env ->
+                    let
+                        lastModule =
+                            parsedModules
+                                |> List.reverse
+                                |> List.head
+                                |> Maybe.map .moduleName
+                                |> Maybe.withDefault [ "Main" ]
+
+                        lastFile =
+                            parsedModules
+                                |> List.reverse
+                                |> List.head
+                                |> Maybe.map .file
+
+                        finalImports =
+                            case lastFile of
+                                Just file ->
+                                    (defaultImports ++ file.imports)
+                                        |> List.foldl (processImport allInterfaces) emptyImports
+
+                                Nothing ->
+                                    emptyImports
+
+                        lastModuleKey =
+                            Environment.moduleKey lastModule
+
+                        finalEnv =
+                            { env
+                                | currentModule = lastModule
+                                , currentModuleKey = lastModuleKey
+                                , currentModuleFunctions =
+                                    Dict.get lastModuleKey env.shared.functions
+                                        |> Maybe.withDefault Dict.empty
+                                , imports = finalImports
+                            }
+
+                        evalResult =
+                            Eval.Expression.evalExpression
+                                (fakeNode expression)
+                                { trace = False, coverage = True, coverageProbeLines = probeLines, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                                finalEnv
+
+                        ( result, coverageSet ) =
+                            EvalResult.toCoverageSet evalResult
+                    in
+                    ( Result.mapError Types.EvalError result
+                    , Set.toList coverageSet |> List.map Types.unpackRange
                     )
 
 
@@ -2041,7 +2168,7 @@ evalProject sources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
