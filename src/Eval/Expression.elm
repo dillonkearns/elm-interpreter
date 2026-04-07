@@ -1,4 +1,4 @@
-module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction)
+module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs)
 
 import Array
 import Bitwise
@@ -16,13 +16,14 @@ import FastDict as Dict exposing (Dict)
 import Kernel
 import Kernel.Utils
 import List.Extra
+import MemoSpec
 import Recursion
 import Result.MyExtra
 import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
-import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), PartialEval, PartialResult, Value(..))
+import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, Value(..))
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -258,6 +259,212 @@ deepHashJsonValue jv =
 hashString : String -> Int
 hashString s =
     String.foldl (\c acc -> Bitwise.xor (acc * 16777619) (Char.toCode c)) 2166136261 s
+
+
+memoLookupPayload : Bool -> MemoSpec.MemoSpec -> String -> List Value -> MemoLookupPayload
+memoLookupPayload collectMemoStats memoSpec qualifiedName args =
+    let
+        maybeQualifiedName =
+            if collectMemoStats then
+                Just qualifiedName
+
+            else
+                Nothing
+    in
+    case memoFingerprintsForSpec memoSpec args of
+        Just { shallowFingerprint, deepFingerprint } ->
+            { specId = memoSpec.id
+            , qualifiedName = maybeQualifiedName
+            , compactFingerprint = compactFingerprintForSpec memoSpec shallowFingerprint
+            , args = Nothing
+            , shallowFingerprint = Just shallowFingerprint
+            , deepFingerprint = Just deepFingerprint
+            }
+
+        Nothing ->
+            { specId = memoSpec.id
+            , qualifiedName = maybeQualifiedName
+            , compactFingerprint = Nothing
+            , args = Just args
+            , shallowFingerprint = Nothing
+            , deepFingerprint = Nothing
+            }
+
+
+memoStorePayload : Bool -> MemoSpec.MemoSpec -> String -> List Value -> Value -> MemoStorePayload
+memoStorePayload collectMemoStats memoSpec qualifiedName args value =
+    let
+        maybeQualifiedName =
+            if collectMemoStats then
+                Just qualifiedName
+
+            else
+                Nothing
+    in
+    case memoFingerprintsForSpec memoSpec args of
+        Just { shallowFingerprint, deepFingerprint } ->
+            { specId = memoSpec.id
+            , qualifiedName = maybeQualifiedName
+            , compactFingerprint = compactFingerprintForSpec memoSpec shallowFingerprint
+            , args = Nothing
+            , shallowFingerprint = Just shallowFingerprint
+            , deepFingerprint = Just deepFingerprint
+            , value = value
+            }
+
+        Nothing ->
+            { specId = memoSpec.id
+            , qualifiedName = maybeQualifiedName
+            , compactFingerprint = Nothing
+            , args = Just args
+            , shallowFingerprint = Nothing
+            , deepFingerprint = Nothing
+            , value = value
+            }
+
+
+memoFingerprintsForSpec : MemoSpec.MemoSpec -> List Value -> Maybe { shallowFingerprint : Int, deepFingerprint : Int }
+memoFingerprintsForSpec memoSpec args =
+    case memoSpec.keyStrategy of
+        MemoSpec.ModuleLookupByRange ->
+            moduleLookupRangeFingerprints args
+
+        MemoSpec.ModuleLookupByNode ->
+            moduleLookupNodeFingerprints args
+
+        MemoSpec.StructuralArgs ->
+            Nothing
+
+
+compactFingerprintForSpec : MemoSpec.MemoSpec -> Int -> Maybe Int
+compactFingerprintForSpec memoSpec combinedFingerprint =
+    case memoSpec.keyStrategy of
+        MemoSpec.ModuleLookupByRange ->
+            Just combinedFingerprint
+
+        MemoSpec.ModuleLookupByNode ->
+            Just combinedFingerprint
+
+        MemoSpec.StructuralArgs ->
+            Nothing
+
+
+moduleLookupRangeFingerprints : List Value -> Maybe { shallowFingerprint : Int, deepFingerprint : Int }
+moduleLookupRangeFingerprints args =
+    case args of
+        [ lookupTable, rangeValue ] ->
+            Maybe.map2 combineMemoFingerprints
+                (lookupTableNamespaceHash lookupTable)
+                (rangeHashValue rangeValue)
+
+        _ ->
+            Nothing
+
+
+moduleLookupNodeFingerprints : List Value -> Maybe { shallowFingerprint : Int, deepFingerprint : Int }
+moduleLookupNodeFingerprints args =
+    case args of
+        [ lookupTable, nodeValue ] ->
+            Maybe.map2 combineMemoFingerprints
+                (lookupTableNamespaceHash lookupTable)
+                (nodeRangeHashValue nodeValue)
+
+        _ ->
+            Nothing
+
+
+combineMemoFingerprints : Int -> Int -> { shallowFingerprint : Int, deepFingerprint : Int }
+combineMemoFingerprints namespaceHash localHash =
+    let
+        combined =
+            Bitwise.xor (namespaceHash * 16777619) localHash
+    in
+    { shallowFingerprint = combined
+    , deepFingerprint = combined
+    }
+
+
+lookupTableNamespaceHash : Value -> Maybe Int
+lookupTableNamespaceHash value =
+    case value of
+        Custom ref [ currentModuleNameValue, _ ] ->
+            if ref.moduleName == [ "Review", "ModuleNameLookupTable", "Internal" ] && ref.name == "ModuleNameLookupTable" then
+                moduleNameValueHash currentModuleNameValue
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+moduleNameValueHash : Value -> Maybe Int
+moduleNameValueHash value =
+    case value of
+        List moduleParts ->
+            moduleParts
+                |> List.foldl
+                    (\part maybeAcc ->
+                        case ( maybeAcc, part ) of
+                            ( Just acc, String namePart ) ->
+                                Just (Bitwise.xor (acc * 16777619) (hashString namePart))
+
+                            _ ->
+                                Nothing
+                    )
+                    (Just 2166136261)
+
+        _ ->
+            Nothing
+
+
+nodeRangeHashValue : Value -> Maybe Int
+nodeRangeHashValue value =
+    case value of
+        Custom ref [ rangeValue, _ ] ->
+            if ref.moduleName == [ "Elm", "Syntax", "Node" ] && ref.name == "Node" then
+                rangeHashValue rangeValue
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+rangeHashValue : Value -> Maybe Int
+rangeHashValue value =
+    case value of
+        Record fields ->
+            case ( Dict.get "start" fields, Dict.get "end" fields ) of
+                ( Just startValue, Just endValue ) ->
+                    Maybe.map2
+                        (\startHash endHash ->
+                            Bitwise.xor (startHash * 16777619) endHash
+                        )
+                        (positionHashValue startValue)
+                        (positionHashValue endValue)
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+positionHashValue : Value -> Maybe Int
+positionHashValue value =
+    case value of
+        Record fields ->
+            case ( Dict.get "row" fields, Dict.get "column" fields ) of
+                ( Just (Int row), Just (Int column) ) ->
+                    Just (Bitwise.xor (row * 16777619) column)
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
 
 
 {-| Combined check + update for cycle detection. Returns either:
@@ -1632,7 +1839,7 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                                             (call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = Just updatedCheck })
                     in
                     -- Check function intercepts before normal evaluation.
-                    -- This is the hook point for framework callbacks and memoization.
+                    -- This is the hook point for framework callbacks and host-driven memoization.
                     case Dict.get qualifiedNameString cfg.intercepts of
                         Just (Types.Intercept interceptFn) ->
                             Recursion.base
@@ -1646,7 +1853,34 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                                 )
 
                         Nothing ->
-                            Recursion.base (evaluateOriginal ())
+                            case MemoSpec.lookup qualifiedNameString cfg.memoizedFunctions of
+                                Just memoSpec ->
+                                    let
+                                        evaluateAndStoreMemoized : () -> EvalResult Value
+                                        evaluateAndStoreMemoized () =
+                                            evaluateOriginal ()
+                                                |> EvalResult.andThen
+                                                    (\value ->
+                                                        EvMemoStore
+                                                            (memoStorePayload cfg.collectMemoStats memoSpec qualifiedNameString args value)
+                                                            (EvOk value)
+                                                    )
+                                    in
+                                    Recursion.base
+                                        (EvMemoLookup
+                                            (memoLookupPayload cfg.collectMemoStats memoSpec qualifiedNameString args)
+                                            (\lookupResult ->
+                                                case lookupResult of
+                                                    Just cachedValue ->
+                                                        EvOk cachedValue
+
+                                                    Nothing ->
+                                                        evaluateAndStoreMemoized ()
+                                            )
+                                        )
+
+                                Nothing ->
+                                    Recursion.base (evaluateOriginal ())
 
                 Nothing ->
                     call maybeQualifiedName implementation cfg boundEnv
@@ -1692,11 +1926,11 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
 
                             else
                                 -- Not tail-recursive: clear tcoTarget
-                                Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, newEnv )
+                                Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, newEnv )
 
                         Nothing ->
                             -- No tcoTarget: skip qualifiedNameToString for tcoKey
@@ -1710,7 +1944,7 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
 
                             else
                                 -- Common case: not TCO, no tcoTarget — pass cfg as-is
@@ -1722,7 +1956,7 @@ call maybeQualifiedName implementation cfg env =
                         Recursion.recurse ( expr, cfg, env )
 
                     else
-                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, env )
+                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, env )
 
         KernelImpl moduleName name f ->
             if cfg.trace then
@@ -1970,7 +2204,7 @@ tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
     else
         let
             innerCfg =
-                { trace = cfg.trace, maxSteps = Nothing, tcoTarget = cfg.tcoTarget, callCounts = cfg.callCounts, intercepts = cfg.intercepts }
+                { trace = cfg.trace, maxSteps = Nothing, tcoTarget = cfg.tcoTarget, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }
 
             result =
                 evalExpression body innerCfg env
@@ -1981,6 +2215,16 @@ tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
                     (\resumeValue ->
                         tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume resumeValue)
                     )
+
+            EvMemoLookup payload resume ->
+                EvMemoLookup payload
+                    (\maybeValue ->
+                        tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume maybeValue)
+                    )
+
+            EvMemoStore payload next ->
+                EvMemoStore payload
+                    (tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env next)
 
             _ ->
                 case tcoExtractTailCall result of
@@ -2074,6 +2318,16 @@ tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg e
                 (\resumeValue ->
                     tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume resumeValue)
                 )
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload
+                (\maybeValue ->
+                    tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume maybeValue)
+                )
+
+        EvMemoStore payload next ->
+            EvMemoStore payload
+                (tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env next)
 
         _ ->
             case tcoExtractTailCall result of
@@ -2882,24 +3136,19 @@ evalLetBlockSingle declaration body cfg env =
             Recursion.base
                 (EvYield tag
                     payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvOk ne ->
-                                evalExpression body cfg ne
+                    (\resumeValue -> continueLetResumeResult (resume resumeValue) body cfg)
+                )
 
-                            EvOkTrace ne _ _ ->
-                                evalExpression body cfg ne
+        EvMemoLookup payload resume ->
+            Recursion.base
+                (EvMemoLookup payload
+                    (nestedLetResumeMaybe resume body cfg)
+                )
 
-                            EvErr e ->
-                                EvErr e
-
-                            EvErrTrace e _ _ ->
-                                EvErr e
-
-                            EvYield t2 p2 r2 ->
-                                -- Nested yield from resume — wrap to continue with body
-                                EvYield t2 p2 (nestedLetResume r2 body cfg)
-                    )
+        EvMemoStore payload next ->
+            Recursion.base
+                (EvMemoStore payload
+                    (continueLetResumeResult next body cfg)
                 )
 
 
@@ -2909,21 +3158,38 @@ one layer, then continues evaluating the body when we finally get an Env.
 nestedLetResume : (Value -> EvalResult Env) -> Node Expression -> Config -> (Value -> EvalResult Value)
 nestedLetResume innerResume body cfg =
     \resumeValue ->
-        case innerResume resumeValue of
-            EvOk ne ->
-                evalExpression body cfg ne
+        continueLetResumeResult (innerResume resumeValue) body cfg
 
-            EvOkTrace ne _ _ ->
-                evalExpression body cfg ne
 
-            EvErr e ->
-                EvErr e
+nestedLetResumeMaybe : (Maybe Value -> EvalResult Env) -> Node Expression -> Config -> (Maybe Value -> EvalResult Value)
+nestedLetResumeMaybe innerResume body cfg =
+    \maybeResumeValue ->
+        continueLetResumeResult (innerResume maybeResumeValue) body cfg
 
-            EvErrTrace e _ _ ->
-                EvErr e
 
-            EvYield t p r ->
-                EvYield t p (nestedLetResume r body cfg)
+continueLetResumeResult : EvalResult Env -> Node Expression -> Config -> EvalResult Value
+continueLetResumeResult envResult body cfg =
+    case envResult of
+        EvOk ne ->
+            evalExpression body cfg ne
+
+        EvOkTrace ne _ _ ->
+            evalExpression body cfg ne
+
+        EvErr e ->
+            EvErr e
+
+        EvErrTrace e _ _ ->
+            EvErr e
+
+        EvYield t p r ->
+            EvYield t p (nestedLetResume r body cfg)
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (nestedLetResumeMaybe resume body cfg)
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (continueLetResumeResult next body cfg)
 
 
 evalLetBlockFull : Expression.LetBlock -> PartialEval Value
@@ -3026,23 +3292,19 @@ evalLetBlockFull letBlock cfg env =
             Recursion.base
                 (EvYield tag
                     payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvOk ne ->
-                                evalExpression letBlock.expression cfg ne
+                    (\resumeValue -> continueLetResumeResult (resume resumeValue) letBlock.expression cfg)
+                )
 
-                            EvOkTrace ne _ _ ->
-                                evalExpression letBlock.expression cfg ne
+        EvMemoLookup payload resume ->
+            Recursion.base
+                (EvMemoLookup payload
+                    (nestedLetResumeMaybe resume letBlock.expression cfg)
+                )
 
-                            EvErr e ->
-                                EvErr e
-
-                            EvErrTrace e _ _ ->
-                                EvErr e
-
-                            EvYield t2 p2 r2 ->
-                                EvYield t2 p2 (nestedLetResume r2 letBlock.expression cfg)
-                    )
+        EvMemoStore payload next ->
+            Recursion.base
+                (EvMemoStore payload
+                    (continueLetResumeResult next letBlock.expression cfg)
                 )
 
 

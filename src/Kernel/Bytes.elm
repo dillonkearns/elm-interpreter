@@ -477,6 +477,12 @@ decode decoderFn bytesVal cfg env =
                 EvYield tag payload resume ->
                     EvYield tag payload resume
 
+                EvMemoLookup payload resume ->
+                    EvMemoLookup payload resume
+
+                EvMemoStore payload next ->
+                    EvMemoStore payload next
+
         EvErr _ ->
             EvalResult.succeed
                 (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
@@ -508,6 +514,12 @@ decode decoderFn bytesVal cfg env =
 
         EvYield tag payload _ ->
             EvYield tag payload (\_ -> EvalResult.succeed (Custom { moduleName = [ "Maybe" ], name = "Nothing" } []))
+
+        EvMemoLookup payload _ ->
+            EvMemoLookup payload (\_ -> EvalResult.succeed (Custom { moduleName = [ "Maybe" ], name = "Nothing" } []))
+
+        EvMemoStore payload _ ->
+            EvMemoStore payload (EvalResult.succeed (Custom { moduleName = [ "Maybe" ], name = "Nothing" } []))
 
 
 {-| Wrapper for `encode` that works with the kernel registration's `oneWithError` pattern.

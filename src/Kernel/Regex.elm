@@ -208,3 +208,9 @@ replaceHelp matches replacerFn original offset acc cfg env =
 
                 EvYield tag payload _ ->
                     EvYield tag payload (\_ -> EvalResult.succeed original)
+
+                EvMemoLookup payload _ ->
+                    EvMemoLookup payload (\_ -> EvalResult.succeed original)
+
+                EvMemoStore payload _ ->
+                    EvMemoStore payload (EvalResult.succeed original)

@@ -58,6 +58,12 @@ toResult er =
             -- Yield not handled at this level — framework driver should handle before toResult
             Err { currentModule = [], callStack = [], error = Types.TypeError "Unhandled EvYield in toResult" }
 
+        EvMemoLookup _ _ ->
+            Err { currentModule = [], callStack = [], error = Types.TypeError "Unhandled EvMemoLookup in toResult" }
+
+        EvMemoStore _ _ ->
+            Err { currentModule = [], callStack = [], error = Types.TypeError "Unhandled EvMemoStore in toResult" }
+
 
 {-| Convert to the legacy triple format. Used at module boundaries
 where the caller expects (Result, Rope, Rope).
@@ -80,6 +86,12 @@ toTriple er =
         EvYield _ _ _ ->
             ( Err { currentModule = [], callStack = [], error = Types.TypeError "Unhandled EvYield" }, Rope.empty, Rope.empty )
 
+        EvMemoLookup _ _ ->
+            ( Err { currentModule = [], callStack = [], error = Types.TypeError "Unhandled EvMemoLookup" }, Rope.empty, Rope.empty )
+
+        EvMemoStore _ _ ->
+            ( Err { currentModule = [], callStack = [], error = Types.TypeError "Unhandled EvMemoStore" }, Rope.empty, Rope.empty )
+
 
 map : (a -> out) -> EvalResult a -> EvalResult out
 map f er =
@@ -99,6 +111,12 @@ map f er =
         EvYield tag payload resume ->
             EvYield tag payload (\v -> map f (resume v))
 
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> map f (resume maybeValue))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (map f next)
+
 
 andThen : (a -> EvalResult b) -> EvalResult a -> EvalResult b
 andThen f er =
@@ -117,6 +135,12 @@ andThen f er =
 
         EvYield tag payload resume ->
             EvYield tag payload (\v -> andThen f (resume v))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> andThen f (resume maybeValue))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (andThen f next)
 
 
 {-| Merge trace data from an outer evaluation into an inner result.
@@ -139,6 +163,12 @@ mergeTraceInto trees logs er =
         EvYield tag payload resume ->
             EvYield tag payload (\v -> mergeTraceInto trees logs (resume v))
 
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> mergeTraceInto trees logs (resume maybeValue))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (mergeTraceInto trees logs next)
+
 
 map2 : (a -> b -> out) -> EvalResult a -> EvalResult b -> EvalResult out
 map2 f a b =
@@ -160,6 +190,12 @@ map2 f a b =
                 EvYield tag payload resume ->
                     EvYield tag payload (\v -> map2 f (EvOk av) (resume v))
 
+                EvMemoLookup payload resume ->
+                    EvMemoLookup payload (\maybeValue -> map2 f (EvOk av) (resume maybeValue))
+
+                EvMemoStore payload next ->
+                    EvMemoStore payload (map2 f (EvOk av) next)
+
         EvErr e ->
             EvErr e
 
@@ -180,6 +216,12 @@ map2 f a b =
                 EvYield tag payload resume ->
                     EvYield tag payload (\v -> map2 f (EvOkTrace av at al) (resume v))
 
+                EvMemoLookup payload resume ->
+                    EvMemoLookup payload (\maybeValue -> map2 f (EvOkTrace av at al) (resume maybeValue))
+
+                EvMemoStore payload next ->
+                    EvMemoStore payload (map2 f (EvOkTrace av at al) next)
+
         EvErrTrace e at al ->
             case b of
                 EvOk _ ->
@@ -197,8 +239,20 @@ map2 f a b =
                 EvYield _ _ _ ->
                     EvErrTrace e at al
 
+                EvMemoLookup _ _ ->
+                    EvErrTrace e at al
+
+                EvMemoStore _ _ ->
+                    EvErrTrace e at al
+
         EvYield tag payload resume ->
             EvYield tag payload (\v -> map2 f (resume v) b)
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> map2 f (resume maybeValue) b)
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (map2 f next b)
 
 
 onValue : (a -> Result EvalErrorData out) -> EvalResult a -> EvalResult out
@@ -224,6 +278,12 @@ onValue f er =
         EvYield tag payload resume ->
             EvYield tag payload (\v -> onValue f (resume v))
 
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> onValue f (resume maybeValue))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (onValue f next)
+
 
 combine : List (EvalResult t) -> EvalResult (List t)
 combine ls =
@@ -246,6 +306,12 @@ combinePlain queue vacc =
 
         (EvYield tag payload resume) :: tail ->
             EvYield tag payload (\v -> combinePlain (resume v :: tail) vacc)
+
+        (EvMemoLookup payload resume) :: tail ->
+            EvMemoLookup payload (\maybeValue -> combinePlain (resume maybeValue :: tail) vacc)
+
+        (EvMemoStore payload next) :: tail ->
+            EvMemoStore payload (combinePlain (next :: tail) vacc)
 
         _ ->
             -- Switch to traced path for remaining items
@@ -274,3 +340,9 @@ combineTraced queue vacc tacc lacc =
 
         (EvYield tag payload resume) :: tail ->
             EvYield tag payload (\v -> combineTraced (resume v :: tail) vacc tacc lacc)
+
+        (EvMemoLookup payload resume) :: tail ->
+            EvMemoLookup payload (\maybeValue -> combineTraced (resume maybeValue :: tail) vacc tacc lacc)
+
+        (EvMemoStore payload next) :: tail ->
+            EvMemoStore payload (combineTraced (next :: tail) vacc tacc lacc)

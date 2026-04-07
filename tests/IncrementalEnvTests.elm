@@ -12,11 +12,13 @@ import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Pattern exposing (QualifiedNameRef)
 import Eval.Expression
 import Eval.Module
-import ValueCodec
 import Expect
-import Test exposing (Test, describe, test)
 import FastDict
+import MemoRuntime
+import Set
+import Test exposing (Test, describe, test)
 import Types exposing (EvalResult(..), Intercept(..), Value(..))
+import ValueCodec
 
 
 suite : Test
@@ -57,6 +59,9 @@ suite =
             , yieldInsideListFoldl
             , yieldInsideManualFold
             , yieldInsideListMap
+            ]
+        , describe "runtime memoization"
+            [ runtimeMemoReusesCacheAcrossInvocations
             ]
         , describe "deepHashValue"
             [ deepHashSameValue
@@ -1136,6 +1141,82 @@ yieldsAcrossAnnotatedImportedZeroArgOperatorChain =
                                             Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
                                 ]
                                 ()
+
+
+runtimeMemoReusesCacheAcrossInvocations : Test
+runtimeMemoReusesCacheAcrossInvocations =
+    test "runtime memo reuses cache across invocations" <|
+        \_ ->
+            let
+                helperSource =
+                    """module ExpensiveHelper exposing (expensive)
+
+expensive : Int -> Int
+expensive n =
+    let
+        doubled =
+            List.map (\\i -> i * 2) (List.range 1 n)
+    in
+    List.foldl (+) 0 doubled
+"""
+
+                memoBenchSource =
+                    """module MemoBench exposing (results)
+
+import ExpensiveHelper
+
+results : Int
+results =
+    ExpensiveHelper.expensive 20
+        + ExpensiveHelper.expensive 20
+        + ExpensiveHelper.expensive 20
+        + ExpensiveHelper.expensive 20
+"""
+            in
+            case Eval.Module.buildProjectEnv [ helperSource ] of
+                Err e ->
+                    Expect.fail ("Build error: " ++ Debug.toString e)
+
+                Ok env ->
+                    case
+                        Eval.Module.evalWithMemoizedFunctions
+                            env
+                            [ memoBenchSource ]
+                            (Set.singleton "ExpensiveHelper.expensive")
+                            MemoRuntime.emptyMemoCache
+                            True
+                            (Expression.FunctionOrValue [] "results")
+                    of
+                        Err e ->
+                            Expect.fail ("Cold memo eval error: " ++ Debug.toString e)
+
+                        Ok coldResult ->
+                            case
+                                Eval.Module.evalWithMemoizedFunctions
+                                    env
+                                    [ memoBenchSource ]
+                                    (Set.singleton "ExpensiveHelper.expensive")
+                                    coldResult.memoCache
+                                    True
+                                    (Expression.FunctionOrValue [] "results")
+                            of
+                                Err e ->
+                                    Expect.fail ("Warm memo eval error: " ++ Debug.toString e)
+
+                                Ok warmResult ->
+                                    Expect.all
+                                        [ \_ -> Expect.equal (Int 1680) coldResult.value
+                                        , \_ -> Expect.equal coldResult.value warmResult.value
+                                        , \_ -> Expect.equal 4 coldResult.memoStats.lookups
+                                        , \_ -> Expect.equal 3 coldResult.memoStats.hits
+                                        , \_ -> Expect.equal 1 coldResult.memoStats.misses
+                                        , \_ -> Expect.equal 1 coldResult.memoStats.stores
+                                        , \_ -> Expect.equal 4 warmResult.memoStats.lookups
+                                        , \_ -> Expect.equal 4 warmResult.memoStats.hits
+                                        , \_ -> Expect.equal 0 warmResult.memoStats.misses
+                                        , \_ -> Expect.equal 0 warmResult.memoStats.stores
+                                        ]
+                                        ()
 
 
 {-| Test: multiple yields from sequential let bindings.

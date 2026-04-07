@@ -1,4 +1,4 @@
-module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), InterceptContext, JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
+module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), InterceptContext, JsonDecoder(..), JsonVal(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, Value(..), evalErrorKindToString)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -7,6 +7,7 @@ import Regex
 import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (Pattern, QualifiedNameRef)
 import FastDict exposing (Dict)
+import MemoSpec
 import Parser exposing (DeadEnd)
 import Recursion exposing (Rec)
 import Rope exposing (Rope)
@@ -33,6 +34,8 @@ type EvalResult out
     | EvOkTrace out (Rope CallTree) (Rope String)
     | EvErrTrace EvalErrorData (Rope CallTree) (Rope String)
     | EvYield String Value (Value -> EvalResult out)
+    | EvMemoLookup MemoLookupPayload (Maybe Value -> EvalResult out)
+    | EvMemoStore MemoStorePayload (EvalResult out)
 
 
 type alias Config =
@@ -41,6 +44,8 @@ type alias Config =
     , tcoTarget : Maybe String
     , callCounts : Maybe CallCounts
     , intercepts : Dict String Intercept
+    , memoizedFunctions : MemoSpec.Registry
+    , collectMemoStats : Bool
     }
 
 
@@ -102,6 +107,27 @@ type Value
     | JsonDecoderValue JsonDecoder
     | RegexValue Regex.Regex
     | BytesValue (Array Int)
+
+
+type alias MemoLookupPayload =
+    { specId : Int
+    , qualifiedName : Maybe String
+    , compactFingerprint : Maybe Int
+    , args : Maybe (List Value)
+    , shallowFingerprint : Maybe Int
+    , deepFingerprint : Maybe Int
+    }
+
+
+type alias MemoStorePayload =
+    { specId : Int
+    , qualifiedName : Maybe String
+    , compactFingerprint : Maybe Int
+    , args : Maybe (List Value)
+    , shallowFingerprint : Maybe Int
+    , deepFingerprint : Maybe Int
+    , value : Value
+    }
 
 
 {-| JSON value representation for Json.Encode.Value / Json.Decode.Value.

@@ -40,6 +40,18 @@ wrapThenWithEval evalFn f er =
                     (resumeThenWithEval evalFn f resume)
                 )
 
+        EvMemoLookup payload resume ->
+            Recursion.base
+                (EvMemoLookup payload
+                    (resumeThenWithEvalMaybe evalFn f resume)
+                )
+
+        EvMemoStore payload next ->
+            Recursion.base
+                (EvMemoStore payload
+                    (continueThenWithEval evalFn f next)
+                )
+
 
 {-| Resolve a Rec using the eval function from Config.
 Since Rec is opaque, we use runRecursion with a step function
@@ -62,7 +74,25 @@ resumeThenWithEval :
     -> (Value -> EvalResult Value)
     -> (Value -> EvalResult Value)
 resumeThenWithEval evalFn f resume resumeValue =
-    case resume resumeValue of
+    continueThenWithEval evalFn f (resume resumeValue)
+
+
+resumeThenWithEvalMaybe :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> (Value -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value))
+    -> (Maybe Value -> EvalResult Value)
+    -> (Maybe Value -> EvalResult Value)
+resumeThenWithEvalMaybe evalFn f resume maybeResumeValue =
+    continueThenWithEval evalFn f (resume maybeResumeValue)
+
+
+continueThenWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> (Value -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value))
+    -> EvalResult Value
+    -> EvalResult Value
+continueThenWithEval evalFn f resumedResult =
+    case resumedResult of
         EvOk v ->
             resolveRecWithStep evalFn (f v)
 
@@ -78,6 +108,12 @@ resumeThenWithEval evalFn f resume resumeValue =
 
         EvYield tag payload nestedResume ->
             EvYield tag payload (resumeThenWithEval evalFn f nestedResume)
+
+        EvMemoLookup payload nestedResume ->
+            EvMemoLookup payload (resumeThenWithEvalMaybe evalFn f nestedResume)
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (continueThenWithEval evalFn f next)
 
 
 combineMap : (a -> Eval b) -> List a -> Eval (List b)
@@ -230,6 +266,12 @@ wrapThen f er =
         EvYield tag payload _ ->
             Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield cannot resume inside recursion scheme" }))
 
+        EvMemoLookup payload _ ->
+            Recursion.base (EvMemoLookup payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvMemoLookup cannot resume inside recursion scheme" }))
+
+        EvMemoStore payload _ ->
+            Recursion.base (EvMemoStore payload (EvErr { currentModule = [], callStack = [], error = Unsupported "EvMemoStore cannot resume inside recursion scheme" }))
+
 
 {-| Merge trace data from an outer evaluation into an inner result.
 -}
@@ -250,6 +292,12 @@ mergeTraceInto trees logs er =
 
         EvYield tag payload resume ->
             EvYield tag payload resume
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload resume
+
+        EvMemoStore payload next ->
+            EvMemoStore payload next
 
 
 recurseMapThen : 
@@ -295,6 +343,12 @@ recurseMapPlain items cfg env vacc f =
 
                         EvYield tag payload resume ->
                             Recursion.base (EvYield tag payload resume)
+
+                        EvMemoLookup payload resume ->
+                            Recursion.base (EvMemoLookup payload resume)
+
+                        EvMemoStore payload next ->
+                            Recursion.base (EvMemoStore payload next)
                 )
 
 
@@ -345,6 +399,12 @@ recurseMapTraced items cfg env vacc tacc lacc f =
 
                         EvYield tag payload resume ->
                             Recursion.base (EvYield tag payload resume)
+
+                        EvMemoLookup payload resume ->
+                            Recursion.base (EvMemoLookup payload resume)
+
+                        EvMemoStore payload next ->
+                            Recursion.base (EvMemoStore payload next)
                 )
 
 

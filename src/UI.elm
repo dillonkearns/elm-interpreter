@@ -21,7 +21,9 @@ import Hex
 import Html
 import Json.Encode
 import List.Extra
+import MemoSpec
 import Rope
+import Set
 import Types exposing (CallTree(..), Error(..), Value)
 import UI.Source as Source
 import UI.Theme as Theme
@@ -741,7 +743,7 @@ update msg model =
 
                 ( result, callTree, logLines ) =
                     Eval.Module.traceOrEvalModule
-                        { trace = tracing, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
+                        { trace = tracing, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                         moduleSource
                         (Expression.FunctionOrValue [] "main")
 

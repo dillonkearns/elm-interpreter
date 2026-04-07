@@ -309,6 +309,12 @@ encodeListHelp func remaining acc cfg env =
                 Types.EvYield tag payload resume ->
                     Types.EvYield tag payload resume
 
+                Types.EvMemoLookup payload resume ->
+                    Types.EvMemoLookup payload resume
+
+                Types.EvMemoStore payload next ->
+                    Types.EvMemoStore payload next
+
 
 {-| Json.Encode.object : List ( String, Value ) -> Value
 Build a JSON object from key-value pairs.
@@ -844,6 +850,12 @@ applyFunction evalFn func arg cfg _ =
                         Err (Types.evalErrorKindToString e.error)
 
                     EvYield _ _ _ ->
+                        Err "Cannot yield inside JSON decoder"
+
+                    EvMemoLookup _ _ ->
+                        Err "Cannot yield inside JSON decoder"
+
+                    EvMemoStore _ _ ->
                         Err "Cannot yield inside JSON decoder"
 
             else
