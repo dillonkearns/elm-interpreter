@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Bitwise
 import Core
@@ -7,7 +7,7 @@ import Elm.Interface exposing (Exposed)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
-import Elm.Syntax.Expression exposing (Expression(..))
+import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation)
 import Elm.Syntax.Import
 import Elm.Syntax.Pattern
 import Elm.Syntax.Range
@@ -125,6 +125,14 @@ type ProjectEnv
         }
 
 
+type alias CachedModuleSummary =
+    { moduleName : ModuleName
+    , interface : List Exposed
+    , importedNames : ImportedNames
+    , functions : List FunctionImplementation
+    }
+
+
 {-| Parse all sources and build an environment from them.
 This is the expensive phase (parse + fold through buildModuleEnv).
 The result can be reused across multiple `evalWithEnv` calls.
@@ -133,6 +141,29 @@ buildProjectEnv : List String -> Result Error ProjectEnv
 buildProjectEnv sources =
     parseProjectSources sources
         |> Result.andThen buildProjectEnvFromParsed
+
+
+buildCachedModuleSummariesFromParsed :
+    List
+        { file : File
+        , moduleName : ModuleName
+        , interface : List Exposed
+        }
+    -> List CachedModuleSummary
+buildCachedModuleSummariesFromParsed parsedModules =
+    let
+        userInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        userInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        allInterfaces =
+            ElmDict.union userInterfaces Core.dependency.interfaces
+    in
+    parsedModules
+        |> List.map (cachedSummaryFromParsedModule allInterfaces)
 
 
 {-| Phase 1: Parse all source strings into files with module names and interfaces.
@@ -181,10 +212,15 @@ buildProjectEnvFromParsed :
         }
     -> Result Error ProjectEnv
 buildProjectEnvFromParsed parsedModules =
+    buildProjectEnvFromSummaries (buildCachedModuleSummariesFromParsed parsedModules)
+
+
+buildProjectEnvFromSummaries : List CachedModuleSummary -> Result Error ProjectEnv
+buildProjectEnvFromSummaries summaries =
     let
         userInterfaces : ElmDict.Dict ModuleName (List Exposed)
         userInterfaces =
-            parsedModules
+            summaries
                 |> List.map (\m -> ( m.moduleName, m.interface ))
                 |> ElmDict.fromList
 
@@ -192,35 +228,52 @@ buildProjectEnvFromParsed parsedModules =
         allInterfaces =
             ElmDict.union userInterfaces Core.dependency.interfaces
 
-        envResult : Result Error Env
-        envResult =
-            parsedModules
-                |> Result.MyExtra.combineFoldl
-                    (\parsedModule envAcc ->
-                        buildModuleEnv allInterfaces parsedModule envAcc
+        sharedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        sharedFunctions =
+            summaries
+                |> List.foldl
+                    (\summary acc ->
+                        Dict.insert
+                            (Environment.moduleKey summary.moduleName)
+                            (summary.functions
+                                |> List.map (\implementation -> ( Node.value implementation.name, implementation ))
+                                |> Dict.fromList
+                            )
+                            acc
                     )
-                    (Ok
-                        { currentModule = []
-                        , currentModuleKey = ""
-                        , callStack = []
-                        , shared = { functions = coreFunctions, moduleImports = Dict.empty }
-                        , currentModuleFunctions = Dict.empty
-                        , letFunctions = Dict.empty
-                        , values = Dict.empty
-                        , imports = emptyImports
-                        , callDepth = 0
-                        , recursionCheck = Nothing
-                        }
+                    coreFunctions
+
+        sharedModuleImports : Dict.Dict String ImportedNames
+        sharedModuleImports =
+            summaries
+                |> List.map
+                    (\summary ->
+                        ( Environment.moduleKey summary.moduleName
+                        , summary.importedNames
+                        )
                     )
+                |> Dict.fromList
+
+        env : Env
+        env =
+            { currentModule = []
+            , currentModuleKey = ""
+            , callStack = []
+            , shared = { functions = sharedFunctions, moduleImports = sharedModuleImports }
+            , currentModuleFunctions = Dict.empty
+            , letFunctions = Dict.empty
+            , values = Dict.empty
+            , imports = emptyImports
+            , callDepth = 0
+            , recursionCheck = Nothing
+            }
     in
-    envResult
-        |> Result.map
-            (\env ->
-                ProjectEnv
-                    { env = env
-                    , allInterfaces = allInterfaces
-                    }
-            )
+    Ok
+        (ProjectEnv
+            { env = env
+            , allInterfaces = allInterfaces
+            }
+        )
 
 
 {-| Replace a single module's declarations in an existing ProjectEnv.
@@ -2045,6 +2098,52 @@ buildModuleEnv allInterfaces { file, moduleName } env =
         |> Result.MyExtra.combineFoldl addDeclaration (Ok envWithModuleImports)
 
 
+cachedSummaryFromParsedModule :
+    ElmDict.Dict ModuleName (List Exposed)
+    ->
+        { file : File
+        , moduleName : ModuleName
+        , interface : List Exposed
+        }
+    -> CachedModuleSummary
+cachedSummaryFromParsedModule allInterfaces { file, moduleName, interface } =
+    { moduleName = moduleName
+    , interface = interface
+    , importedNames =
+        (defaultImports ++ file.imports)
+            |> List.foldl (processImport allInterfaces) emptyImports
+    , functions = moduleFunctionImplementations moduleName file
+    }
+
+
+moduleFunctionImplementations : ModuleName -> File -> List FunctionImplementation
+moduleFunctionImplementations moduleName file =
+    file.declarations
+        |> List.concatMap
+            (\(Node _ decl) ->
+                case decl of
+                    FunctionDeclaration function ->
+                        [ Node.value function.declaration ]
+
+                    AliasDeclaration alias_ ->
+                        recordAliasConstructorImplementation alias_
+                            |> Maybe.map List.singleton
+                            |> Maybe.withDefault []
+
+                    CustomTypeDeclaration customType ->
+                        constructorImplementations moduleName customType
+
+                    PortDeclaration _ ->
+                        []
+
+                    InfixDeclaration _ ->
+                        []
+
+                    Destructuring _ _ ->
+                        []
+            )
+
+
 {-| If a type alias has a record type annotation, register its name as a
 function that constructs a Record value from positional arguments.
 
@@ -2056,6 +2155,16 @@ registers `Point` as a 2-argument function whose body is
 -}
 registerRecordAliasConstructor : ModuleName -> TypeAlias -> Env -> Env
 registerRecordAliasConstructor moduleName alias_ env =
+    case recordAliasConstructorImplementation alias_ of
+        Just implementation ->
+            Environment.addFunction moduleName implementation env
+
+        Nothing ->
+            env
+
+
+recordAliasConstructorImplementation : TypeAlias -> Maybe Elm.Syntax.Expression.FunctionImplementation
+recordAliasConstructorImplementation alias_ =
     case Node.value alias_.typeAnnotation of
         Record fields ->
             let
@@ -2070,30 +2179,27 @@ registerRecordAliasConstructor moduleName alias_ env =
                 argNames : List String
                 argNames =
                     List.indexedMap (\i _ -> "$alias_arg" ++ String.fromInt i) fieldNames
-
-                implementation : Elm.Syntax.Expression.FunctionImplementation
-                implementation =
-                    { name = fakeNode aliasName
-                    , arguments =
-                        argNames
-                            |> List.map (\n -> fakeNode (Elm.Syntax.Pattern.VarPattern n))
-                    , expression =
-                        fakeNode
-                            (RecordExpr
-                                (List.map2
-                                    (\fieldName argName ->
-                                        fakeNode ( fakeNode fieldName, fakeNode (FunctionOrValue [] argName) )
-                                    )
-                                    fieldNames
-                                    argNames
-                                )
-                            )
-                    }
             in
-            Environment.addFunction moduleName implementation env
+            Just
+                { name = fakeNode aliasName
+                , arguments =
+                    argNames
+                        |> List.map (\n -> fakeNode (Elm.Syntax.Pattern.VarPattern n))
+                , expression =
+                    fakeNode
+                        (RecordExpr
+                            (List.map2
+                                (\fieldName argName ->
+                                    fakeNode ( fakeNode fieldName, fakeNode (FunctionOrValue [] argName) )
+                                )
+                                fieldNames
+                                argNames
+                            )
+                        )
+                }
 
         _ ->
-            env
+            Nothing
 
 
 {-| Register constructors from a custom type declaration as functions in env.
@@ -2105,51 +2211,51 @@ registerConstructors :
     -> Env
     -> Env
 registerConstructors moduleName customType env =
-    let
-        addConstructor : Node Elm.Syntax.Type.ValueConstructor -> Env -> Env
-        addConstructor (Node _ ctor) envAcc =
-            let
-                ctorName : String
-                ctorName =
-                    Node.value ctor.name
+    constructorImplementations moduleName customType
+        |> List.foldl (Environment.addFunction moduleName) env
 
-                arity : Int
-                arity =
-                    List.length ctor.arguments
 
-                -- Generate argument pattern names: $ctor_arg0, $ctor_arg1, ...
-                argNames : List String
-                argNames =
-                    List.range 0 (arity - 1)
-                        |> List.map (\i -> "$ctor_arg" ++ String.fromInt i)
+constructorImplementations :
+    ModuleName
+    -> Elm.Syntax.Type.Type
+    -> List Elm.Syntax.Expression.FunctionImplementation
+constructorImplementations moduleName customType =
+    customType.constructors
+        |> List.map
+            (\(Node _ ctor) ->
+                let
+                    ctorName : String
+                    ctorName =
+                        Node.value ctor.name
 
-                -- Build the function implementation
-                implementation : Elm.Syntax.Expression.FunctionImplementation
-                implementation =
-                    { name = fakeNode ctorName
-                    , arguments =
-                        argNames
-                            |> List.map (\n -> fakeNode (Elm.Syntax.Pattern.VarPattern n))
-                    , expression =
-                        if arity == 0 then
-                            -- Zero-arg constructor: just the constructor itself
-                            fakeNode (FunctionOrValue moduleName ctorName)
+                    arity : Int
+                    arity =
+                        List.length ctor.arguments
 
-                        else
-                            -- N-arg constructor: application of constructor to args
-                            fakeNode
-                                (Application
-                                    (fakeNode (FunctionOrValue moduleName ctorName)
-                                        :: List.map
-                                            (\n -> fakeNode (FunctionOrValue [] n))
-                                            argNames
-                                    )
+                    argNames : List String
+                    argNames =
+                        List.range 0 (arity - 1)
+                            |> List.map (\i -> "$ctor_arg" ++ String.fromInt i)
+                in
+                { name = fakeNode ctorName
+                , arguments =
+                    argNames
+                        |> List.map (\n -> fakeNode (Elm.Syntax.Pattern.VarPattern n))
+                , expression =
+                    if arity == 0 then
+                        fakeNode (FunctionOrValue moduleName ctorName)
+
+                    else
+                        fakeNode
+                            (Application
+                                (fakeNode (FunctionOrValue moduleName ctorName)
+                                    :: List.map
+                                        (\n -> fakeNode (FunctionOrValue [] n))
+                                        argNames
                                 )
-                    }
-            in
-            Environment.addFunction moduleName implementation envAcc
-    in
-    List.foldl addConstructor env customType.constructors
+                            )
+                }
+            )
 
 
 {-| Build an interface from a parsed File by examining its declarations and exposing list.
