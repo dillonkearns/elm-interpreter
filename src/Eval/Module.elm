@@ -1,4 +1,4 @@
-module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Bitwise
 import Core
@@ -718,6 +718,115 @@ evalWithEnvFromFilesAndValues (ProjectEnv projectEnv) additionalFiles injectedVa
             Result.mapError Types.EvalError result
 
 
+evalWithEnvFromFilesAndValuesAndMemo :
+    ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Set String
+    -> MemoRuntime.MemoCache
+    -> Bool
+    -> Expression
+    ->
+        Result Error
+            { value : Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+evalWithEnvFromFilesAndValuesAndMemo (ProjectEnv projectEnv) additionalFiles injectedValues memoizedFunctions memoCache collectMemoStats expression =
+    let
+        parsedModules =
+            additionalFiles
+                |> List.map
+                    (\file ->
+                        { file = file
+                        , moduleName = fileModuleName file
+                        , interface = buildInterfaceFromFile file
+                        }
+                    )
+
+        additionalInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces =
+            ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+        envResult =
+            parsedModules
+                |> Result.MyExtra.combineFoldl
+                    (\parsedModule envAcc ->
+                        buildModuleEnv allInterfaces parsedModule envAcc
+                    )
+                    (Ok projectEnv.env)
+    in
+    case envResult of
+        Err e ->
+            Err e
+
+        Ok env ->
+            let
+                lastModule =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .moduleName
+                        |> Maybe.withDefault [ "Main" ]
+
+                lastFile =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .file
+
+                finalImports =
+                    case lastFile of
+                        Just file ->
+                            (defaultImports ++ file.imports)
+                                |> List.foldl (processImport allInterfaces) emptyImports
+
+                        Nothing ->
+                            emptyImports
+
+                lastModuleKey =
+                    Environment.moduleKey lastModule
+
+                finalEnv =
+                    { env
+                        | currentModule = lastModule
+                        , currentModuleKey = lastModuleKey
+                        , currentModuleFunctions =
+                            Dict.get lastModuleKey env.shared.functions
+                                |> Maybe.withDefault Dict.empty
+                        , imports = finalImports
+                        , values =
+                            Dict.foldl
+                                (\name value acc -> Dict.insert name value acc)
+                                env.values
+                                injectedValues
+                    }
+            in
+            Eval.Expression.evalExpression
+                (fakeNode expression)
+                { trace = False
+                , maxSteps = Nothing
+                , tcoTarget = Nothing
+                , callCounts = Nothing
+                , intercepts = Dict.empty
+                , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+                , collectMemoStats = collectMemoStats
+                }
+                finalEnv
+                |> driveInternalMemo
+                    memoCache
+                    (if collectMemoStats then
+                        MemoRuntime.emptyMemoStats
+
+                     else
+                        MemoRuntime.disabledMemoStats
+                    )
+
+
 {-| Like `evalWithIntercepts`, but drives interpreter-local memoization
 internally and returns the updated cache for warm reuse in later runs.
 -}
@@ -749,6 +858,38 @@ evalWithMemoizedFunctions projectEnv additionalSources memoizedFunctions memoCac
         |> Result.andThen
             (\files ->
                 evalWithEnvFromFilesAndMemo projectEnv files memoizedFunctions memoCache collectMemoStats expression
+            )
+
+
+evalWithValuesAndMemoizedFunctions :
+    ProjectEnv
+    -> List String
+    -> Dict.Dict String Value
+    -> Set String
+    -> MemoRuntime.MemoCache
+    -> Bool
+    -> Expression
+    ->
+        Result Error
+            { value : Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+evalWithValuesAndMemoizedFunctions projectEnv additionalSources injectedValues memoizedFunctions memoCache collectMemoStats expression =
+    let
+        parseResult =
+            additionalSources
+                |> List.map
+                    (\source ->
+                        Elm.Parser.parseToFile source
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineResults
+    in
+    parseResult
+        |> Result.andThen
+            (\files ->
+                evalWithEnvFromFilesAndValuesAndMemo projectEnv files injectedValues memoizedFunctions memoCache collectMemoStats expression
             )
 
 
