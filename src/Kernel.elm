@@ -17,6 +17,7 @@ import Core.Elm.Kernel.Parser
 import Core.Regex
 import Core.Dict
 import Core.List
+import Core.Set
 import Core.String
 import Elm.Syntax.Expression as Expression exposing (Expression(..), FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -34,6 +35,7 @@ import Kernel.Json
 import Kernel.List
 import Kernel.Parser
 import Kernel.Regex
+import Kernel.Set
 import Kernel.String
 import Kernel.Utils
 import Maybe.Extra
@@ -139,6 +141,22 @@ functions evalFunction =
         , ( "union", twoWithError anything anything to anything Kernel.Dict.union Core.Dict.union )
         , ( "fromList", oneWithError anything to anything Kernel.Dict.fromList Core.Dict.fromList )
         , ( "toList", oneWithError anything to anything Kernel.Dict.toList Core.Dict.toList )
+        ]
+      )
+
+    -- Native Set.* fast paths. Same idea as Dict: unwrap the
+    -- Set_elm_builtin wrapper and delegate to the host-native Dict
+    -- kernel, avoiding the interpreted pattern-match step chain.
+    , ( [ "Set" ]
+      , [ ( "empty", constant anything Kernel.Set.emptyValue )
+        , ( "isEmpty", oneWithError anything to anything Kernel.Set.isEmpty Core.Set.isEmpty )
+        , ( "size", oneWithError anything to anything Kernel.Set.size Core.Set.size )
+        , ( "member", twoWithError anything anything to anything Kernel.Set.member Core.Set.member )
+        , ( "insert", twoWithError anything anything to anything Kernel.Set.insert Core.Set.insert )
+        , ( "remove", twoWithError anything anything to anything Kernel.Set.remove Core.Set.remove )
+        , ( "union", twoWithError anything anything to anything Kernel.Set.union Core.Set.union )
+        , ( "fromList", oneWithError anything to anything Kernel.Set.fromList Core.Set.fromList )
+        , ( "toList", oneWithError anything to anything Kernel.Set.toList Core.Set.toList )
         ]
       )
 
