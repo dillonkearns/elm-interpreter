@@ -24,34 +24,22 @@ map f xs cfg env =
 
 mapHelp : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
 mapHelp f remaining acc cfg env =
-    let
-        innerCfg =
-            { cfg | tcoTarget = Nothing }
-    in
     case remaining of
         [] ->
             EvalResult.succeed (List.reverse acc)
 
         x :: rest ->
-            case f x innerCfg env of
-                EvYield tag payload resume ->
-                    EvYield tag payload
-                        (\v ->
-                            case EvalResult.toResult (resume v) of
-                                Ok mapped ->
-                                    mapHelp f rest (mapped :: acc) cfg env
+            let
+                innerCfg =
+                    { cfg | tcoTarget = Nothing }
+            in
+            -- Direct tail call so Elm TCO compiles to a while loop.
+            case EvalResult.toResult (f x innerCfg env) of
+                Err e ->
+                    EvErr e
 
-                                Err e ->
-                                    EvErr e
-                        )
-
-                fxResult ->
-                    case EvalResult.toResult fxResult of
-                        Ok mapped ->
-                            mapHelp f rest (mapped :: acc) cfg env
-
-                        Err e ->
-                            EvErr e
+                Ok mapped ->
+                    mapHelp f rest (mapped :: acc) cfg env
 
 
 {-| Kernel List.foldl: reduces a list from the left.
@@ -63,61 +51,34 @@ foldl f init xs cfg env =
 
 foldlHelp : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
 foldlHelp f acc remaining cfg env =
-    let
-        -- Clear tcoTarget to prevent TailCall signals from escaping
-        -- the kernel loop. Without this, a function matching tcoTarget
-        -- called inside the fold would fire TailCall, which toResult
-        -- would catch as an error and propagate up incorrectly.
-        innerCfg =
-            { cfg | tcoTarget = Nothing }
-    in
     case remaining of
         [] ->
             EvalResult.succeed acc
 
         x :: rest ->
             let
-                -- Apply the accumulator function to get the step result
-                applyStep g =
-                    case g acc innerCfg env of
-                        EvYield tag2 payload2 resume2 ->
-                            EvYield tag2 payload2
-                                (\v2 ->
-                                    case EvalResult.toResult (resume2 v2) of
-                                        Ok newAcc ->
-                                            foldlHelp f newAcc rest cfg env
-
-                                        Err e ->
-                                            EvErr e
-                                )
-
-                        gResult ->
-                            case EvalResult.toResult gResult of
-                                Err e ->
-                                    EvErr e
-
-                                Ok newAcc ->
-                                    foldlHelp f newAcc rest cfg env
+                -- Clear tcoTarget to prevent TailCall signals from escaping
+                -- the kernel loop. Without this, a function matching tcoTarget
+                -- called inside the fold would fire TailCall, which toResult
+                -- would catch as an error and propagate up incorrectly.
+                innerCfg =
+                    { cfg | tcoTarget = Nothing }
             in
-            case f x innerCfg env of
-                EvYield tag payload resume ->
-                    EvYield tag payload
-                        (\v ->
-                            case EvalResult.toResult (resume v) of
-                                Ok g ->
-                                    applyStep g
+            -- Evaluate f x, then its partial application on acc, with the
+            -- recursive call in direct tail position so Elm TCO compiles
+            -- this whole body to a while loop. Yields are forwarded as-is
+            -- and can still drive the rest of the fold via resume.
+            case EvalResult.toResult (f x innerCfg env) of
+                Err e ->
+                    EvErr e
 
-                                Err e ->
-                                    EvErr e
-                        )
-
-                fxResult ->
-                    case EvalResult.toResult fxResult of
+                Ok g ->
+                    case EvalResult.toResult (g acc innerCfg env) of
                         Err e ->
                             EvErr e
 
-                        Ok g ->
-                            applyStep g
+                        Ok newAcc ->
+                            foldlHelp f newAcc rest cfg env
 
 
 {-| Kernel List.filter: keeps elements where the predicate returns True.

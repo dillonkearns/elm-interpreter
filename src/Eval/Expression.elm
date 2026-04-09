@@ -60,7 +60,7 @@ fingerprintValue value =
             7
 
         List items ->
-            List.length items * 53 + 8
+            shallowListBucket items * 53 + 8
 
         Tuple a _ ->
             fingerprintValue a * 59 + 9
@@ -68,8 +68,13 @@ fingerprintValue value =
         Triple a _ _ ->
             fingerprintValue a * 61 + 10
 
-        Custom ref args ->
-            List.length args * 67 + 11
+        Custom _ args ->
+            -- List.length on args allocates an F2 wrapper and runs a fold
+            -- every single call, which is burned hard by the TCO cycle
+            -- check walking env.values. The constructor arity alone isn't
+            -- a useful growth signal anyway, so bucket it the same way
+            -- as `sizeOfValue`.
+            shallowListBucket args * 67 + 11
 
         Record dict ->
             -- Include fingerprints of values, not just size, so records with
@@ -95,7 +100,7 @@ fingerprintValue value =
                         Nothing ->
                             0
             in
-            arity * 83 + List.length args * 89 + nameHash + Dict.size closureEnv.values * 97 + 14
+            arity * 83 + shallowListBucket args * 89 + nameHash + Dict.size closureEnv.values * 97 + 14
 
         _ ->
             0
@@ -110,14 +115,26 @@ sizeOfArgs args =
     List.foldl (\v acc -> acc + sizeOfValue v) 0 args
 
 
+{-| Cheap size proxy used only by the TCO cycle check. The old version
+called `List.length` on the `Custom`/`List` args lists — for `Custom`
+that's always the fixed constructor arity so it provided no growth
+signal at all, and for `List` it was O(n) in the accumulator size.
+
+We only need a crude "empty / small / big" bucket for cycle growth
+detection. Pattern-match the first few cons cells to bucket lists
+and treat `Custom` as a constant since its arity can't grow.
+-}
 sizeOfValue : Value -> Int
 sizeOfValue value =
     case value of
         List items ->
-            List.length items
+            shallowListBucket items
 
-        String s ->
-            String.length s
+        String _ ->
+            -- String.length is O(n) in Elm; the cycle check only needs
+            -- to know the value is "there", and fingerprintValue already
+            -- factors string length into its hash, so a constant is fine.
+            1
 
         Tuple _ _ ->
             2
@@ -125,17 +142,41 @@ sizeOfValue value =
         Triple _ _ _ ->
             3
 
-        Custom _ args ->
-            List.length args
+        Custom _ _ ->
+            -- Constructor arity is fixed, so this was useless for
+            -- growth detection and the old List.length call was pure
+            -- overhead (per-iteration inside the TCO loop, even after
+            -- the sampled check landed). Constant `1` is enough: the
+            -- fingerprint already distinguishes different Custom shapes.
+            1
 
-        Record dict ->
-            Dict.size dict
+        Record _ ->
+            1
 
-        JsArray arr ->
-            Array.length arr
+        JsArray _ ->
+            1
 
         _ ->
             1
+
+
+shallowListBucket : List a -> Int
+shallowListBucket items =
+    case items of
+        [] ->
+            0
+
+        _ :: [] ->
+            1
+
+        _ :: _ :: [] ->
+            2
+
+        _ :: _ :: _ :: [] ->
+            3
+
+        _ ->
+            4
 
 
 {-| Deep hash of a Value — traverses the full structure for content-based
@@ -2193,7 +2234,25 @@ This is tail-recursive in Elm, compiled to a while loop by the host compiler.
 -}
 tcoLoop : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
 tcoLoop funcName body remaining cfg env =
-    tcoLoopHelp funcName body remaining 0 0 0 0 cfg env
+    -- Build the per-iteration innerCfg ONCE, outside the loop. The loop
+    -- body only differs from cfg in `maxSteps = Nothing` (the TCO loop
+    -- manages its own step budget via `remaining`), and that difference
+    -- is constant across iterations. Previously this record was rebuilt
+    -- on every single iteration, allocating a fresh 7-field Config
+    -- record per interpreted step inside a tail-recursive function.
+    let
+        innerCfg : Config
+        innerCfg =
+            { trace = cfg.trace
+            , maxSteps = Nothing
+            , tcoTarget = cfg.tcoTarget
+            , callCounts = cfg.callCounts
+            , intercepts = cfg.intercepts
+            , memoizedFunctions = cfg.memoizedFunctions
+            , collectMemoStats = cfg.collectMemoStats
+            }
+    in
+    tcoLoopHelp funcName body remaining 0 0 0 0 innerCfg cfg env
 
 
 {-| Only run the expensive cycle-detection fingerprinting once per
@@ -2207,8 +2266,8 @@ tcoCycleCheckInterval =
     16
 
 
-tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value
-tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env =
+tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value
+tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env =
     if remaining <= 0 then
         EvErr
             { currentModule = env.currentModule
@@ -2218,9 +2277,6 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
 
     else
         let
-            innerCfg =
-                { trace = cfg.trace, maxSteps = Nothing, tcoTarget = cfg.tcoTarget, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }
-
             result =
                 evalExpression body innerCfg env
         in
@@ -2228,18 +2284,18 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
             EvYield tag payload resume ->
                 EvYield tag payload
                     (\resumeValue ->
-                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env (resume resumeValue)
+                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
                     )
 
             EvMemoLookup payload resume ->
                 EvMemoLookup payload
                     (\maybeValue ->
-                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env (resume maybeValue)
+                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
                     )
 
             EvMemoStore payload next ->
                 EvMemoStore payload
-                    (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env next)
+                    (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env next)
 
             _ ->
                 case tcoExtractTailCall result of
@@ -2255,6 +2311,7 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
                                 lastSize
                                 growCount
                                 lastFingerprint
+                                innerCfg
                                 cfg
                                 (Environment.replaceValues newValues env)
 
@@ -2339,6 +2396,7 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
                                     newSize
                                     newGrowCount
                                     newFingerprint
+                                    innerCfg
                                     cfg
                                     (Environment.replaceValues newValues env)
 
@@ -2347,24 +2405,24 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
                         result
 
 
-tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value -> EvalResult Value
-tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env result =
+tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value -> EvalResult Value
+tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env result =
     case result of
         EvYield tag payload resume ->
             EvYield tag payload
                 (\resumeValue ->
-                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env (resume resumeValue)
+                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
                 )
 
         EvMemoLookup payload resume ->
             EvMemoLookup payload
                 (\maybeValue ->
-                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env (resume maybeValue)
+                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
                 )
 
         EvMemoStore payload next ->
             EvMemoStore payload
-                (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env next)
+                (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env next)
 
         _ ->
             case tcoExtractTailCall result of
@@ -2379,6 +2437,7 @@ tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount 
                         lastSize
                         growCount
                         lastFingerprint
+                        innerCfg
                         cfg
                         (Environment.replaceValues newValues env)
 
@@ -2486,10 +2545,52 @@ evalFunctionOrValue moduleName name cfg env =
                             Types.succeedPartial value
 
                         Nothing ->
-                            evalQualifiedOrVariant [] name cfg env
+                            -- letFunctions and values already missed; skip the
+                            -- redundant letFunctions check inside
+                            -- evalQualifiedOrVariant and go directly to the
+                            -- currentModuleFunctions path.
+                            evalUnqualifiedAfterLocalMiss name cfg env
 
         _ ->
             evalQualifiedOrVariant moduleName name cfg env
+
+
+{-| Continuation of `evalFunctionOrValue` for the unqualified case after
+`env.letFunctions` and `env.values` have both been checked and missed.
+Skips the redundant `letFunctions` lookup that the old path did via
+`evalQualifiedOrVariant`.
+-}
+evalUnqualifiedAfterLocalMiss : String -> PartialEval Value
+evalUnqualifiedAfterLocalMiss name cfg env =
+    case Dict.get name env.currentModuleFunctions of
+        Just function ->
+            let
+                qualifiedNameRef : QualifiedNameRef
+                qualifiedNameRef =
+                    { moduleName = env.currentModule, name = name }
+
+                callFn =
+                    if cfg.trace then
+                        Environment.call
+
+                    else
+                        Environment.callNoStack
+            in
+            if List.isEmpty function.arguments then
+                call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+
+            else
+                PartiallyApplied
+                    (callFn env.currentModule name env)
+                    []
+                    function.arguments
+                    (Just qualifiedNameRef)
+                    (AstImpl function.expression)
+                    (List.length function.arguments)
+                    |> Types.succeedPartial
+
+        Nothing ->
+            evalQualifiedOrVariantSlow [] name cfg env
 
 
 evalQualifiedOrVariant : ModuleName -> String -> PartialEval Value
@@ -2971,6 +3072,10 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
 {-| Check for native-kernel overrides registered against user-level modules
 like `Dict`, `Set`, etc. Returns `Nothing` if the module/name doesn't have a
 kernel override, so the caller can fall through to the normal AST lookup.
+
+Builds the result inline from the `(argCount, f)` tuple it already found,
+avoiding a second round of FastDict.get that `evalKernelFunctionWithKey`
+would otherwise perform.
 -}
 userModuleKernelFastPath : ModuleName -> String -> Config -> Env -> Maybe (PartialResult Value)
 userModuleKernelFastPath moduleName name cfg env =
@@ -2992,8 +3097,58 @@ userModuleKernelFastPath moduleName name cfg env =
                     Nothing ->
                         Nothing
 
-                    Just _ ->
-                        Just (evalKernelFunctionWithKey moduleNameKey moduleName name cfg env)
+                    Just ( argCount, f ) ->
+                        Just (runKernelTuple moduleName name argCount f cfg env)
+
+
+{-| Run a resolved kernel function tuple directly, without doing a second
+kernelFunctions lookup. Shared between `userModuleKernelFastPath` and
+`evalKernelFunctionWithKey` for the hot `argCount > 0` wrap-as-PartiallyApplied
+case.
+-}
+runKernelTuple : ModuleName -> String -> Int -> (List Value -> Eval Value) -> Config -> Env -> PartialResult Value
+runKernelTuple moduleName name argCount f cfg env =
+    if argCount == 0 then
+        if cfg.trace then
+            let
+                kernelEvalResult : EvalResult Value
+                kernelEvalResult =
+                    f [] cfg (Environment.callKernel moduleName name env)
+
+                ( result, callTrees, logLines ) =
+                    EvalResult.toTriple kernelEvalResult
+
+                callTreeRope : Rope CallTree
+                callTreeRope =
+                    Rope.singleton
+                        (CallNode
+                            { env = env
+                            , expression = fakeNode <| FunctionOrValue moduleName name
+                            , result = result
+                            , children = callTrees
+                            }
+                        )
+            in
+            Recursion.base
+                (case result of
+                    Ok v ->
+                        EvOkTrace v callTreeRope logLines
+
+                    Err e ->
+                        EvErrTrace e callTreeRope logLines
+                )
+
+        else
+            Recursion.base (f [] cfg env)
+
+    else
+        PartiallyApplied (Environment.empty moduleName)
+            []
+            (List.repeat argCount (fakeNode AllPattern))
+            (Just { moduleName = moduleName, name = name })
+            (KernelImpl moduleName name f)
+            argCount
+            |> Types.succeedPartial
 
 
 evalKernelFunction : ModuleName -> String -> PartialEval Value

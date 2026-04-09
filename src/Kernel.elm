@@ -201,6 +201,22 @@ functions evalFunction =
         ]
       )
 
+    -- Native List.* thin-wrapper short circuits. Only the first-order
+    -- (no interpreted callback) entries are registered here: the
+    -- higher-order helpers (`foldl`, `map`, `filter`, ...) also have
+    -- their kernel implementations, but routing user-level calls
+    -- through them via this fast path breaks `elm-review`'s
+    -- `Review.Rule` visitor machinery (either silently returns no
+    -- errors or trips a stack overflow depending on the exact mix).
+    -- The root cause hasn't been tracked down yet, so for now we only
+    -- short-circuit the safe first-order entries; `range` / `append`
+    -- still give a real improvement on list-building workloads.
+    , ( [ "List" ]
+      , [ ( "range", two int int to anyList Kernel.List.range Core.List.range )
+        , ( "append", two anyList anyList to anyList Kernel.List.append Core.List.append )
+        ]
+      )
+
     -- Elm.Kernel.String
     , ( [ "Elm", "Kernel", "String" ]
       , [ ( "length", one string to int String.length Core.String.length )
