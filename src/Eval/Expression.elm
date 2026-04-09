@@ -1522,8 +1522,8 @@ kernelAppend args cfg env =
 evalApplication : Node Expression -> List (Node Expression) -> PartialEval Value
 evalApplication first rest cfg env =
     let
-        inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialResult Value
-        inner localEnv oldArgs patterns maybeQualifiedName implementation =
+        inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> Int -> PartialResult Value
+        inner localEnv oldArgs patterns maybeQualifiedName implementation patternsLength =
             case ( oldArgs, rest ) of
                 ( [], [ singleArg ] ) ->
                     -- Fast path: single argument, no oldArgs, exactly 1 new arg
@@ -1545,7 +1545,7 @@ evalApplication first rest cfg env =
 
                         [] ->
                             -- 0 patterns with 1 arg: need general path (splitting)
-                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
+                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
                 ( [], [ arg1, arg2 ] ) ->
                     -- Fast path: two arguments, no oldArgs
@@ -1572,10 +1572,10 @@ evalApplication first rest cfg env =
 
                         _ ->
                             -- 0 or 1 pattern with 2 args: need general path (splitting)
-                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
+                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
                 _ ->
-                    evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
+                    evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
     in
     evalOrRecurse ( first, cfg, env )
         (\firstValue ->
@@ -1584,8 +1584,8 @@ evalApplication first rest cfg env =
                     Types.recurseMapThenWithEval evalExpression ( rest, cfg, env )
                         (\values -> Types.succeedPartial <| Custom name (customArgs ++ values))
 
-                PartiallyApplied localEnv oldArgs patterns maybeQualifiedName implementation _ ->
-                    inner localEnv oldArgs patterns maybeQualifiedName implementation
+                PartiallyApplied localEnv oldArgs patterns maybeQualifiedName implementation patternsLength ->
+                    inner localEnv oldArgs patterns maybeQualifiedName implementation patternsLength
 
                 other ->
                     Types.failPartial <|
@@ -1596,9 +1596,13 @@ evalApplication first rest cfg env =
         )
 
 
-evalApplicationGeneralCompute : Node Expression -> List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
-evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env =
-    evalApplicationGeneral first rest oldArgs (List.length oldArgs) (List.length patterns) localEnv patterns maybeQualifiedName implementation cfg env
+evalApplicationGeneralCompute : Node Expression -> List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> Int -> PartialEval Value
+evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env =
+    -- patternsLength comes from the cached arity on PartiallyApplied.
+    -- oldArgs length is still recomputed here because it grows through
+    -- curried application; it's usually a short list and only matters on
+    -- the general (slow) path.
+    evalApplicationGeneral first rest oldArgs (List.length oldArgs) patternsLength localEnv patterns maybeQualifiedName implementation cfg env
 
 
 evalApplicationGeneral : Node Expression -> List (Node Expression) -> List Value -> Int -> Int -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
@@ -2189,11 +2193,22 @@ This is tail-recursive in Elm, compiled to a while loop by the host compiler.
 -}
 tcoLoop : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
 tcoLoop funcName body remaining cfg env =
-    tcoLoopHelp funcName body remaining 0 0 (fingerprintValues env.values) cfg env
+    tcoLoopHelp funcName body remaining 0 0 0 0 cfg env
 
 
-tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value
-tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
+{-| Only run the expensive cycle-detection fingerprinting once per
+`tcoCycleCheckInterval` iterations. Infinite recursion will still be
+caught, just `interval` steps later than it would otherwise — a tradeoff
+that's well worth it when the loop body does lots of interpreted work
+per iteration (e.g. List.foldl building up a Dict/Set).
+-}
+tcoCycleCheckInterval : Int
+tcoCycleCheckInterval =
+    16
+
+
+tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value
+tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env =
     if remaining <= 0 then
         EvErr
             { currentModule = env.currentModule
@@ -2213,192 +2228,159 @@ tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
             EvYield tag payload resume ->
                 EvYield tag payload
                     (\resumeValue ->
-                        tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume resumeValue)
+                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env (resume resumeValue)
                     )
 
             EvMemoLookup payload resume ->
                 EvMemoLookup payload
                     (\maybeValue ->
-                        tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume maybeValue)
+                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env (resume maybeValue)
                     )
 
             EvMemoStore payload next ->
                 EvMemoStore payload
-                    (tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env next)
+                    (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env next)
 
             _ ->
                 case tcoExtractTailCall result of
                     Just newValues ->
-                        -- Got a TailCall signal
-                        let
-                            newSize =
-                                valuesSize newValues
-
-                            newFingerprint =
-                                fingerprintValues newValues
-
-                            -- Category A: check if fingerprint is identical (NOT using ==
-                            -- on the values dict, which is unreliable for PartiallyApplied).
-                            identicalFingerprint =
-                                newFingerprint == lastFingerprint && newSize == lastSize
-
-                            -- "Bounded progress": at least one value has constant size
-                            -- but changing fingerprint.
-                            boundedProgress =
-                                hasBoundedProgressInValues env.values newValues
-
-                            newGrowCount =
-                                if boundedProgress then
-                                    0
-
-                                else if newSize > lastSize && lastSize > 0 then
-                                    growCount + 1
-
-                                else if identicalFingerprint then
-                                    -- Fingerprint didn't change — count toward Category A
-                                    growCount + 1
-
-                                else
-                                    0
-
-                            -- Use same threshold as checkAndUpdateCycle: 500 for closures
-                            hasClosures =
-                                Dict.foldl
-                                    (\_ v found ->
-                                        found
-                                            || (case v of
-                                                    PartiallyApplied _ _ _ _ _ _ ->
-                                                        True
-
-                                                    _ ->
-                                                        False
-                                               )
-                                    )
-                                    False
-                                    newValues
-
-                            threshold =
-                                if hasClosures then
-                                    500
-
-                                else
-                                    50
-                        in
-                        if newGrowCount >= threshold then
-                            EvErr
-                                { currentModule = env.currentModule
-                                , callStack = env.callStack
-                                , error =
-                                    TypeError
-                                        ("Infinite recursion detected: "
-                                            ++ funcName
-                                            ++ (if identicalFingerprint then
-                                                    " called with identical arguments"
-
-                                                else
-                                                    " arguments growing without bound"
-                                               )
-                                        )
-                                }
+                        -- Got a TailCall signal. Cheap per-iteration bookkeeping:
+                        -- increment iterationsSinceCheck. Only run full fingerprinting
+                        -- every tcoCycleCheckInterval iterations.
+                        if iterationsSinceCheck + 1 < tcoCycleCheckInterval then
+                            tcoLoopHelp funcName
+                                body
+                                (remaining - 1)
+                                (iterationsSinceCheck + 1)
+                                lastSize
+                                growCount
+                                lastFingerprint
+                                cfg
+                                (Environment.replaceValues newValues env)
 
                         else
-                            -- Continue loop
-                            tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
+                            let
+                                newSize =
+                                    valuesSize newValues
+
+                                newFingerprint =
+                                    fingerprintValues newValues
+
+                                -- Category A: check if fingerprint is identical (NOT using ==
+                                -- on the values dict, which is unreliable for PartiallyApplied).
+                                identicalFingerprint =
+                                    newFingerprint == lastFingerprint && newSize == lastSize
+
+                                -- "Bounded progress": at least one value has constant size
+                                -- but changing fingerprint.
+                                boundedProgress =
+                                    hasBoundedProgressInValues env.values newValues
+
+                                newGrowCount =
+                                    if boundedProgress then
+                                        0
+
+                                    else if newSize > lastSize && lastSize > 0 then
+                                        growCount + 1
+
+                                    else if identicalFingerprint then
+                                        -- Fingerprint didn't change — count toward Category A
+                                        growCount + 1
+
+                                    else
+                                        0
+
+                                -- Use same threshold as checkAndUpdateCycle: 500 for closures
+                                hasClosures =
+                                    Dict.foldl
+                                        (\_ v found ->
+                                            found
+                                                || (case v of
+                                                        PartiallyApplied _ _ _ _ _ _ ->
+                                                            True
+
+                                                        _ ->
+                                                            False
+                                                   )
+                                        )
+                                        False
+                                        newValues
+
+                                threshold =
+                                    if hasClosures then
+                                        500
+
+                                    else
+                                        50
+                            in
+                            if newGrowCount >= threshold then
+                                EvErr
+                                    { currentModule = env.currentModule
+                                    , callStack = env.callStack
+                                    , error =
+                                        TypeError
+                                            ("Infinite recursion detected: "
+                                                ++ funcName
+                                                ++ (if identicalFingerprint then
+                                                        " called with identical arguments"
+
+                                                    else
+                                                        " arguments growing without bound"
+                                                   )
+                                            )
+                                    }
+
+                            else
+                                -- Continue loop, reset iterationsSinceCheck
+                                tcoLoopHelp funcName
+                                    body
+                                    (remaining - 1)
+                                    0
+                                    newSize
+                                    newGrowCount
+                                    newFingerprint
+                                    cfg
+                                    (Environment.replaceValues newValues env)
 
                     Nothing ->
                         -- Not a TailCall: return the result as-is
                         result
 
 
-tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value -> EvalResult Value
-tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env result =
+tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value -> EvalResult Value
+tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env result =
     case result of
         EvYield tag payload resume ->
             EvYield tag payload
                 (\resumeValue ->
-                    tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume resumeValue)
+                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env (resume resumeValue)
                 )
 
         EvMemoLookup payload resume ->
             EvMemoLookup payload
                 (\maybeValue ->
-                    tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env (resume maybeValue)
+                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env (resume maybeValue)
                 )
 
         EvMemoStore payload next ->
             EvMemoStore payload
-                (tcoResumeResult funcName body remaining lastSize growCount lastFingerprint cfg env next)
+                (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint cfg env next)
 
         _ ->
             case tcoExtractTailCall result of
                 Just newValues ->
-                    let
-                        newSize =
-                            valuesSize newValues
-
-                        newFingerprint =
-                            fingerprintValues newValues
-
-                        identicalFingerprint =
-                            newFingerprint == lastFingerprint && newSize == lastSize
-
-                        boundedProgress =
-                            hasBoundedProgressInValues env.values newValues
-
-                        newGrowCount =
-                            if boundedProgress then
-                                0
-
-                            else if newSize > lastSize && lastSize > 0 then
-                                growCount + 1
-
-                            else if identicalFingerprint then
-                                growCount + 1
-
-                            else
-                                0
-
-                        hasClosures =
-                            Dict.foldl
-                                (\_ v found ->
-                                    found
-                                        || (case v of
-                                                PartiallyApplied _ _ _ _ _ _ ->
-                                                    True
-
-                                                _ ->
-                                                    False
-                                           )
-                                )
-                                False
-                                newValues
-
-                        threshold =
-                            if hasClosures then
-                                500
-
-                            else
-                                50
-                    in
-                    if newGrowCount >= threshold then
-                        EvErr
-                            { currentModule = env.currentModule
-                            , callStack = env.callStack
-                            , error =
-                                TypeError
-                                    ("Infinite recursion detected: "
-                                        ++ funcName
-                                        ++ (if identicalFingerprint then
-                                                " called with identical arguments"
-
-                                            else
-                                                " arguments growing without bound"
-                                           )
-                                    )
-                            }
-
-                    else
-                        tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
+                    -- Force a full cycle check on the iteration following a
+                    -- resume from yield/memo, so suspended state still gets
+                    -- validated periodically.
+                    tcoLoopHelp funcName
+                        body
+                        (remaining - 1)
+                        tcoCycleCheckInterval
+                        lastSize
+                        growCount
+                        lastFingerprint
+                        cfg
+                        (Environment.replaceValues newValues env)
 
                 Nothing ->
                     result
@@ -2926,15 +2908,11 @@ kernelFunctions =
 
 
 evalFunction : Kernel.EvalFunction
-evalFunction oldArgs patterns functionName implementation cfg localEnv =
+evalFunction oldArgs patterns patternsLength functionName implementation cfg localEnv =
     let
         oldArgsLength : Int
         oldArgsLength =
             List.length oldArgs
-
-        patternsLength : Int
-        patternsLength =
-            List.length patterns
     in
     if oldArgsLength < patternsLength then
         -- Still not enough

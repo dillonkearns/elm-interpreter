@@ -819,6 +819,7 @@ runOneOf evalFn decoders json errors cfg env =
 type alias EvalFunction =
     List Value
     -> List (Elm.Syntax.Node.Node Elm.Syntax.Pattern.Pattern)
+    -> Int
     -> Maybe Elm.Syntax.Pattern.QualifiedNameRef
     -> Types.Implementation
     -> Types.Eval Value
@@ -836,7 +837,7 @@ applyFunction evalFn func arg cfg _ =
                     oldArgs ++ [ arg ]
             in
             if List.length newArgs >= arity then
-                case evalFn newArgs patterns maybeName implementation cfg closureEnv of
+                case evalFn newArgs patterns arity maybeName implementation cfg closureEnv of
                     EvOk val ->
                         Ok val
 

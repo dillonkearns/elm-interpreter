@@ -79,6 +79,9 @@ runBenchmark name =
                 "review_rule_mock" ->
                     reviewRuleMock
 
+                "review_rule_mock_large" ->
+                    reviewRuleMockLarge
+
                 _ ->
                     \() -> Err ("Unknown benchmark: " ++ name)
     in
@@ -319,6 +322,47 @@ main =
 
         modules =
             List.map buildModuleContext (List.range 1 20)
+
+        foldProjectContext m acc =
+            { usedValues = Set.union m.usedValues acc.usedValues
+            , exports = Dict.union m.exports acc.exports
+            }
+
+        empty =
+            { usedValues = Set.empty, exports = Dict.empty }
+
+        project =
+            List.foldl foldProjectContext empty modules
+    in
+    Set.size project.usedValues + Dict.size project.exports
+"""
+
+
+{-| Same shape as review_rule_mock, scaled up ~10x so the profile has
+enough Elm-side samples to see the hot frames above Node startup.
+-}
+reviewRuleMockLarge : () -> Result String String
+reviewRuleMockLarge () =
+    evalSimple """module T exposing (main)
+import Dict
+import Set
+main =
+    let
+        buildModuleContext i =
+            { usedValues =
+                List.foldl
+                    (\\n acc -> Set.insert ( "Module" ++ String.fromInt i, "fn" ++ String.fromInt n ) acc)
+                    Set.empty
+                    (List.range 1 200)
+            , exports =
+                List.foldl
+                    (\\n acc -> Dict.insert ( "Module" ++ String.fromInt i, "fn" ++ String.fromInt n ) n acc)
+                    Dict.empty
+                    (List.range 1 200)
+            }
+
+        modules =
+            List.map buildModuleContext (List.range 1 100)
 
         foldProjectContext m acc =
             { usedValues = Set.union m.usedValues acc.usedValues

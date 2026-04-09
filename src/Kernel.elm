@@ -47,6 +47,7 @@ import Value exposing (typeError)
 type alias EvalFunction =
     List Value
     -> List (Node Pattern)
+    -> Int
     -> Maybe QualifiedNameRef
     -> Implementation
     -> Eval Value
@@ -612,10 +613,10 @@ function evalFunctionWith inSelector _ outSelector =
         fromValue : Value -> Maybe (from -> Eval to)
         fromValue value =
             case value of
-                PartiallyApplied localEnv oldArgs patterns maybeName implementation _ ->
+                PartiallyApplied localEnv oldArgs patterns maybeName implementation cachedArity ->
                     Just
                         (\arg cfg _ ->
-                            evalFunctionWith (oldArgs ++ [ inSelector.toValue arg ]) patterns maybeName implementation cfg localEnv
+                            evalFunctionWith (oldArgs ++ [ inSelector.toValue arg ]) patterns cachedArity maybeName implementation cfg localEnv
                                 |> EvalResult.onValue
                                     (\out ->
                                         case outSelector.fromValue out of
@@ -1025,11 +1026,11 @@ regexReplaceAtMost evalFn _ =
         case args of
             [ Int n, regexVal, replacerVal, String str ] ->
                 case replacerVal of
-                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
+                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation cachedArity ->
                         let
                             applyReplacer : Value -> Eval Value
                             applyReplacer matchVal c _ =
-                                evalFn (oldArgs ++ [ matchVal ]) patterns maybeName implementation c closureEnv
+                                evalFn (oldArgs ++ [ matchVal ]) patterns cachedArity maybeName implementation c closureEnv
                         in
                         Kernel.Regex.replaceAtMost n regexVal applyReplacer str cfg env
                             |> EvalResult.map String
@@ -1191,16 +1192,16 @@ bytesDecodeKernel evalFn _ =
         case args of
             [ decoderFn, bsArg ] ->
                 case decoderFn of
-                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
+                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation cachedArity ->
                         let
                             applyDecoder : Value -> Eval (Value -> Eval Value)
                             applyDecoder arg c _ =
-                                evalFn (oldArgs ++ [ arg ]) patterns maybeName implementation c closureEnv
+                                evalFn (oldArgs ++ [ arg ]) patterns cachedArity maybeName implementation c closureEnv
                                     |> EvalResult.onValue
                                         (\result ->
                                             case result of
-                                                PartiallyApplied cEnv oArgs pats mName impl _ ->
-                                                    Ok (\arg2 c2 _ -> evalFn (oArgs ++ [ arg2 ]) pats mName impl c2 cEnv)
+                                                PartiallyApplied cEnv oArgs pats mName impl innerArity ->
+                                                    Ok (\arg2 c2 _ -> evalFn (oArgs ++ [ arg2 ]) pats innerArity mName impl c2 cEnv)
 
                                                 _ ->
                                                     Err (typeError env "Bytes.decode: decoder did not return a function")
@@ -1319,8 +1320,8 @@ writeStub4 _ _ =
 applyPredicate : EvalFunction -> Value -> Value -> Types.Config -> Types.Env -> Types.EvalResult Bool
 applyPredicate evalFn predicate charArg cfg env =
     case predicate of
-        PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
-            evalFn (oldArgs ++ [ charArg ]) patterns maybeName implementation cfg closureEnv
+        PartiallyApplied closureEnv oldArgs patterns maybeName implementation cachedArity ->
+            evalFn (oldArgs ++ [ charArg ]) patterns cachedArity maybeName implementation cfg closureEnv
                 |> EvalResult.onValue
                     (\result ->
                         case result of

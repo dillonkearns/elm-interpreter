@@ -6,3 +6,5 @@ build
 package-lock.json
 benchmark/benchmark.js
 benchmark/dict-set-benchmark.js
+benchmark/dict-set-benchmark-debug.js
+benchmark/profiles/
