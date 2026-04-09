@@ -126,6 +126,22 @@ functions evalFunction =
         ]
       )
 
+    -- Native Dict.* fast paths. These short-circuit the interpreted RBTree
+    -- walk for the hottest user-level Dict operations.
+    , ( [ "Dict" ]
+      , [ ( "empty", constant anything Kernel.Dict.emptyValue )
+        , ( "isEmpty", oneWithError anything to anything Kernel.Dict.isEmpty Core.Dict.isEmpty )
+        , ( "size", oneWithError anything to anything Kernel.Dict.size Core.Dict.size )
+        , ( "get", twoWithError anything anything to anything Kernel.Dict.get Core.Dict.get )
+        , ( "member", twoWithError anything anything to anything Kernel.Dict.member Core.Dict.member )
+        , ( "insert", threeWithError anything anything anything to anything Kernel.Dict.insert Core.Dict.insert )
+        , ( "remove", twoWithError anything anything to anything Kernel.Dict.remove Core.Dict.remove )
+        , ( "union", twoWithError anything anything to anything Kernel.Dict.union Core.Dict.union )
+        , ( "fromList", oneWithError anything to anything Kernel.Dict.fromList Core.Dict.fromList )
+        , ( "toList", oneWithError anything to anything Kernel.Dict.toList Core.Dict.toList )
+        ]
+      )
+
     -- Elm.Kernel.JsArray
     , ( [ "Elm", "Kernel", "JsArray" ]
       , [ ( "appendN", three int (jsArray anything) (jsArray anything) to (jsArray anything) Kernel.JsArray.appendN Core.Elm.JsArray.appendN )

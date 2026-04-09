@@ -2732,7 +2732,16 @@ evalNonVariant moduleName name cfg env =
         _ ->
             -- Note: env.values lookup for moduleName=[] is already done in
             -- evalFunctionOrValue before calling this function, so skip it here.
-            let
+            --
+            -- Fast path: some user-level modules (Dict, Set, ...) have native
+            -- kernel implementations that bypass the interpreted RBTree walk.
+            -- Check kernelFunctions first before the AST lookup.
+            case userModuleKernelFastPath moduleName name cfg env of
+                Just result ->
+                    result
+
+                Nothing ->
+                    let
                         maybeFunction : Maybe ( ModuleName, String, Expression.FunctionImplementation )
                         maybeFunction =
                             if List.isEmpty moduleName then
@@ -2979,6 +2988,34 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                 evalExpression expr
                                     cfg
                                     (localEnv |> Environment.withBindings newBindings)
+
+
+{-| Check for native-kernel overrides registered against user-level modules
+like `Dict`, `Set`, etc. Returns `Nothing` if the module/name doesn't have a
+kernel override, so the caller can fall through to the normal AST lookup.
+-}
+userModuleKernelFastPath : ModuleName -> String -> Config -> Env -> Maybe (PartialResult Value)
+userModuleKernelFastPath moduleName name cfg env =
+    if List.isEmpty moduleName then
+        Nothing
+
+    else
+        let
+            moduleNameKey : String
+            moduleNameKey =
+                Environment.moduleKey moduleName
+        in
+        case Dict.get moduleNameKey kernelFunctions of
+            Nothing ->
+                Nothing
+
+            Just kernelModule ->
+                case Dict.get name kernelModule of
+                    Nothing ->
+                        Nothing
+
+                    Just _ ->
+                        Just (evalKernelFunctionWithKey moduleNameKey moduleName name cfg env)
 
 
 evalKernelFunction : ModuleName -> String -> PartialEval Value
