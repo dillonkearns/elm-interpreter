@@ -201,19 +201,53 @@ functions evalFunction =
         ]
       )
 
-    -- Native List.* thin-wrapper short circuits. Only the first-order
-    -- (no interpreted callback) entries are registered here: the
-    -- higher-order helpers (`foldl`, `map`, `filter`, ...) also have
-    -- their kernel implementations, but routing user-level calls
-    -- through them via this fast path breaks `elm-review`'s
-    -- `Review.Rule` visitor machinery (either silently returns no
-    -- errors or trips a stack overflow depending on the exact mix).
-    -- The root cause hasn't been tracked down yet, so for now we only
-    -- short-circuit the safe first-order entries; `range` / `append`
-    -- still give a real improvement on list-building workloads.
+    -- Native List.* thin-wrapper short circuits. The Elm stdlib's
+    -- `List.foldl func acc list = Elm.Kernel.List.foldl func acc list`
+    -- et al. bounce through an extra interpreted wrapper on every
+    -- call. Register the kernel implementations directly against
+    -- the user-level `["List"]` module so `userModuleKernelFastPath`
+    -- catches them and skips the wrapper.
+    --
+    -- Note: the higher-order entries rely on `Kernel/List.elm`
+    -- foldlHelp/mapHelp propagating EvYield/EvMemo* results instead
+    -- of collapsing them through `EvalResult.toResult`, otherwise
+    -- intercept-driven yields (from e.g. elm-review's Review.Rule
+    -- cache markers) silently turn into `"Unhandled EvYield"` errors
+    -- and rules quietly report zero findings.
+    -- Native List.* thin-wrapper short circuits. The Elm stdlib's
+    -- `List.foldl func acc list = Elm.Kernel.List.foldl func acc list`
+    -- et al. bounce through an extra interpreted wrapper on every
+    -- call; registering kernel implementations directly against the
+    -- user-level `["List"]` module lets `userModuleKernelFastPath`
+    -- catch them and skip the wrapper.
+    --
+    -- `List.map` is intentionally excluded. With `map` in the
+    -- shortcut, `elm-review`'s `Review.Rule` visitor machinery
+    -- silently reports zero errors on real rules. Binary-search
+    -- narrowed the bug to specifically `List.map` routed through
+    -- this fast path — every other higher-order List helper in the
+    -- set (`foldl`, `foldr`, `filter`, `filterMap`, `concatMap`,
+    -- `indexedMap`, `any`, `all`, `sortBy`, `sortWith`) produces
+    -- correct results. Both the yield-aware and the
+    -- `EvalResult.toResult`-based `mapHelp` implementations fail the
+    -- same way, so the issue isn't in `Kernel.List.map` itself — it
+    -- has to be in how the resulting `PartiallyApplied (KernelImpl)`
+    -- value flows into `Review.Rule`'s rule-construction machinery.
+    -- Root cause still unknown, but the other shortcuts are a clean
+    -- win and the `map` exclusion limits the hit to one function.
     , ( [ "List" ]
       , [ ( "range", two int int to anyList Kernel.List.range Core.List.range )
         , ( "append", two anyList anyList to anyList Kernel.List.append Core.List.append )
+        , ( "foldl", threeWithError (function2 evalFunction anything anything to anything) anything anyList to anything Kernel.List.foldl Core.List.foldl )
+        , ( "foldr", threeWithError (function2 evalFunction anything anything to anything) anything anyList to anything Kernel.List.foldr Core.List.foldr )
+        , ( "filter", twoWithError (function evalFunction anything to bool) anyList to anyList Kernel.List.filter Core.List.filter )
+        , ( "filterMap", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.filterMap Core.List.filterMap )
+        , ( "concatMap", twoWithError (function evalFunction anything to anyList) anyList to anyList Kernel.List.concatMap Core.List.concatMap )
+        , ( "indexedMap", twoWithError (function2 evalFunction anything anything to anything) anyList to anyList Kernel.List.indexedMap Core.List.indexedMap )
+        , ( "any", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.any Core.List.any )
+        , ( "all", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.all Core.List.all )
+        , ( "sortBy", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.sortBy Core.List.sortBy )
+        , ( "sortWith", twoWithError (function2 evalFunction anything anything to order) anyList to anyList Kernel.List.sortWith Core.List.sortWith )
         ]
       )
 
