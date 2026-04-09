@@ -26,6 +26,7 @@ const BENCHMARKS = [
   "set_union_string_1k",
   "set_member_string_1k",
   "review_rule_mock",
+  "visitor_split_mock",
 ];
 
 const runnerPath = path.join(__dirname, "run-dict-set-one.js");

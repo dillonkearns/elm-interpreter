@@ -82,6 +82,12 @@ runBenchmark name =
                 "review_rule_mock_large" ->
                     reviewRuleMockLarge
 
+                "visitor_split_mock" ->
+                    visitorSplitMock
+
+                "visitor_split_mock_large" ->
+                    visitorSplitMockLarge
+
                 _ ->
                     \() -> Err ("Unknown benchmark: " ++ name)
     in
@@ -335,6 +341,128 @@ main =
             List.foldl foldProjectContext empty modules
     in
     Set.size project.usedValues + Dict.size project.exports
+"""
+
+
+{-| Visitor-split shape of the same work: instead of a single
+"buildModuleContext i" that produces a big record, split into
+per-visitor helpers (one for the usedValues visitor, one for the
+exports visitor) so each visitor's inner loop runs through a small
+interpreted function and writes a focused contribution that the
+fold can merge via kernel Dict/Set union.
+
+If the interpreter's closure/env overhead is well amortized, this
+benchmark should land at parity with review_rule_mock instead of
+being slower. A big regression here would suggest visitor splitting
+has an inherent cost that would undermine the architectural plan.
+-}
+visitorSplitMock : () -> Result String String
+visitorSplitMock () =
+    evalSimple """module T exposing (main)
+import Dict
+import Set
+
+
+usedValuesVisitor : Int -> Set.Set ( String, String )
+usedValuesVisitor i =
+    List.foldl
+        (\\n acc -> Set.insert ( "Module" ++ String.fromInt i, "fn" ++ String.fromInt n ) acc)
+        Set.empty
+        (List.range 1 50)
+
+
+exportsVisitor : Int -> Dict.Dict ( String, String ) Int
+exportsVisitor i =
+    List.foldl
+        (\\n acc -> Dict.insert ( "Module" ++ String.fromInt i, "fn" ++ String.fromInt n ) n acc)
+        Dict.empty
+        (List.range 1 50)
+
+
+mergeUsedValues : Set.Set a -> Set.Set a -> Set.Set a
+mergeUsedValues new acc =
+    Set.union new acc
+
+
+mergeExports : Dict.Dict comparable v -> Dict.Dict comparable v -> Dict.Dict comparable v
+mergeExports new acc =
+    Dict.union new acc
+
+
+main =
+    let
+        moduleIndices =
+            List.range 1 20
+
+        projectUsedValues =
+            List.foldl
+                (\\i acc -> mergeUsedValues (usedValuesVisitor i) acc)
+                Set.empty
+                moduleIndices
+
+        projectExports =
+            List.foldl
+                (\\i acc -> mergeExports (exportsVisitor i) acc)
+                Dict.empty
+                moduleIndices
+    in
+    Set.size projectUsedValues + Dict.size projectExports
+"""
+
+
+{-| Large variant of visitor_split_mock for profiling.
+-}
+visitorSplitMockLarge : () -> Result String String
+visitorSplitMockLarge () =
+    evalSimple """module T exposing (main)
+import Dict
+import Set
+
+
+usedValuesVisitor : Int -> Set.Set ( String, String )
+usedValuesVisitor i =
+    List.foldl
+        (\\n acc -> Set.insert ( "Module" ++ String.fromInt i, "fn" ++ String.fromInt n ) acc)
+        Set.empty
+        (List.range 1 200)
+
+
+exportsVisitor : Int -> Dict.Dict ( String, String ) Int
+exportsVisitor i =
+    List.foldl
+        (\\n acc -> Dict.insert ( "Module" ++ String.fromInt i, "fn" ++ String.fromInt n ) n acc)
+        Dict.empty
+        (List.range 1 200)
+
+
+mergeUsedValues : Set.Set a -> Set.Set a -> Set.Set a
+mergeUsedValues new acc =
+    Set.union new acc
+
+
+mergeExports : Dict.Dict comparable v -> Dict.Dict comparable v -> Dict.Dict comparable v
+mergeExports new acc =
+    Dict.union new acc
+
+
+main =
+    let
+        moduleIndices =
+            List.range 1 100
+
+        projectUsedValues =
+            List.foldl
+                (\\i acc -> mergeUsedValues (usedValuesVisitor i) acc)
+                Set.empty
+                moduleIndices
+
+        projectExports =
+            List.foldl
+                (\\i acc -> mergeExports (exportsVisitor i) acc)
+                Dict.empty
+                moduleIndices
+    in
+    Set.size projectUsedValues + Dict.size projectExports
 """
 
 
