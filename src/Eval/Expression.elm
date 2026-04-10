@@ -2019,6 +2019,17 @@ call maybeQualifiedName implementation cfg env =
             else
                 Recursion.base (f [] cfg env)
 
+        RExprImpl _ ->
+            -- Resolved-IR closures never reach the string-keyed evaluator.
+            -- Reaching here means the useResolvedIR gate is misrouted.
+            Recursion.base
+                (EvErr
+                    { currentModule = env.currentModule
+                    , callStack = env.callStack
+                    , error = TypeError "RExprImpl in old evaluator call path (useResolvedIR misrouted)"
+                    }
+                )
+
 
 
 {-| Static analysis: check if a function body is tail-recursive with respect
@@ -3050,6 +3061,12 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                     AstImpl expr ->
                         evalExpression expr cfg boundEnv
 
+                    RExprImpl _ ->
+                        -- Resolved-IR closures never reach the string-keyed
+                        -- evaluator. Reaching here means the useResolvedIR
+                        -- gate is misrouted.
+                        EvalResult.fail <| typeError localEnv "RExprImpl in old evaluator (useResolvedIR misrouted)"
+
             Nothing ->
                 let
                     maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
@@ -3081,6 +3098,9 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                                 evalExpression expr
                                     cfg
                                     (localEnv |> Environment.withBindings newBindings)
+
+                            RExprImpl _ ->
+                                EvalResult.fail <| typeError localEnv "RExprImpl in old evaluator (useResolvedIR misrouted)"
 
 
 {-| Check for native-kernel overrides registered against user-level modules

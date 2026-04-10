@@ -34,6 +34,7 @@ supported here never produce those.
 
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Pattern exposing (QualifiedNameRef)
+import Environment
 import Eval.ResolvedIR as IR exposing (RExpr(..))
 import FastDict
 import Rope
@@ -42,6 +43,7 @@ import Types
         ( EvalErrorData
         , EvalErrorKind(..)
         , EvalResult(..)
+        , Implementation(..)
         , Value(..)
         )
 
@@ -333,32 +335,329 @@ evalR env expr =
                         evalR { env | locals = newLocals } letBody
                     )
 
-        -- Everything below is "not implemented in iteration 3b1" — later
-        -- iterations replace each of these with real handling.
+        RLambda lambda ->
+            -- Creating a closure snapshots the current locals. The body
+            -- will be run with its arguments prepended to this snapshot.
+            -- Regular lambdas don't need a self-reference slot.
+            EvOk (makeClosure env lambda.arity lambda.body 0 Nothing)
+
+        RApply headExpr argExprs ->
+            evalR env headExpr
+                |> andThenValue
+                    (\headValue ->
+                        evalExprList env argExprs
+                            |> andThenList
+                                (\argValues ->
+                                    applyClosure env headValue argValues
+                                )
+                    )
+
+        RCtor ref ->
+            evalConstructor ref
+
+        RCase scrutineeExpr branches ->
+            evalR env scrutineeExpr
+                |> andThenValue
+                    (\scrutineeValue ->
+                        evalCaseBranches env scrutineeValue branches
+                    )
+
+        RRecordAccessFunction fieldName ->
+            -- `.field` is a function `\r -> r.field`. Build it as a
+            -- one-arg closure whose body is `RRecordAccess (RLocal 0) field`.
+            -- No captures needed since the body only references the argument.
+            EvOk
+                (makeClosure
+                    { env | locals = [] }
+                    1
+                    (RRecordAccess (RLocal 0) fieldName)
+                    0
+                    Nothing
+                )
+
+        -- Everything below is "not implemented in iteration 3b2" — Phase 3
+        -- wire-up (3b3) adds RGlobal dispatch into the project env's
+        -- resolved bodies map.
         RGlobal _ ->
-            evErr env (Unsupported "RGlobal (iteration 3b2)")
-
-        RCtor _ ->
-            evErr env (Unsupported "RCtor (iteration 3b2)")
-
-        RRecordAccessFunction _ ->
-            evErr env (Unsupported "RRecordAccessFunction (iteration 3b2)")
-
-        RCase _ _ ->
-            evErr env (Unsupported "RCase (iteration 3b2)")
-
-        RLambda _ ->
-            evErr env (Unsupported "RLambda (iteration 3b2)")
-
-        RApply _ _ ->
-            evErr env (Unsupported "RApply (iteration 3b2)")
+            evErr env (Unsupported "RGlobal (iteration 3b3 — wire-up)")
 
         RGLSL _ ->
             evErr env (Unsupported "RGLSL (not supported)")
 
 
 
+-- CLOSURES AND APPLICATION
+
+
+{-| Build a `PartiallyApplied` Value carrying a resolved-IR body. The Env
+field is a dummy (the new evaluator never reads it) and the patterns list
+is empty (the new evaluator uses the cached-arity Int directly instead of
+counting patterns).
+
+`selfSlots` is the number of self-reference slots to prepend to the
+captured locals at call time. Use `0` for regular lambda closures and `1`
+for let-bound recursive functions — see the `Implementation` docstring in
+`Types.elm` for why.
+
+-}
+makeClosure : REnv -> Int -> RExpr -> Int -> Maybe QualifiedNameRef -> Value
+makeClosure env arity body selfSlots debugName =
+    PartiallyApplied
+        (Environment.empty [])
+        []
+        []
+        debugName
+        (RExprImpl
+            { body = body
+            , capturedLocals = env.locals
+            , selfSlots = selfSlots
+            }
+        )
+        arity
+
+
+{-| Apply a list of new arguments to a callable value. Handles three cases:
+
+  - **Partial application**: fewer args total than arity → return an
+    updated closure with more `appliedArgs`.
+
+  - **Exact application**: total args == arity → run the body with the
+    captured locals plus the bound arguments.
+
+  - **Over-application**: total args > arity → run with exactly `arity`
+    args, then recursively apply the extra args to the result. Common in
+    Elm code like `List.map (\x -> \y -> ...) xs ys`.
+
+Also dispatches `Custom` constructor values (which behave like
+partially-applied N-arg constructors — applying args just extends the
+arg list) and passes kernel-backed `PartiallyApplied` values through to
+a simple argument accumulator. Full kernel dispatch from the new
+evaluator is deferred until Phase 3 wire-up (`Config.useResolvedIR`
+flag); for now, applying to a kernel closure returns `Unsupported`.
+
+-}
+applyClosure : REnv -> Value -> List Value -> EvalResult Value
+applyClosure env head newArgs =
+    if List.isEmpty newArgs then
+        EvOk head
+
+    else
+        case head of
+            PartiallyApplied _ appliedArgs _ debugName impl arity ->
+                case impl of
+                    RExprImpl implBody ->
+                        let
+                            totalArgs : List Value
+                            totalArgs =
+                                appliedArgs ++ newArgs
+
+                            totalCount : Int
+                            totalCount =
+                                List.length totalArgs
+
+                            selfClosure : Value
+                            selfClosure =
+                                -- The "fresh" self-reference used for
+                                -- recursive calls has no applied args — it's
+                                -- what the user wrote as `f`, not what they
+                                -- wrote as `f 5` part-way through a call.
+                                PartiallyApplied
+                                    (Environment.empty [])
+                                    []
+                                    []
+                                    debugName
+                                    impl
+                                    arity
+                        in
+                        if totalCount < arity then
+                            EvOk
+                                (PartiallyApplied
+                                    (Environment.empty [])
+                                    totalArgs
+                                    []
+                                    debugName
+                                    impl
+                                    arity
+                                )
+
+                        else if totalCount == arity then
+                            runRExprClosure env implBody selfClosure totalArgs
+
+                        else
+                            let
+                                bodyArgs : List Value
+                                bodyArgs =
+                                    List.take arity totalArgs
+
+                                extraArgs : List Value
+                                extraArgs =
+                                    List.drop arity totalArgs
+                            in
+                            runRExprClosure env implBody selfClosure bodyArgs
+                                |> andThenValue
+                                    (\result ->
+                                        applyClosure env result extraArgs
+                                    )
+
+                    AstImpl _ ->
+                        evErr env
+                            (Unsupported
+                                "applying new evaluator to old AST-backed closure (Phase 3 wire-up will bridge this)"
+                            )
+
+                    KernelImpl _ _ _ ->
+                        evErr env
+                            (Unsupported
+                                "applying new evaluator to kernel-backed closure (Phase 3 wire-up will bridge this)"
+                            )
+
+            Custom qualRef existingArgs ->
+                -- Constructor application: treat as arg accumulation.
+                -- Elm's type checker ensures arity is correct upstream, so
+                -- we don't validate here.
+                EvOk (Custom qualRef (existingArgs ++ newArgs))
+
+            other ->
+                evErr env
+                    (TypeError
+                        ("apply on non-callable: " ++ Debug.toString other)
+                    )
+
+
+{-| Run a resolved-IR closure body with the captured locals plus newly-bound
+arguments. The args are prepended in application order, so the first-bound
+parameter ends up at the deepest index.
+
+`selfSlots` copies of the closure itself are prepended to the captured
+locals before the args are added. This implements single-binding
+self-recursion without needing cyclic data structures — see `makeClosure`
+and the `Implementation.RExprImpl` docstring for the full story.
+
+-}
+runRExprClosure :
+    REnv
+    ->
+        { body : RExpr
+        , capturedLocals : List Value
+        , selfSlots : Int
+        }
+    -> Value
+    -> List Value
+    -> EvalResult Value
+runRExprClosure env implBody selfClosure args =
+    let
+        withSelf : List Value
+        withSelf =
+            prependRepeated implBody.selfSlots selfClosure implBody.capturedLocals
+
+        bodyLocals : List Value
+        bodyLocals =
+            List.foldl (::) withSelf args
+
+        bodyEnv : REnv
+        bodyEnv =
+            { env | locals = bodyLocals }
+    in
+    evalR bodyEnv implBody.body
+
+
+prependRepeated : Int -> a -> List a -> List a
+prependRepeated n value list =
+    if n <= 0 then
+        list
+
+    else
+        prependRepeated (n - 1) value (value :: list)
+
+
+
+-- CONSTRUCTORS
+
+
+{-| Evaluate a constructor reference. Special-cases `True`/`False` (Elm's
+`Basics.Bool` constructors map to the dedicated `Bool` Value variant) and
+treats every other constructor as an initially-empty `Custom` value that
+`applyClosure` grows as arguments are applied.
+
+Name matching ignores the module name to match the existing evaluator's
+behavior — Elm's type checker has already enforced unique constructor
+names within a scope, and the resolver preserves source-level qualification
+which may be empty or qualified depending on how the user imported the
+type.
+
+-}
+evalConstructor : { moduleName : ModuleName, name : String } -> EvalResult Value
+evalConstructor { moduleName, name } =
+    case name of
+        "True" ->
+            EvOk (Bool True)
+
+        "False" ->
+            EvOk (Bool False)
+
+        _ ->
+            EvOk (Custom { moduleName = moduleName, name = name } [])
+
+
+
+-- CASE EXPRESSIONS
+
+
+evalCaseBranches :
+    REnv
+    -> Value
+    -> List ( IR.RPattern, RExpr )
+    -> EvalResult Value
+evalCaseBranches env scrutinee branches =
+    case branches of
+        [] ->
+            evErr env
+                (TypeError
+                    ("case expression failed to match any branch for value: "
+                        ++ Debug.toString scrutinee
+                    )
+                )
+
+        ( pattern, branchBody ) :: rest ->
+            case matchPattern pattern scrutinee env.locals of
+                Just newLocals ->
+                    evalR { env | locals = newLocals } branchBody
+
+                Nothing ->
+                    evalCaseBranches env scrutinee rest
+
+
+
 -- HELPERS
+
+
+{-| Evaluate a list of RExprs to a list of Values in order. Propagates
+errors from any element; short-circuits on the first failure.
+-}
+evalExprList : REnv -> List RExpr -> EvalResult (List Value)
+evalExprList env exprs =
+    List.foldr
+        (\expr acc ->
+            case acc of
+                EvOk vs ->
+                    case evalR env expr of
+                        EvOk v ->
+                            EvOk (v :: vs)
+
+                        EvErr e ->
+                            EvErr e
+
+                        other ->
+                            unsupportedResult "evalExprList" other
+
+                EvErr _ ->
+                    acc
+
+                _ ->
+                    acc
+        )
+        (EvOk [])
+        exprs
 
 
 {-| Evaluate a record's field list in source order, returning the list of
@@ -419,21 +718,47 @@ evalLetBindings env bindings =
         (\binding accResult ->
             case accResult of
                 EvOk locals ->
+                    let
+                        bodyEnv : REnv
+                        bodyEnv =
+                            { env | locals = locals }
+                    in
                     if binding.arity > 0 then
-                        evErr env
-                            (Unsupported
-                                ("RLet function binding '"
-                                    ++ binding.debugName
-                                    ++ "' (closures arrive in iteration 3b2)"
-                                )
-                            )
+                        -- Function binding: the body is an `RLambda` whose
+                        -- body was resolved expecting `self` in the locals
+                        -- stack (selfRecExtendedLocals in the resolver).
+                        -- Build the closure with selfSlots = 1 so the
+                        -- evaluator prepends the closure itself to
+                        -- captured locals at call time, matching the
+                        -- resolver's layout.
+                        --
+                        -- We look *inside* the RLambda rather than calling
+                        -- evalR on it because evalR would produce a
+                        -- regular closure with selfSlots = 0.
+                        case binding.body of
+                            RLambda lambda ->
+                                let
+                                    closureValue : Value
+                                    closureValue =
+                                        makeClosure
+                                            bodyEnv
+                                            lambda.arity
+                                            lambda.body
+                                            1
+                                            Nothing
+                                in
+                                EvOk (closureValue :: locals)
+
+                            _ ->
+                                evErr env
+                                    (TypeError
+                                        ("let function binding '"
+                                            ++ binding.debugName
+                                            ++ "' body is not an RLambda"
+                                        )
+                                    )
 
                     else
-                        let
-                            bodyEnv : REnv
-                            bodyEnv =
-                                { env | locals = locals }
-                        in
                         case evalR bodyEnv binding.body of
                             EvOk value ->
                                 case matchPattern binding.pattern value locals of
@@ -584,19 +909,124 @@ matchPattern pat value locals =
                 Nothing ->
                     Nothing
 
-        -- Patterns below will be supported in iteration 3b2 alongside
-        -- RCase. For now, any attempt to match them at runtime fails.
-        IR.RPRecord _ ->
+        IR.RPRecord fieldNames ->
+            -- Record destructuring: each field name becomes one bound slot
+            -- with the record's value for that field. fieldNames is stored
+            -- sorted by the resolver, so the slot order here matches the
+            -- alphabetical resolver layout.
+            case value of
+                Record fieldDict ->
+                    bindRecordFields fieldNames fieldDict locals
+
+                _ ->
+                    Nothing
+
+        IR.RPCons headPat tailPat ->
+            case value of
+                List (h :: t) ->
+                    case matchPattern headPat h locals of
+                        Just afterHead ->
+                            matchPattern tailPat (List t) afterHead
+
+                        Nothing ->
+                            Nothing
+
+                _ ->
+                    Nothing
+
+        IR.RPList elemPats ->
+            case value of
+                List items ->
+                    if List.length items == List.length elemPats then
+                        matchPatternsAgainstValues elemPats items locals
+
+                    else
+                        Nothing
+
+                _ ->
+                    Nothing
+
+        IR.RPCtor ref argPats ->
+            -- Constructor pattern. Name matching ignores moduleName to
+            -- stay compatible with the existing evaluator (which also
+            -- matches by name only — see the `match` function in
+            -- Eval.Expression around line 4002 for the Bool special case).
+            --
+            -- Special-cases `True`/`False` because the evaluator
+            -- represents Bool as its own Value variant, not as `Custom`.
+            case ( ref.name, value ) of
+                ( "True", Bool True ) ->
+                    if List.isEmpty argPats then
+                        Just locals
+
+                    else
+                        Nothing
+
+                ( "False", Bool False ) ->
+                    if List.isEmpty argPats then
+                        Just locals
+
+                    else
+                        Nothing
+
+                ( _, Custom valueRef valueArgs ) ->
+                    if ref.name == valueRef.name then
+                        matchPatternsAgainstValues argPats valueArgs locals
+
+                    else
+                        Nothing
+
+                _ ->
+                    Nothing
+
+
+{-| Match a list of patterns against a list of values in lock-step. Returns
+`Nothing` if the lists have different lengths or any pattern fails to match.
+Used for tuple elements, list elements, and constructor arguments.
+-}
+matchPatternsAgainstValues :
+    List IR.RPattern
+    -> List Value
+    -> List Value
+    -> Maybe (List Value)
+matchPatternsAgainstValues patterns values locals =
+    case ( patterns, values ) of
+        ( [], [] ) ->
+            Just locals
+
+        ( p :: ps, v :: vs ) ->
+            case matchPattern p v locals of
+                Just afterP ->
+                    matchPatternsAgainstValues ps vs afterP
+
+                Nothing ->
+                    Nothing
+
+        _ ->
             Nothing
 
-        IR.RPCons _ _ ->
-            Nothing
 
-        IR.RPList _ ->
-            Nothing
+{-| Walk a sorted list of record field names, looking up each field in the
+record's dict and prepending the resolved value to the locals stack.
+Returns `Nothing` if any field is missing from the record.
+-}
+bindRecordFields :
+    List String
+    -> FastDict.Dict String Value
+    -> List Value
+    -> Maybe (List Value)
+bindRecordFields fieldNames fieldDict locals =
+    case fieldNames of
+        [] ->
+            Just locals
 
-        IR.RPCtor _ _ ->
-            Nothing
+        name :: rest ->
+            case FastDict.get name fieldDict of
+                Just fieldValue ->
+                    bindRecordFields rest fieldDict (fieldValue :: locals)
+
+                Nothing ->
+                    Nothing
 
 
 andThenValue :

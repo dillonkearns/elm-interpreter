@@ -6,6 +6,7 @@ import Elm.Syntax.ModuleName exposing (ModuleName)
 import Regex
 import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (Pattern, QualifiedNameRef)
+import Eval.ResolvedIR as IR
 import FastDict exposing (Dict)
 import MemoSpec
 import Parser exposing (DeadEnd)
@@ -164,11 +165,44 @@ type JsonDecoder
 
 
 {-| Function implementation: either an AST expression to evaluate,
-or a pre-resolved kernel function that can be called directly.
+or a pre-resolved kernel function that can be called directly,
+or a resolved-IR body produced by `Eval.Resolver` for Phase 3's
+new evaluator.
+
+`RExprImpl` carries the closure's body as an `RExpr`, the captured
+locals list that was in scope when the closure was created, and
+`selfSlots` — the number of synthetic "self reference" slots the
+evaluator should prepend to `capturedLocals` at call time, filled
+with the closure itself.
+
+`selfSlots` supports single-binding self-recursion: `let f x = f
+(x - 1) in f 5` needs `f` to be visible inside its own body. At
+closure creation time we can't put the finished closure into its
+own captured locals (that would be a cycle), so the evaluator
+substitutes at call time instead. For `RLambda` expressions and
+non-recursive contexts, `selfSlots = 0` and the substitution is
+skipped.
+
+Mutual recursion of multiple function bindings in the same let
+group is NOT supported — the resolver's sequential scoping only
+gives a single binding visibility of itself, not siblings. That's
+deferred to a later iteration when the evaluator gains a
+pre-allocation story.
+
+The new evaluator (`Eval.ResolvedExpression`) is the only code
+that creates or reads these values. The old evaluator code treats
+them as an error if it ever encounters one, which should only
+happen via `useResolvedIR = False` misrouting.
+
 -}
 type Implementation
     = AstImpl (Node Expression)
     | KernelImpl ModuleName String (List Value -> Eval Value)
+    | RExprImpl
+        { body : IR.RExpr
+        , capturedLocals : List Value
+        , selfSlots : Int
+        }
 
 
 type alias SharedContext =

@@ -144,6 +144,14 @@ toExpression value =
                     KernelImpl moduleName name _ ->
                         Expression.FunctionOrValue moduleName name
 
+                    RExprImpl _ ->
+                        -- Resolved-IR closures can't be round-tripped to
+                        -- elm-syntax — they carry De Bruijn indexed bodies
+                        -- with no parameter names. Display as an opaque
+                        -- placeholder. Only reachable via debug-print code
+                        -- paths that shouldn't mix with the new evaluator.
+                        Expression.FunctionOrValue [] "<resolved-closure>"
+
             PartiallyApplied _ args patterns Nothing implementation _ ->
                 case implementation of
                     AstImpl expr ->
@@ -162,6 +170,9 @@ toExpression value =
                             :: List.map toExpression args
                         )
                             |> Expression.Application
+
+                    RExprImpl _ ->
+                        Expression.FunctionOrValue [] "<resolved-closure>"
 
 
 arrayToExpression : String -> List Value -> Expression

@@ -27,6 +27,11 @@ suite =
         , andOrTests
         , recordTests
         , letTests
+        , lambdaTests
+        , applyTests
+        , constructorTests
+        , caseTests
+        , recordAccessFunctionTests
         , unsupportedTests
         ]
 
@@ -383,55 +388,342 @@ letTests =
                         inner
                     )
                     |> expectValue (Int 7)
-        , test "function binding returns Unsupported (iteration 3b2)" <|
+        , test "non-recursive function binding: identity" <|
             \_ ->
-                case
-                    RE.evalR RE.emptyREnv
-                        (RLet
+                -- let f x = x in f 42
+                let
+                    identityLambda =
+                        RLambda { arity = 1, body = RLocal 0 }
+
+                    program =
+                        RLet
                             [ { pattern = IR.RPVar
                               , arity = 1
-                              , body =
-                                    RLambda { arity = 1, body = RLocal 0 }
+                              , body = identityLambda
                               , debugName = "f"
                               }
                             ]
-                            (RLocal 0)
+                            (RApply (RLocal 0) [ RInt 42 ])
+                in
+                RE.evalR RE.emptyREnv program
+                    |> expectValue (Int 42)
+        ]
+
+
+lambdaTests : Test
+lambdaTests =
+    describe "RLambda + RApply (closures and application)"
+        [ test "identity lambda applied" <|
+            \_ ->
+                -- (\x -> x) 7
+                RE.evalR RE.emptyREnv
+                    (RApply
+                        (RLambda { arity = 1, body = RLocal 0 })
+                        [ RInt 7 ]
+                    )
+                    |> expectValue (Int 7)
+        , test "const lambda applied fully" <|
+            \_ ->
+                -- (\x y -> x) 1 2
+                -- Body is RLocal 1 (outer x, after y gets pushed)
+                RE.evalR RE.emptyREnv
+                    (RApply
+                        (RLambda { arity = 2, body = RLocal 1 })
+                        [ RInt 1, RInt 2 ]
+                    )
+                    |> expectValue (Int 1)
+        , test "partial application returns a closure" <|
+            \_ ->
+                -- ((\x y -> x) 1) — not yet applied to y
+                case
+                    RE.evalR RE.emptyREnv
+                        (RApply
+                            (RLambda { arity = 2, body = RLocal 1 })
+                            [ RInt 1 ]
                         )
                 of
+                    EvOk (PartiallyApplied _ appliedArgs _ _ _ arity) ->
+                        ( List.length appliedArgs, arity )
+                            |> Expect.equal ( 1, 2 )
+
+                    other ->
+                        Expect.fail
+                            ("expected PartiallyApplied closure, got "
+                                ++ resultToString other
+                            )
+        , test "partial then complete application" <|
+            \_ ->
+                -- Apply the 1 first, then apply 2 to the result
+                case
+                    RE.evalR RE.emptyREnv
+                        (RApply
+                            (RLambda { arity = 2, body = RLocal 1 })
+                            [ RInt 1 ]
+                        )
+                of
+                    EvOk partial ->
+                        case
+                            RE.evalR RE.emptyREnv
+                                (RApply
+                                    -- Inject the partial closure via a local
+                                    -- slot since we can't embed a Value in
+                                    -- an RExpr literal.
+                                    (RLocal 0)
+                                    [ RInt 2 ]
+                                )
+                        of
+                            -- The RApply above needs locals containing the
+                            -- partial closure; rebuild an env for it.
+                            _ ->
+                                case
+                                    RE.evalR
+                                        (withLocals [ partial ])
+                                        (RApply (RLocal 0) [ RInt 2 ])
+                                of
+                                    EvOk v ->
+                                        v |> Expect.equal (Int 1)
+
+                                    other ->
+                                        Expect.fail ("second apply failed: " ++ resultToString other)
+
+                    other ->
+                        Expect.fail ("first apply failed: " ++ resultToString other)
+        , test "closure captures outer locals" <|
+            \_ ->
+                -- In an env where slot 0 = 100, evaluate `\x -> x + 0th-local`.
+                -- The lambda body is RApply (some add) [RLocal 0, RLocal 1].
+                -- Lambda's RLocal 0 = its own arg, RLocal 1 = the captured value.
+                --
+                -- But we don't have + yet (RGlobal deferred), so instead
+                -- build a body that uses RTuple2 to combine them:
+                --   \x -> (x, captured)
+                -- Apply with 7, expect (7, 100).
+                let
+                    env =
+                        withLocals [ Int 100 ]
+
+                    lambda =
+                        RLambda
+                            { arity = 1
+                            , body = RTuple2 (RLocal 0) (RLocal 1)
+                            }
+                in
+                RE.evalR env (RApply lambda [ RInt 7 ])
+                    |> expectValue (Tuple (Int 7) (Int 100))
+        ]
+
+
+applyTests : Test
+applyTests =
+    describe "RApply edge cases"
+        [ test "applying zero args returns the function unchanged" <|
+            \_ ->
+                -- Should never happen in practice (the resolver doesn't
+                -- emit empty-arg applies), but if it does, it should be
+                -- a no-op rather than a crash.
+                let
+                    lambda =
+                        RLambda { arity = 1, body = RLocal 0 }
+                in
+                case RE.evalR RE.emptyREnv (RApply lambda []) of
+                    EvOk (PartiallyApplied _ [] _ _ _ 1) ->
+                        Expect.pass
+
+                    other ->
+                        Expect.fail
+                            ("expected unchanged closure, got "
+                                ++ resultToString other
+                            )
+        , test "applying to a non-callable is a type error" <|
+            \_ ->
+                case RE.evalR RE.emptyREnv (RApply (RInt 0) [ RInt 1 ]) of
                     EvErr { error } ->
                         case error of
-                            Unsupported _ ->
+                            TypeError _ ->
                                 Expect.pass
 
                             other ->
-                                Expect.fail ("expected Unsupported, got " ++ kindToString other)
+                                Expect.fail ("expected TypeError, got " ++ kindToString other)
 
                     other ->
                         Expect.fail ("expected EvErr, got " ++ resultToString other)
         ]
 
 
+constructorTests : Test
+constructorTests =
+    describe "RCtor"
+        [ test "True → Bool True" <|
+            \_ ->
+                RE.evalR RE.emptyREnv
+                    (RCtor { moduleName = [], name = "True" })
+                    |> expectValue (Bool True)
+        , test "False → Bool False" <|
+            \_ ->
+                RE.evalR RE.emptyREnv
+                    (RCtor { moduleName = [], name = "False" })
+                    |> expectValue (Bool False)
+        , test "Nothing → empty Custom" <|
+            \_ ->
+                RE.evalR RE.emptyREnv
+                    (RCtor { moduleName = [ "Maybe" ], name = "Nothing" })
+                    |> expectValue
+                        (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+        , test "Just 5 via RApply extends the Custom's args" <|
+            \_ ->
+                RE.evalR RE.emptyREnv
+                    (RApply
+                        (RCtor { moduleName = [ "Maybe" ], name = "Just" })
+                        [ RInt 5 ]
+                    )
+                    |> expectValue
+                        (Custom { moduleName = [ "Maybe" ], name = "Just" } [ Int 5 ])
+        ]
+
+
+caseTests : Test
+caseTests =
+    describe "RCase pattern matching"
+        [ test "literal match: first branch wins" <|
+            \_ ->
+                -- case 1 of 1 -> "one"; _ -> "other"
+                RE.evalR RE.emptyREnv
+                    (RCase (RInt 1)
+                        [ ( IR.RPInt 1, RString "one" )
+                        , ( IR.RPWildcard, RString "other" )
+                        ]
+                    )
+                    |> expectValue (String "one")
+        , test "literal mismatch: fall through to wildcard" <|
+            \_ ->
+                RE.evalR RE.emptyREnv
+                    (RCase (RInt 2)
+                        [ ( IR.RPInt 1, RString "one" )
+                        , ( IR.RPWildcard, RString "other" )
+                        ]
+                    )
+                    |> expectValue (String "other")
+        , test "RPVar binds the scrutinee" <|
+            \_ ->
+                -- case 42 of x -> x
+                -- In the branch body, RLocal 0 = x = 42.
+                RE.evalR RE.emptyREnv
+                    (RCase (RInt 42)
+                        [ ( IR.RPVar, RLocal 0 ) ]
+                    )
+                    |> expectValue (Int 42)
+        , test "tuple pattern destructures" <|
+            \_ ->
+                -- case (1, 2) of (a, b) -> b
+                -- In the branch: locals = [b, a, ...]. RLocal 0 = b = 2.
+                RE.evalR RE.emptyREnv
+                    (RCase (RTuple2 (RInt 1) (RInt 2))
+                        [ ( IR.RPTuple2 IR.RPVar IR.RPVar, RLocal 0 ) ]
+                    )
+                    |> expectValue (Int 2)
+        , test "constructor pattern with one arg: Just" <|
+            \_ ->
+                -- case (Just 7) of
+                --     Just v -> v
+                --     Nothing -> 0
+                RE.evalR RE.emptyREnv
+                    (RCase
+                        (RApply
+                            (RCtor { moduleName = [ "Maybe" ], name = "Just" })
+                            [ RInt 7 ]
+                        )
+                        [ ( IR.RPCtor
+                                { moduleName = [], name = "Just" }
+                                [ IR.RPVar ]
+                          , RLocal 0
+                          )
+                        , ( IR.RPCtor
+                                { moduleName = [], name = "Nothing" }
+                                []
+                          , RInt 0
+                          )
+                        ]
+                    )
+                    |> expectValue (Int 7)
+        , test "cons pattern: head :: tail" <|
+            \_ ->
+                -- case [1, 2, 3] of
+                --     head :: tail -> head
+                --     [] -> 0
+                RE.evalR RE.emptyREnv
+                    (RCase (RList [ RInt 1, RInt 2, RInt 3 ])
+                        [ ( IR.RPCons IR.RPVar IR.RPVar, RLocal 1 )
+                        , ( IR.RPList [], RInt 0 )
+                        ]
+                    )
+                    |> expectValue (Int 1)
+        , test "empty list pattern" <|
+            \_ ->
+                RE.evalR RE.emptyREnv
+                    (RCase (RList [])
+                        [ ( IR.RPList [], RString "empty" )
+                        , ( IR.RPWildcard, RString "nonempty" )
+                        ]
+                    )
+                    |> expectValue (String "empty")
+        , test "record pattern destructures" <|
+            \_ ->
+                -- case {a=1, b=2} of {a, b} -> a
+                -- Fields sorted alphabetically: locals = [b, a] so a is at RLocal 1.
+                RE.evalR RE.emptyREnv
+                    (RCase
+                        (RRecord [ ( "a", RInt 1 ), ( "b", RInt 2 ) ])
+                        [ ( IR.RPRecord [ "a", "b" ], RLocal 1 ) ]
+                    )
+                    |> expectValue (Int 1)
+        , test "no branch matches: type error" <|
+            \_ ->
+                case
+                    RE.evalR RE.emptyREnv
+                        (RCase (RInt 5)
+                            [ ( IR.RPInt 0, RString "zero" )
+                            , ( IR.RPInt 1, RString "one" )
+                            ]
+                        )
+                of
+                    EvErr { error } ->
+                        case error of
+                            TypeError _ ->
+                                Expect.pass
+
+                            other ->
+                                Expect.fail ("expected TypeError, got " ++ kindToString other)
+
+                    other ->
+                        Expect.fail ("expected EvErr, got " ++ resultToString other)
+        ]
+
+
+recordAccessFunctionTests : Test
+recordAccessFunctionTests =
+    describe "RRecordAccessFunction"
+        [ test ".field applied to a record returns the value" <|
+            \_ ->
+                -- (.x) { x = 10, y = 20 }
+                let
+                    rec =
+                        RRecord [ ( "x", RInt 10 ), ( "y", RInt 20 ) ]
+                in
+                RE.evalR RE.emptyREnv
+                    (RApply (RRecordAccessFunction "x") [ rec ])
+                    |> expectValue (Int 10)
+        ]
+
+
 unsupportedTests : Test
 unsupportedTests =
-    describe "still unsupported in iteration 3b1"
-        [ test "RGlobal returns Unsupported" <|
+    describe "still unsupported after iteration 3b2"
+        [ test "RGlobal returns Unsupported (deferred to Phase 3 wire-up)" <|
             \_ ->
                 expectUnsupported (RGlobal 42)
-        , test "RLambda returns Unsupported" <|
+        , test "RGLSL returns Unsupported (never supported)" <|
             \_ ->
-                expectUnsupported (RLambda { arity = 1, body = RInt 0 })
-        , test "RApply returns Unsupported" <|
-            \_ ->
-                expectUnsupported (RApply (RInt 0) [])
-        , test "RCase returns Unsupported" <|
-            \_ ->
-                expectUnsupported (RCase (RInt 0) [])
-        , test "RCtor returns Unsupported" <|
-            \_ ->
-                expectUnsupported (RCtor { moduleName = [ "Maybe" ], name = "Nothing" })
-        , test "RRecordAccessFunction returns Unsupported" <|
-            \_ ->
-                expectUnsupported (RRecordAccessFunction "x")
+                expectUnsupported (RGLSL "opaque glsl")
         ]
 
 
