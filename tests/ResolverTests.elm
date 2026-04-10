@@ -304,17 +304,15 @@ lambdaTests =
             \_ ->
                 -- `\(a, b) -> a` desugars to `\$_arg0 -> let (a, b) = $_arg0 in a`.
                 --
-                -- The resolver works under the let-rec evaluator model:
-                -- all sibling slots are pre-allocated BEFORE any binding's
-                -- RHS is evaluated. So inside the let-group, locals is
-                -- [b, a, $_arg0, ...outer] at both RHS and body resolution
-                -- time. That means:
-                --   - The binding's RHS ($_arg0) sees $_arg0 at RLocal 2
-                --     (two slots below the pattern bindings).
-                --   - The let body sees `a` at RLocal 1 and `b` at RLocal 0.
+                -- With sequential scoping, the binding's RHS (`$_arg0`) is
+                -- resolved against the outer context (`["$_arg0"]`), so
+                -- `$_arg0` is at RLocal 0. After the pattern match, the
+                -- let body sees locals = [b, a, $_arg0, ...outer], so
+                -- `a` is at RLocal 1.
                 --
-                -- Phase 3's evaluator will honor this by pre-allocating
-                -- placeholder slots that get filled as bindings evaluate.
+                -- Phase 3's sequential evaluator will honor this by
+                -- evaluating each binding's RHS and prepending the
+                -- pattern's bindings to the locals stack in order.
                 expectResolvesTo "\\( a, b ) -> a"
                     (RLambda
                         { arity = 1
@@ -322,7 +320,7 @@ lambdaTests =
                             RLet
                                 [ { pattern = RPTuple2 RPVar RPVar
                                   , arity = 0
-                                  , body = RLocal 2
+                                  , body = RLocal 0
                                   , debugName = "a"
                                   }
                                 ]
@@ -338,7 +336,7 @@ lambdaTests =
                             RLet
                                 [ { pattern = RPTuple2 RPVar RPVar
                                   , arity = 0
-                                  , body = RLocal 2
+                                  , body = RLocal 0
                                   , debugName = "a"
                                   }
                                 ]
@@ -491,9 +489,14 @@ letTests =
         , test "multiple bindings (later sees earlier)" <|
             \_ ->
                 -- let x = 1; y = x in y
-                -- Slots: x = RLocal 1 (outer), y = RLocal 0 (inner)
-                -- Each binding's body resolves against locals = [y, x, ...outer]
-                -- So `x` in y's body is RLocal 1, and `y` in the final expression is RLocal 0.
+                --
+                -- With sequential scoping:
+                --   * x's RHS is resolved against []. Result: RInt 1.
+                --     After: extendedLocals = ["x"].
+                --   * y's RHS is resolved against ["x"]. `x` is at slot 0.
+                --     After: extendedLocals = ["y", "x"].
+                --   * The let body `y` is resolved against ["y", "x"].
+                --     `y` is at slot 0.
                 expectResolvesTo "let\n        x = 1\n        y = x\n    in\n    y"
                     (RLet
                         [ { pattern = RPVar
@@ -503,7 +506,7 @@ letTests =
                           }
                         , { pattern = RPVar
                           , arity = 0
-                          , body = RLocal 1
+                          , body = RLocal 0
                           , debugName = "y"
                           }
                         ]

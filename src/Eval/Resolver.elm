@@ -548,16 +548,26 @@ resolveLet :
     -> Expression.LetBlock
     -> Result ResolveError RExpr
 resolveLet ctx letBlock =
-    -- Let bindings are treated as a mutually-visible group: all siblings are
-    -- in scope for all bodies AND for the final expression. This matches
-    -- Elm's semantics for mutually-recursive function definitions; value
-    -- bindings cannot reference themselves by construction (the type checker
-    -- already enforced that).
-    let
-        resolved =
-            collectLetBindings ctx letBlock.declarations
-    in
-    resolved
+    -- Let bindings use sequential scoping with self-recursion for function
+    -- bindings. Concretely, when resolving binding N:
+    --
+    --   * Value bindings (arity 0) see only bindings 0..N-1 — they cannot
+    --     reference themselves or later siblings. This matches Elm's
+    --     semantics: `let x = x in ...` is a type error.
+    --
+    --   * Function bindings (arity > 0) see bindings 0..N-1 PLUS themselves,
+    --     so single-binding self-recursion (`let fact n = ... fact (n-1)
+    --     in ...`) works. Full MUTUAL recursion of sibling function
+    --     bindings is NOT supported here — Phase 3 will revisit this when
+    --     closures arrive and the evaluator can pre-allocate slots.
+    --
+    -- The let BODY sees every binding, exactly like the pre-body
+    -- `extendedLocals` produced by the fold.
+    --
+    -- This sequential shape is consistent with a pure-Elm evaluator that
+    -- evaluates bindings in order and prepends each result to the locals
+    -- stack — no placeholder slot patching needed.
+    collectLetBindings ctx letBlock.declarations
         |> Result.andThen
             (\{ bindings, extendedLocals } ->
                 let
@@ -575,120 +585,92 @@ collectLetBindings :
     -> List (Node LetDeclaration)
     -> Result ResolveError { bindings : List IR.RLetBinding, extendedLocals : List String }
 collectLetBindings ctx declarations =
-    -- Two-pass approach:
-    --
-    -- Pass 1: walk declarations in order, resolve each pattern to determine
-    --         the slot shape, and prepend bindings to an accumulating
-    --         localNames. This produces the "extended" context that every
-    --         binding body (and the final expression) will use.
-    --
-    -- Pass 2: resolve each binding's body against the extended context.
-    --         Function bodies are wrapped in RLambda here — the resolver
-    --         treats `let f x = ...` as sugar for `let f = \x -> ...`.
+    -- Single-pass fold: for each let declaration, resolve its RHS against
+    -- the CURRENT extendedLocals (which has previous siblings in scope),
+    -- then prepend the binding's pattern bindings to extendedLocals for
+    -- subsequent bindings and the let body.
     declarations
         |> List.foldl
-            (\(Node _ decl) acc ->
-                case acc of
+            (\(Node _ decl) accResult ->
+                case accResult of
                     Err e ->
                         Err e
 
                     Ok state ->
                         case decl of
                             LetFunction { declaration } ->
-                                let
-                                    impl =
-                                        Node.value declaration
-
-                                    name =
-                                        Node.value impl.name
-                                in
-                                Ok
-                                    { state
-                                        | skeletons =
-                                            { pattern = RPVar
-                                            , patternBindings = [ name ]
-                                            , arguments = impl.arguments
-                                            , body = impl.expression
-                                            , debugName = name
-                                            }
-                                                :: state.skeletons
-                                        , extendedLocals = name :: state.extendedLocals
-                                    }
+                                resolveLetFunction ctx state (Node.value declaration)
 
                             LetDestructuring patternNode bodyNode ->
-                                resolvePattern ctx patternNode
-                                    |> Result.map
-                                        (\{ resolved, bindings } ->
-                                            { state
-                                                | skeletons =
-                                                    { pattern = resolved
-                                                    , patternBindings = bindings
-                                                    , arguments = []
-                                                    , body = bodyNode
-                                                    , debugName = firstBindingName bindings
-                                                    }
-                                                        :: state.skeletons
-                                                , extendedLocals = prependBindings bindings state.extendedLocals
-                                            }
-                                        )
+                                resolveLetValue ctx state patternNode bodyNode
             )
-            (Ok { skeletons = [], extendedLocals = ctx.localNames })
-        |> Result.andThen
-            (\{ skeletons, extendedLocals } ->
-                let
-                    innerCtx : ResolverContext
-                    innerCtx =
-                        { ctx | localNames = extendedLocals }
-                in
-                skeletons
-                    -- skeletons was built with foldl which reverses, so
-                    -- reverse back to source order before resolving bodies.
-                    |> List.reverse
-                    |> List.foldr
-                        (\skeleton bindingsAcc ->
-                            Result.map2 (::)
-                                (resolveLetBody innerCtx skeleton)
-                                bindingsAcc
-                        )
-                        (Ok [])
-                    |> Result.map
-                        (\bindings ->
-                            { bindings = bindings, extendedLocals = extendedLocals }
-                        )
+            (Ok { bindings = [], extendedLocals = ctx.localNames })
+        |> Result.map
+            (\state ->
+                { bindings = List.reverse state.bindings
+                , extendedLocals = state.extendedLocals
+                }
             )
 
 
-type alias LetSkeleton =
-    { pattern : RPattern
-    , patternBindings : List String
-    , arguments : List (Node Pattern)
-    , body : Node Expression
-    , debugName : String
+type alias LetFoldState =
+    { bindings : List IR.RLetBinding
+    , extendedLocals : List String
     }
 
 
-resolveLetBody : ResolverContext -> LetSkeleton -> Result ResolveError IR.RLetBinding
-resolveLetBody ctx skeleton =
-    case skeleton.arguments of
+resolveLetFunction :
+    ResolverContext
+    -> LetFoldState
+    -> Expression.FunctionImplementation
+    -> Result ResolveError LetFoldState
+resolveLetFunction ctx state impl =
+    let
+        name : String
+        name =
+            Node.value impl.name
+    in
+    case impl.arguments of
         [] ->
-            -- Plain value binding: body is resolved as-is, arity = 0.
-            resolveExpression ctx skeleton.body
+            -- Zero-argument function declaration is really a value binding.
+            -- Elm's parser produces LetFunction for `let f = expr` because
+            -- every `f = expr` is a "function declaration" in the grammar.
+            -- Resolve it without self-rec scoping — values can't self-ref.
+            let
+                bodyCtx : ResolverContext
+                bodyCtx =
+                    { ctx | localNames = state.extendedLocals }
+            in
+            resolveExpression bodyCtx impl.expression
                 |> Result.map
                     (\body ->
-                        { pattern = skeleton.pattern
-                        , arity = 0
-                        , body = body
-                        , debugName = skeleton.debugName
+                        { bindings =
+                            { pattern = RPVar
+                            , arity = 0
+                            , body = body
+                            , debugName = name
+                            }
+                                :: state.bindings
+                        , extendedLocals = name :: state.extendedLocals
                         }
                     )
 
         args ->
-            -- Function binding: the LetFunction `let f p1 p2 = body in ...`
-            -- is semantically `let f = \p1 p2 -> body in ...`. Reuse the
-            -- lambda path so non-trivial patterns get the same desugaring.
+            -- Real function declaration (arity > 0). The body is a lambda,
+            -- and the function gets to see its own name for self-recursion.
+            -- Rewrite non-trivial parameter patterns to the same form
+            -- resolveLambda uses, then resolve the body with the lambda's
+            -- parameter slots on top of the self-recursive binding slot.
             let
                 ( rewrittenArgs, rewrittenBody ) =
-                    desugarLambdaParams args skeleton.body
+                    desugarLambdaParams args impl.expression
+
+                -- Self-rec scope: name is visible in its own body. Added
+                -- BEFORE the lambda's parameters so parameters shadow it
+                -- if they share a name (matches Elm's shadowing rules).
+                selfRecExtendedLocals : List String
+                selfRecExtendedLocals =
+                    name :: state.extendedLocals
             in
             resolvePatterns ctx rewrittenArgs
                 |> Result.andThen
@@ -696,22 +678,61 @@ resolveLetBody ctx skeleton =
                         let
                             lambdaCtx : ResolverContext
                             lambdaCtx =
-                                { ctx | localNames = prependBindings bindings ctx.localNames }
+                                { ctx | localNames = prependBindings bindings selfRecExtendedLocals }
                         in
                         resolveExpression lambdaCtx rewrittenBody
                             |> Result.map
                                 (\body ->
-                                    { pattern = skeleton.pattern
-                                    , arity = List.length rewrittenArgs
-                                    , body =
-                                        RLambda
-                                            { arity = List.length rewrittenArgs
-                                            , body = body
-                                            }
-                                    , debugName = skeleton.debugName
+                                    { bindings =
+                                        { pattern = RPVar
+                                        , arity = List.length rewrittenArgs
+                                        , body =
+                                            RLambda
+                                                { arity = List.length rewrittenArgs
+                                                , body = body
+                                                }
+                                        , debugName = name
+                                        }
+                                            :: state.bindings
+                                    , extendedLocals = name :: state.extendedLocals
                                     }
                                 )
                     )
+
+
+resolveLetValue :
+    ResolverContext
+    -> LetFoldState
+    -> Node Pattern
+    -> Node Expression
+    -> Result ResolveError LetFoldState
+resolveLetValue ctx state patternNode bodyNode =
+    -- Destructuring let binding: `let (a, b) = rhs in ...`. The RHS is
+    -- resolved against state.extendedLocals (previous siblings only —
+    -- values cannot reference themselves). After resolving, the pattern's
+    -- bindings are prepended to extendedLocals for subsequent bindings.
+    resolvePattern ctx patternNode
+        |> Result.andThen
+            (\{ resolved, bindings } ->
+                let
+                    bodyCtx : ResolverContext
+                    bodyCtx =
+                        { ctx | localNames = state.extendedLocals }
+                in
+                resolveExpression bodyCtx bodyNode
+                    |> Result.map
+                        (\body ->
+                            { bindings =
+                                { pattern = resolved
+                                , arity = 0
+                                , body = body
+                                , debugName = firstBindingName bindings
+                                }
+                                    :: state.bindings
+                            , extendedLocals = prependBindings bindings state.extendedLocals
+                            }
+                        )
+            )
 
 
 firstBindingName : List String -> String
