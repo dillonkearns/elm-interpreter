@@ -20,6 +20,7 @@ import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Environment
 import Eval.Expression
+import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedExpression as RE
 import Eval.ResolvedIR as IR
 import Eval.Resolver as Resolver
@@ -196,6 +197,9 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                     , globals = Dict.empty
                     , resolvedBodies = projectEnv.resolved.bodies
                     , globalIdToName = projectEnv.resolved.globalIdToName
+                    , nativeDispatchers =
+                        NativeDispatch.buildRegistry
+                            (\key -> Dict.get key projectEnv.resolved.globalIds)
                     , fallbackEnv = projectEnv.env
                     , fallbackConfig = dispatchConfig
                     , currentModule = [ "ResolvedEntry" ]

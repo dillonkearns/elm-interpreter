@@ -38,6 +38,7 @@ import Elm.Syntax.Node as Node exposing (Node)
 import Elm.Syntax.Pattern exposing (QualifiedNameRef)
 import Environment
 import Eval.Expression
+import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedIR as IR exposing (RExpr(..))
 import FastDict
 import MemoSpec
@@ -81,6 +82,7 @@ type alias REnv =
     , globals : FastDict.Dict IR.GlobalId Value
     , resolvedBodies : FastDict.Dict IR.GlobalId RExpr
     , globalIdToName : FastDict.Dict IR.GlobalId ( ModuleName, String )
+    , nativeDispatchers : FastDict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
     , fallbackEnv : Env
     , fallbackConfig : Config
     , currentModule : ModuleName
@@ -103,6 +105,7 @@ emptyREnv =
     , globals = FastDict.empty
     , resolvedBodies = FastDict.empty
     , globalIdToName = FastDict.empty
+    , nativeDispatchers = FastDict.empty
     , fallbackEnv = Environment.empty []
     , fallbackConfig = emptyConfig
     , currentModule = []
@@ -375,11 +378,11 @@ evalR env expr =
             EvOk (makeClosure env lambda.arity lambda.body 0 Nothing)
 
         RApply headExpr argExprs ->
-            -- Fast path for core-backed globals: evaluate the args in the
-            -- new evaluator, then delegate the whole call to the old
-            -- evaluator via a synthesized `Application` AST. This
-            -- sidesteps the problem of representing old-style closures
-            -- in the new evaluator's apply loop.
+            -- Fast path for core-backed globals: evaluate the args, then
+            -- either dispatch natively (via the NativeDispatch registry,
+            -- which covers the ~15 hottest core functions) or delegate
+            -- the whole call to the old evaluator via a synthesized
+            -- `Application` AST.
             case headExpr of
                 RGlobal id ->
                     case FastDict.get id env.globals of
@@ -404,11 +407,19 @@ evalR env expr =
                                             )
 
                                 Nothing ->
-                                    -- Core dispatch: delegate the whole call.
+                                    -- Core dispatch: try the native
+                                    -- dispatcher registry first to avoid
+                                    -- the Value.toExpression + synthesized
+                                    -- AST round-trip for hot functions.
                                     evalExprList env argExprs
                                         |> andThenList
                                             (\argValues ->
-                                                delegateCoreApply env id argValues
+                                                case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
+                                                    Just result ->
+                                                        EvOk result
+
+                                                    Nothing ->
+                                                        delegateCoreApply env id argValues
                                             )
 
                 _ ->
