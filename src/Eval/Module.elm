@@ -72,7 +72,20 @@ type alias ResolvedProject =
     , bodies : Dict.Dict IR.GlobalId IR.RExpr
     , globalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
     , nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+    , kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
     , errors : List ResolveErrorEntry
+    }
+
+
+{-| A precomputed direct-dispatch entry for a core function whose body is
+a simple kernel reference (the common "wrapper" pattern in `Core.Basics`,
+`Core.String`, etc.). At delegation time, the evaluator calls the kernel
+function directly with the applied args + Config + Env, skipping the
+Value.toExpression + synthesized AST round-trip.
+-}
+type alias KernelDispatcher =
+    { arity : Int
+    , kernelFn : List Value -> Types.Config -> Env -> EvalResult Value
     }
 
 
@@ -89,6 +102,7 @@ emptyResolvedProject =
     , bodies = Dict.empty
     , globalIdToName = Dict.empty
     , nativeDispatchers = Dict.empty
+    , kernelDispatchers = Dict.empty
     , errors = []
     }
 
@@ -100,6 +114,32 @@ through its own code path inside this module.
 projectEnvResolved : ProjectEnv -> ResolvedProject
 projectEnvResolved (ProjectEnv projectEnv) =
     projectEnv.resolved
+
+
+{-| Detect the "direct kernel wrapper" pattern in a Core-module
+FunctionImplementation: the body is a bare `FunctionOrValue
+["Elm", "Kernel", ModuleName, ...] name`, with no arguments on the
+wrapper itself. Returns `Just (kernelModuleName, kernelName)` when
+the pattern matches.
+
+This catches most of `Core.Basics.*`, `Core.String.*`, `Core.Char.*`,
+etc. where the wrapper is just a pass-through to the kernel. Core
+functions with non-kernel bodies (like `List.map` implemented as a
+fold in Elm) don't match and are handled via regular delegation.
+
+-}
+extractKernelReference : Elm.Syntax.Expression.FunctionImplementation -> Maybe ( ModuleName, String )
+extractKernelReference impl =
+    if List.isEmpty impl.arguments then
+        case Node.value impl.expression of
+            FunctionOrValue (("Elm" :: "Kernel" :: _) as kernelModuleName) kernelName ->
+                Just ( kernelModuleName, kernelName )
+
+            _ ->
+                Nothing
+
+    else
+        Nothing
 
 
 {-| Evaluate a top-level expression via the new resolved-IR evaluator.
@@ -200,6 +240,7 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                     , resolvedBodies = projectEnv.resolved.bodies
                     , globalIdToName = projectEnv.resolved.globalIdToName
                     , nativeDispatchers = projectEnv.resolved.nativeDispatchers
+                    , kernelDispatchers = projectEnv.resolved.kernelDispatchers
                     , fallbackEnv = projectEnv.env
                     , fallbackConfig = dispatchConfig
                     , currentModule = [ "ResolvedEntry" ]
@@ -335,6 +376,55 @@ resolveProject summaries =
             NativeDispatch.buildRegistry
                 (\key -> Dict.get key globalIds)
 
+        -- Build the kernel dispatcher registry by walking Core.functions
+        -- and finding entries whose body is a direct kernel reference
+        -- (the common "wrapper" pattern). For each such entry, precompute
+        -- the (arity, kernelFn) tuple so the new evaluator can call the
+        -- kernel function directly at delegation time, skipping the
+        -- AST synthesis round-trip.
+        kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
+        kernelDispatchers =
+            Core.functions
+                |> Dict.foldl
+                    (\coreModuleName moduleDict outer ->
+                        moduleDict
+                            |> Dict.foldl
+                                (\funcName impl acc ->
+                                    case extractKernelReference impl of
+                                        Just ( kernelModuleName, kernelName ) ->
+                                            let
+                                                kernelModuleKey : String
+                                                kernelModuleKey =
+                                                    Environment.moduleKey kernelModuleName
+                                            in
+                                            case Dict.get kernelModuleKey Eval.Expression.kernelFunctions of
+                                                Just kernelModule ->
+                                                    case Dict.get kernelName kernelModule of
+                                                        Just ( arity, kernelFn ) ->
+                                                            case Dict.get ( coreModuleName, funcName ) globalIds of
+                                                                Just id ->
+                                                                    Dict.insert id
+                                                                        { arity = arity
+                                                                        , kernelFn = kernelFn
+                                                                        }
+                                                                        acc
+
+                                                                Nothing ->
+                                                                    acc
+
+                                                        Nothing ->
+                                                            acc
+
+                                                Nothing ->
+                                                    acc
+
+                                        Nothing ->
+                                            acc
+                                )
+                                outer
+                    )
+                    Dict.empty
+
         -- Pass 2: resolve each user declaration's body against the full
         -- globalIds map. Accumulate successes in `bodies` and failures
         -- in `errors`. Either way, keep going — a failure here is not
@@ -345,6 +435,7 @@ resolveProject summaries =
             , bodies = Dict.empty
             , globalIdToName = globalIdToName
             , nativeDispatchers = nativeDispatchers
+            , kernelDispatchers = kernelDispatchers
             , errors = []
             }
     in

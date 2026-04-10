@@ -1,4 +1,4 @@
-module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs)
+module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs, kernelFunctions)
 
 import Array
 import Bitwise

@@ -83,6 +83,11 @@ type alias REnv =
     , resolvedBodies : FastDict.Dict IR.GlobalId RExpr
     , globalIdToName : FastDict.Dict IR.GlobalId ( ModuleName, String )
     , nativeDispatchers : FastDict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+    , kernelDispatchers :
+        FastDict.Dict IR.GlobalId
+            { arity : Int
+            , kernelFn : List Value -> Config -> Env -> EvalResult Value
+            }
     , fallbackEnv : Env
     , fallbackConfig : Config
     , currentModule : ModuleName
@@ -106,6 +111,7 @@ emptyREnv =
     , resolvedBodies = FastDict.empty
     , globalIdToName = FastDict.empty
     , nativeDispatchers = FastDict.empty
+    , kernelDispatchers = FastDict.empty
     , fallbackEnv = Environment.empty []
     , fallbackConfig = emptyConfig
     , currentModule = []
@@ -720,6 +726,31 @@ expected call site.
 -}
 delegateCoreApply : REnv -> IR.GlobalId -> List Value -> EvalResult Value
 delegateCoreApply env id args =
+    -- Kernel fast path: if this GlobalId is a pre-resolved direct kernel
+    -- wrapper, call the kernel function directly with the args, skipping
+    -- the Value.toExpression + synthesized Application + evalExpression
+    -- round-trip entirely. This covers most of Basics.*, String.*,
+    -- Char.*, etc. — wherever the Core module wrapper is just a
+    -- pass-through to `Elm.Kernel.*`.
+    case FastDict.get id env.kernelDispatchers of
+        Just dispatcher ->
+            if List.length args == dispatcher.arity then
+                dispatcher.kernelFn args env.fallbackConfig env.fallbackEnv
+
+            else
+                -- Partial or over-application of a kernel function:
+                -- fall back to the general delegation path, which
+                -- constructs a PartiallyApplied value via the old
+                -- evaluator's usual machinery. Uncommon for hot
+                -- operators since they're arity-2.
+                delegateViaAst env id args
+
+        Nothing ->
+            delegateViaAst env id args
+
+
+delegateViaAst : REnv -> IR.GlobalId -> List Value -> EvalResult Value
+delegateViaAst env id args =
     case FastDict.get id env.globalIdToName of
         Nothing ->
             evErr env
