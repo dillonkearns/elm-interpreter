@@ -238,6 +238,7 @@ functions evalFunction =
     , ( [ "List" ]
       , [ ( "range", two int int to anyList Kernel.List.range Core.List.range )
         , ( "append", two anyList anyList to anyList Kernel.List.append Core.List.append )
+        , ( "map", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.map Core.List.map )
         , ( "foldl", threeWithError (function2 evalFunction anything anything to anything) anything anyList to anything Kernel.List.foldl Core.List.foldl )
         , ( "foldr", threeWithError (function2 evalFunction anything anything to anything) anything anyList to anything Kernel.List.foldr Core.List.foldr )
         , ( "filter", twoWithError (function evalFunction anything to bool) anyList to anyList Kernel.List.filter Core.List.filter )
@@ -652,6 +653,39 @@ jsArray selector =
     }
 
 
+{-| Selector that extracts a "callable" from any function-typed `Value`
+the interpreter can produce.
+
+**IMPORTANT for anyone adding kernel wrappers or new selectors:** there
+are *two* Value representations a user can legitimately pass as a
+function, and this selector (and anything analogous) MUST handle both:
+
+1.  `PartiallyApplied` — anonymous lambdas, top-level functions, let
+    bindings, any closure produced by `evalFunction` /
+    `mkPartiallyApplied`.
+
+2.  `Custom ref customArgs` — a partially-applied *type constructor*
+    (`Node Range.emptyRange`, `Just`, `Tuple.pair 1`, etc.). These show
+    up whenever user code passes a constructor as a higher-order
+    argument, e.g.
+    `xs |> List.map (Node Range.emptyRange)`. The interpreter stores
+    this the same way a fully-applied constructor is stored — as
+    `Custom ref [Range.emptyRange]` — because `evalApplication` treats
+    Custom application as "just append the new arg to the args list"
+    (see `evalApplication`'s `Custom name customArgs ->` branch in
+    `Eval/Expression.elm`).
+
+Missing the `Custom` branch was the root cause of the `List.map`
+shortcut correctness bug fixed in round 7 — `Review.ModuleNameLookupTable.Compute`
+calls `List.map (Node Range.emptyRange) …`, which silently failed with
+a type error ("Expected first argument to be anything -> anything, got
+Node {…}") before the error was swallowed by
+`runProjectRulesFresh`'s error-to-string path.
+
+When in doubt, cross-reference this selector with
+`Kernel.Json.applyFunction`, which is the other place in the codebase
+that goes "Value → callable" and has always handled both branches.
+-}
 function :
     EvalFunction
     -> OutSelector from xf
@@ -681,6 +715,33 @@ function evalFunctionWith inSelector _ outSelector =
                                                             ++ " to "
                                                             ++ outSelector.name
                                     )
+                        )
+
+                Custom ref customArgs ->
+                    -- Constructor partial application: `Node Range.emptyRange`
+                    -- is stored as `Custom { ..., name = "Node" } [Range.emptyRange]`.
+                    -- When used as a higher-order function (e.g. `List.map (Node
+                    -- Range.emptyRange) xs`), applying it to one more argument
+                    -- must produce `Custom ref (customArgs ++ [arg])` — the same
+                    -- behavior `evalApplication`'s Custom branch implements.
+                    Just
+                        (\arg _ env ->
+                            let
+                                newValue : Value
+                                newValue =
+                                    Custom ref (customArgs ++ [ inSelector.toValue arg ])
+                            in
+                            case outSelector.fromValue newValue of
+                                Just ov ->
+                                    EvalResult.succeed ov
+
+                                Nothing ->
+                                    EvalResult.fail <|
+                                        typeError env <|
+                                            "Could not convert constructor output "
+                                                ++ Value.toString newValue
+                                                ++ " to "
+                                                ++ outSelector.name
                         )
 
                 _ ->
