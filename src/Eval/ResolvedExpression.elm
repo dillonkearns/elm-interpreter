@@ -53,15 +53,15 @@ import Types
 `locals` is a cons-list of already-bound values; `RLocal i` evaluates to
 `List.drop i env.locals |> List.head`. The head is the innermost binding.
 
-`globals` holds pre-computed top-level values. Phase 3 iteration 3b will
-populate this lazily (evaluate a top-level's RExpr body the first time
-its `RGlobal` is encountered, cache the result). Iteration 3a doesn't
-touch it.
+`globals` holds pre-computed top-level values. Phase 3 iteration 3b3
+populates this lazily — the first time an `RGlobal` is encountered, its
+body is evaluated and the result is cached for subsequent lookups.
+(Returned via the EvalResult stream so the caller can thread the update.)
 
 `resolvedBodies` is the map from `GlobalId` to the resolved `RExpr` body
 the resolver produced at `buildProjectEnv` time. The evaluator reaches
 into this when an `RGlobal id` reference needs to evaluate an unresolved
-top-level.
+top-level that isn't cached yet.
 
 `currentModule` and `callStack` are bookkeeping for error messages and
 eventual tracing integration, matching the fields on the existing
@@ -78,7 +78,7 @@ type alias REnv =
 
 
 {-| A completely empty REnv useful for literal-only tests. Real callers
-will build one from a `ProjectEnv` in Phase 3 iteration 3b.
+build one from a `ProjectEnv` via `Eval.Module.evalWithResolvedIR`.
 -}
 emptyREnv : REnv
 emptyREnv =
@@ -375,11 +375,8 @@ evalR env expr =
                     Nothing
                 )
 
-        -- Everything below is "not implemented in iteration 3b2" — Phase 3
-        -- wire-up (3b3) adds RGlobal dispatch into the project env's
-        -- resolved bodies map.
-        RGlobal _ ->
-            evErr env (Unsupported "RGlobal (iteration 3b3 — wire-up)")
+        RGlobal id ->
+            evalGlobal env id
 
         RGLSL _ ->
             evErr env (Unsupported "RGLSL (not supported)")
@@ -568,6 +565,66 @@ prependRepeated n value list =
 
     else
         prependRepeated (n - 1) value (value :: list)
+
+
+
+-- GLOBALS
+
+
+{-| Evaluate a top-level reference.
+
+Iteration 3b3 supports **user declarations only** — GlobalIds that the
+resolver produced for declarations in the project's user modules and
+stored in `env.resolvedBodies`. Core declarations (`Basics.add`,
+`List.map`, etc.) are deliberately left as `Unsupported` so tests and
+benchmarks are forced to notice when they hit the boundary. A follow-up
+iteration (3b4 or later) will add a delegation path that dispatches core
+calls through the existing string-keyed evaluator for interoperation.
+
+The evaluation happens against a **fresh locals stack** (`[]`) because
+top-level declarations don't close over any runtime locals — everything
+they reference is either another global or a binder inside their own
+body. This matches how the string-keyed evaluator populates
+`currentModuleFunctions` / `letFunctions` for calls into top-level
+declarations.
+
+Memoized top-levels (`env.globals`) are checked before the body is
+evaluated; a hit returns immediately. Iteration 3b3 does NOT write to
+`env.globals` after a miss — threading cache updates through the
+`EvalResult` stream requires the same plumbing the memoization system
+already uses, and that's deferred until we wire the `useResolvedIR`
+flag into `Eval.Module`'s actual entry points in a later iteration.
+
+-}
+evalGlobal : REnv -> IR.GlobalId -> EvalResult Value
+evalGlobal env id =
+    case FastDict.get id env.globals of
+        Just cached ->
+            EvOk cached
+
+        Nothing ->
+            case FastDict.get id env.resolvedBodies of
+                Just body ->
+                    let
+                        topLevelEnv : REnv
+                        topLevelEnv =
+                            { env | locals = [] }
+                    in
+                    evalR topLevelEnv body
+
+                Nothing ->
+                    -- Not resolved and not cached. In iteration 3b3 this
+                    -- means it's a core declaration (the resolver stores
+                    -- user bodies only). Returning Unsupported is the
+                    -- signal to a future delegation layer that this is
+                    -- where it needs to bridge to the old evaluator.
+                    evErr env
+                        (Unsupported
+                            ("RGlobal "
+                                ++ String.fromInt id
+                                ++ " not in resolvedBodies (core call — Phase 3 core-dispatch wire-up deferred)"
+                            )
+                        )
 
 
 

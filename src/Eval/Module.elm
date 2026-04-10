@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, projectEnvResolved, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, projectEnvResolved, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Bitwise
 import Core
@@ -20,6 +20,7 @@ import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Environment
 import Eval.Expression
+import Eval.ResolvedExpression as RE
 import Eval.ResolvedIR as IR
 import Eval.Resolver as Resolver
 import FastDict as Dict
@@ -88,12 +89,145 @@ emptyResolvedProject =
 
 
 {-| Accessor for the resolver output attached to a ProjectEnv. Mostly for
-tests and diagnostics — Phase 3's evaluator will reach into this directly
+tests and diagnostics — Phase 3's evaluator reaches into this directly
 through its own code path inside this module.
 -}
 projectEnvResolved : ProjectEnv -> ResolvedProject
 projectEnvResolved (ProjectEnv projectEnv) =
     projectEnv.resolved
+
+
+{-| Evaluate a top-level expression via the new resolved-IR evaluator.
+
+This is Phase 3 iteration 3b3's wire-up entry point. It:
+
+1.  Parses the expression source string into an `Elm.Syntax.Expression`.
+2.  Resolves it against the project's `globalIds` map, producing an
+    `RExpr` that has every reference rewritten to `RLocal`/`RGlobal`/
+    `RCtor`.
+3.  Builds an `REnv` from the project's resolved bodies.
+4.  Calls `Eval.ResolvedExpression.evalR` and returns the result.
+
+Iteration 3b3 only supports expressions that touch **user declarations**
+in the project env — references to core functions (like `+` or
+`List.map`) still return an `Unsupported` error because the new
+evaluator's core-dispatch bridge is deferred. See
+`Eval.ResolvedExpression.evalGlobal` for the error pattern.
+
+The caller is expected to compose this with the existing
+`evalWithEnvFromFiles` for any expression that requires the old path —
+there's no automatic fallback in 3b3.
+
+-}
+evalWithResolvedIR : ProjectEnv -> String -> Result Error Value
+evalWithResolvedIR (ProjectEnv projectEnv) expressionSource =
+    let
+        -- Wrap the expression source in a throwaway module with a single
+        -- declaration so we can reuse `Elm.Parser.parseToFile`. The entry
+        -- name uses a `$`-free lowercase identifier to stay valid Elm.
+        wrappedSource : String
+        wrappedSource =
+            "module ResolvedEntry exposing (..)\n\nentry =\n    " ++ expressionSource
+    in
+    case Elm.Parser.parseToFile wrappedSource of
+        Err deadEnds ->
+            Err (ParsingError deadEnds)
+
+        Ok file ->
+            case file.declarations of
+                [ Node _ (Elm.Syntax.Declaration.FunctionDeclaration func) ] ->
+                    let
+                        impl :
+                            { name : Node String
+                            , arguments : List (Node Elm.Syntax.Pattern.Pattern)
+                            , expression : Node Expression
+                            }
+                        impl =
+                            Node.value func.declaration
+
+                        resolverCtx : Resolver.ResolverContext
+                        resolverCtx =
+                            Resolver.initContext
+                                [ "ResolvedEntry" ]
+                                projectEnv.resolved.globalIds
+                    in
+                    case Resolver.resolveExpression resolverCtx impl.expression of
+                        Err resolveError ->
+                            Err
+                                (EvalError
+                                    { currentModule = [ "ResolvedEntry" ]
+                                    , callStack = []
+                                    , error =
+                                        Types.Unsupported
+                                            ("resolver error: " ++ resolverErrorToString resolveError)
+                                    }
+                                )
+
+                        Ok rexpr ->
+                            let
+                                renv : RE.REnv
+                                renv =
+                                    { locals = []
+                                    , globals = Dict.empty
+                                    , resolvedBodies = projectEnv.resolved.bodies
+                                    , currentModule = [ "ResolvedEntry" ]
+                                    , callStack = []
+                                    }
+                            in
+                            case RE.evalR renv rexpr of
+                                EvOk value ->
+                                    Ok value
+
+                                EvErr errorData ->
+                                    Err (EvalError errorData)
+
+                                _ ->
+                                    Err
+                                        (EvalError
+                                            { currentModule = [ "ResolvedEntry" ]
+                                            , callStack = []
+                                            , error =
+                                                Types.Unsupported
+                                                    "EvalResult with trace/yield/memo — not supported through evalWithResolvedIR yet"
+                                            }
+                                        )
+
+                _ ->
+                    Err
+                        (EvalError
+                            { currentModule = [ "ResolvedEntry" ]
+                            , callStack = []
+                            , error = Types.Unsupported "expected one function declaration in entry wrapper"
+                            }
+                        )
+
+
+resolverErrorToString : Resolver.ResolveError -> String
+resolverErrorToString err =
+    case err of
+        Resolver.UnknownName { moduleName, name } ->
+            let
+                qualified : String
+                qualified =
+                    if List.isEmpty moduleName then
+                        name
+
+                    else
+                        String.join "." moduleName ++ "." ++ name
+            in
+            "unknown name " ++ qualified
+
+        Resolver.UnknownOperator op ->
+            "unknown operator " ++ op
+
+        Resolver.UnsupportedExpression msg ->
+            "unsupported expression: " ++ msg
+
+        Resolver.InvalidRecordUpdateTarget name ->
+            "invalid record update target: " ++ name
+
+        Resolver.UnexpectedTupleArity n ->
+            "unexpected tuple arity: " ++ String.fromInt n
 
 
 {-| Walk every declaration — core and user — to assign `GlobalId`s, then
@@ -214,14 +348,14 @@ eval : String -> Expression -> Result Error Value
 eval source expression =
     let
         ( result, _, _ ) =
-            traceOrEvalModule { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False } source expression
+            traceOrEvalModule { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } source expression
     in
     result
 
 
 trace : String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 trace source expression =
-    traceOrEvalModule { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False } source expression
+    traceOrEvalModule { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } source expression
 
 
 traceOrEvalModule : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
@@ -634,7 +768,7 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                                { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -718,7 +852,7 @@ evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles ex
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                        { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -829,6 +963,7 @@ evalWithEnvFromFilesAndMemo (ProjectEnv projectEnv) additionalFiles memoizedFunc
                 , intercepts = Dict.empty
                 , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                 , collectMemoStats = collectMemoStats
+                , useResolvedIR = False
                 }
                 finalEnv
                 |> driveInternalMemo
@@ -934,7 +1069,7 @@ evalWithEnvFromFilesAndValues (ProjectEnv projectEnv) additionalFiles injectedVa
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                        { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -1038,6 +1173,7 @@ evalWithEnvFromFilesAndValuesAndMemo (ProjectEnv projectEnv) additionalFiles inj
                 , intercepts = Dict.empty
                 , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                 , collectMemoStats = collectMemoStats
+                , useResolvedIR = False
                 }
                 finalEnv
                 |> driveInternalMemo
@@ -1453,6 +1589,7 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw (ProjectEnv projectEnv) add
                 , intercepts = intercepts
                 , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                 , collectMemoStats = False
+                , useResolvedIR = False
                 }
                 finalEnv
 
@@ -1563,6 +1700,7 @@ evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expressi
                                 , intercepts = intercepts
                                 , memoizedFunctions = MemoSpec.emptyRegistry
                                 , collectMemoStats = False
+                                , useResolvedIR = False
                                 }
                                 finalEnv
                                 |> EvalResult.toResult
@@ -1699,6 +1837,7 @@ evalWithInterceptsAndMemoRaw (ProjectEnv projectEnv) additionalSources intercept
                         , intercepts = intercepts
                         , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                         , collectMemoStats = False
+                        , useResolvedIR = False
                         }
                         finalEnv
 
@@ -1837,7 +1976,7 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         evalResult =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                                { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
                                 finalEnv
 
                         ( result, callTrees, logLines ) =
@@ -2212,7 +2351,7 @@ evalProject sources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                                { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
                                 finalEnv
                                 |> EvalResult.toResult
                     in

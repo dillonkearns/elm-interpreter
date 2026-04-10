@@ -47,6 +47,7 @@ type alias Config =
     , intercepts : Dict String Intercept
     , memoizedFunctions : MemoSpec.Registry
     , collectMemoStats : Bool
+    , useResolvedIR : Bool
     }
 
 

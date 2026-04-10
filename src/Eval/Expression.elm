@@ -1975,11 +1975,11 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
 
                             else
                                 -- Not tail-recursive: clear tcoTarget
-                                Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, newEnv )
+                                Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, newEnv )
 
                         Nothing ->
                             -- No tcoTarget: skip qualifiedNameToString for tcoKey
@@ -1993,7 +1993,7 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
 
                             else
                                 -- Common case: not TCO, no tcoTarget — pass cfg as-is
@@ -2005,7 +2005,7 @@ call maybeQualifiedName implementation cfg env =
                         Recursion.recurse ( expr, cfg, env )
 
                     else
-                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, env )
+                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, env )
 
         KernelImpl moduleName name f ->
             if cfg.trace then
@@ -2265,6 +2265,7 @@ tcoLoop funcName body remaining cfg env =
             , intercepts = cfg.intercepts
             , memoizedFunctions = cfg.memoizedFunctions
             , collectMemoStats = cfg.collectMemoStats
+            , useResolvedIR = cfg.useResolvedIR
             }
     in
     tcoLoopHelp funcName body remaining 0 0 0 0 innerCfg cfg env
