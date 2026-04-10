@@ -71,6 +71,7 @@ type alias ResolvedProject =
     { globalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
     , bodies : Dict.Dict IR.GlobalId IR.RExpr
     , globalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
+    , nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
     , errors : List ResolveErrorEntry
     }
 
@@ -87,6 +88,7 @@ emptyResolvedProject =
     { globalIds = Dict.empty
     , bodies = Dict.empty
     , globalIdToName = Dict.empty
+    , nativeDispatchers = Dict.empty
     , errors = []
     }
 
@@ -197,9 +199,7 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                     , globals = Dict.empty
                     , resolvedBodies = projectEnv.resolved.bodies
                     , globalIdToName = projectEnv.resolved.globalIdToName
-                    , nativeDispatchers =
-                        NativeDispatch.buildRegistry
-                            (\key -> Dict.get key projectEnv.resolved.globalIds)
+                    , nativeDispatchers = projectEnv.resolved.nativeDispatchers
                     , fallbackEnv = projectEnv.env
                     , fallbackConfig = dispatchConfig
                     , currentModule = [ "ResolvedEntry" ]
@@ -325,6 +325,16 @@ resolveProject summaries =
                     (\key id acc -> Dict.insert id key acc)
                     Dict.empty
 
+        -- Build the native dispatcher registry once per project env. The
+        -- registry maps a handful of hot core-function GlobalIds to
+        -- direct `List Value -> Maybe Value` dispatchers so the new
+        -- evaluator can skip the Value.toExpression + synthesized AST
+        -- delegation path for common operators.
+        nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+        nativeDispatchers =
+            NativeDispatch.buildRegistry
+                (\key -> Dict.get key globalIds)
+
         -- Pass 2: resolve each user declaration's body against the full
         -- globalIds map. Accumulate successes in `bodies` and failures
         -- in `errors`. Either way, keep going — a failure here is not
@@ -334,6 +344,7 @@ resolveProject summaries =
             { globalIds = globalIds
             , bodies = Dict.empty
             , globalIdToName = globalIdToName
+            , nativeDispatchers = nativeDispatchers
             , errors = []
             }
     in
