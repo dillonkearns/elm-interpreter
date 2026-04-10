@@ -34,6 +34,7 @@ suite =
         , singleModuleSmoke
         , multiModuleSmoke
         , noErrorsForBasicProgram
+        , broadLanguageCoverage
         ]
 
 
@@ -235,6 +236,199 @@ pipeline n =
 
                     else
                         Expect.fail ("resolver failed on: " ++ errorSummary)
+
+                Err err ->
+                    Expect.fail (errToString err)
+
+
+broadLanguageCoverage : Test
+broadLanguageCoverage =
+    test "a broad language-coverage fixture resolves with zero errors" <|
+        \_ ->
+            -- This fixture is intentionally dense — every construct here
+            -- should survive the resolver, and any addition to this test
+            -- should come with a confirmation that the parser produces the
+            -- expected AST. If the resolver ever regresses on one of these
+            -- constructs, the test's error list pinpoints the specific
+            -- declaration.
+            let
+                src =
+                    """module BigFixture exposing (..)
+
+type Tree a
+    = Leaf
+    | Node (Tree a) a (Tree a)
+
+
+type alias Person =
+    { name : String
+    , age : Int
+    , friends : List String
+    }
+
+
+insert : comparable -> Tree comparable -> Tree comparable
+insert value tree =
+    case tree of
+        Leaf ->
+            Node Leaf value Leaf
+
+        Node left x right ->
+            if value < x then
+                Node (insert value left) x right
+
+            else if value > x then
+                Node left x (insert value right)
+
+            else
+                tree
+
+
+toList : Tree a -> List a
+toList tree =
+    case tree of
+        Leaf ->
+            []
+
+        Node left x right ->
+            toList left ++ (x :: toList right)
+
+
+greet : Person -> String
+greet { name, age } =
+    \"Hello, \" ++ name ++ \"! You are \" ++ String.fromInt age ++ \" years old.\"
+
+
+birthday : Person -> Person
+birthday person =
+    { person | age = person.age + 1 }
+
+
+addFriend : String -> Person -> Person
+addFriend friend person =
+    { person | friends = friend :: person.friends }
+
+
+pairUp : List a -> List b -> List ( a, b )
+pairUp xs ys =
+    case ( xs, ys ) of
+        ( [], _ ) ->
+            []
+
+        ( _, [] ) ->
+            []
+
+        ( x :: xrest, y :: yrest ) ->
+            ( x, y ) :: pairUp xrest yrest
+
+
+foldr : (a -> b -> b) -> b -> List a -> b
+foldr f acc list =
+    case list of
+        [] ->
+            acc
+
+        head :: rest ->
+            f head (foldr f acc rest)
+
+
+map : (a -> b) -> List a -> List b
+map f list =
+    foldr (\\x acc -> f x :: acc) [] list
+
+
+maybeMap2 : (a -> b -> c) -> Maybe a -> Maybe b -> Maybe c
+maybeMap2 f ma mb =
+    case ( ma, mb ) of
+        ( Just a, Just b ) ->
+            Just (f a b)
+
+        _ ->
+            Nothing
+
+
+type Result err ok
+    = Err err
+    | Ok ok
+
+
+andThen : (a -> Result err b) -> Result err a -> Result err b
+andThen f result =
+    case result of
+        Ok value ->
+            f value
+
+        Err e ->
+            Err e
+
+
+pipeline : Int -> String
+pipeline n =
+    n
+        |> (+) 1
+        |> String.fromInt
+        |> (\\s -> \"n+1 = \" ++ s)
+
+
+complexLet : Int -> Int
+complexLet n =
+    let
+        doubled =
+            n * 2
+
+        tripled =
+            n * 3
+
+        sumOfBoth =
+            doubled + tripled
+
+        quadrupled x =
+            x * 4
+    in
+    quadrupled sumOfBoth
+
+
+destructuringLet : ( Int, Int ) -> Int
+destructuringLet pair =
+    let
+        ( a, b ) =
+            pair
+    in
+    a + b
+
+
+lambdaInsideLambda : Int -> Int -> Int
+lambdaInsideLambda x =
+    \\y -> x + y
+
+
+higherOrder : (Int -> Int) -> (Int -> Int) -> Int -> Int
+higherOrder f g n =
+    f (g n)
+"""
+            in
+            case Eval.Module.buildProjectEnv [ src ] of
+                Ok projectEnv ->
+                    let
+                        resolved =
+                            Eval.Module.projectEnvResolved projectEnv
+
+                        errorDescriptions : List String
+                        errorDescriptions =
+                            resolved.errors
+                                |> List.map (\e -> e.name)
+                    in
+                    if List.isEmpty errorDescriptions then
+                        -- Also spot-check that we resolved something. A
+                        -- silent "zero errors because we resolved zero
+                        -- declarations" would pass the error check but
+                        -- isn't what we want.
+                        FastDict.size resolved.bodies
+                            |> Expect.atLeast 15
+
+                    else
+                        Expect.fail
+                            ("resolver failed on: " ++ String.join ", " errorDescriptions)
 
                 Err err ->
                     Expect.fail (errToString err)
