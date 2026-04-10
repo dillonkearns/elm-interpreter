@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, projectEnvResolved, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, projectEnvResolved, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Bitwise
 import Core
@@ -122,11 +122,11 @@ there's no automatic fallback in 3b3.
 
 -}
 evalWithResolvedIR : ProjectEnv -> String -> Result Error Value
-evalWithResolvedIR (ProjectEnv projectEnv) expressionSource =
+evalWithResolvedIR projectEnv expressionSource =
     let
         -- Wrap the expression source in a throwaway module with a single
         -- declaration so we can reuse `Elm.Parser.parseToFile`. The entry
-        -- name uses a `$`-free lowercase identifier to stay valid Elm.
+        -- name uses a lowercase identifier to stay valid Elm.
         wrappedSource : String
         wrappedSource =
             "module ResolvedEntry exposing (..)\n\nentry =\n    " ++ expressionSource
@@ -138,76 +138,8 @@ evalWithResolvedIR (ProjectEnv projectEnv) expressionSource =
         Ok file ->
             case file.declarations of
                 [ Node _ (Elm.Syntax.Declaration.FunctionDeclaration func) ] ->
-                    let
-                        impl :
-                            { name : Node String
-                            , arguments : List (Node Elm.Syntax.Pattern.Pattern)
-                            , expression : Node Expression
-                            }
-                        impl =
-                            Node.value func.declaration
-
-                        resolverCtx : Resolver.ResolverContext
-                        resolverCtx =
-                            Resolver.initContext
-                                [ "ResolvedEntry" ]
-                                projectEnv.resolved.globalIds
-                    in
-                    case Resolver.resolveExpression resolverCtx impl.expression of
-                        Err resolveError ->
-                            Err
-                                (EvalError
-                                    { currentModule = [ "ResolvedEntry" ]
-                                    , callStack = []
-                                    , error =
-                                        Types.Unsupported
-                                            ("resolver error: " ++ resolverErrorToString resolveError)
-                                    }
-                                )
-
-                        Ok rexpr ->
-                            let
-                                dispatchConfig : Types.Config
-                                dispatchConfig =
-                                    { trace = False
-                                    , maxSteps = Nothing
-                                    , tcoTarget = Nothing
-                                    , callCounts = Nothing
-                                    , intercepts = Dict.empty
-                                    , memoizedFunctions = MemoSpec.emptyRegistry
-                                    , collectMemoStats = False
-                                    , useResolvedIR = False
-                                    }
-
-                                renv : RE.REnv
-                                renv =
-                                    { locals = []
-                                    , globals = Dict.empty
-                                    , resolvedBodies = projectEnv.resolved.bodies
-                                    , globalIdToName = projectEnv.resolved.globalIdToName
-                                    , fallbackEnv = projectEnv.env
-                                    , fallbackConfig = dispatchConfig
-                                    , currentModule = [ "ResolvedEntry" ]
-                                    , callStack = []
-                                    }
-                            in
-                            case RE.evalR renv rexpr of
-                                EvOk value ->
-                                    Ok value
-
-                                EvErr errorData ->
-                                    Err (EvalError errorData)
-
-                                _ ->
-                                    Err
-                                        (EvalError
-                                            { currentModule = [ "ResolvedEntry" ]
-                                            , callStack = []
-                                            , error =
-                                                Types.Unsupported
-                                                    "EvalResult with trace/yield/memo — not supported through evalWithResolvedIR yet"
-                                            }
-                                        )
+                    evalWithResolvedIRExpression projectEnv
+                        (Node.value (Node.value func.declaration).expression)
 
                 _ ->
                     Err
@@ -215,6 +147,76 @@ evalWithResolvedIR (ProjectEnv projectEnv) expressionSource =
                             { currentModule = [ "ResolvedEntry" ]
                             , callStack = []
                             , error = Types.Unsupported "expected one function declaration in entry wrapper"
+                            }
+                        )
+
+
+{-| Like `evalWithResolvedIR`, but takes a pre-parsed `Expression` AST
+instead of a source string. Used by benchmarks and any caller that
+already has an AST, to avoid the per-call parse overhead.
+-}
+evalWithResolvedIRExpression : ProjectEnv -> Expression -> Result Error Value
+evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
+    let
+        resolverCtx : Resolver.ResolverContext
+        resolverCtx =
+            Resolver.initContext
+                [ "ResolvedEntry" ]
+                projectEnv.resolved.globalIds
+    in
+    case Resolver.resolveExpression resolverCtx (fakeNode expression) of
+        Err resolveError ->
+            Err
+                (EvalError
+                    { currentModule = [ "ResolvedEntry" ]
+                    , callStack = []
+                    , error =
+                        Types.Unsupported
+                            ("resolver error: " ++ resolverErrorToString resolveError)
+                    }
+                )
+
+        Ok rexpr ->
+            let
+                dispatchConfig : Types.Config
+                dispatchConfig =
+                    { trace = False
+                    , maxSteps = Nothing
+                    , tcoTarget = Nothing
+                    , callCounts = Nothing
+                    , intercepts = Dict.empty
+                    , memoizedFunctions = MemoSpec.emptyRegistry
+                    , collectMemoStats = False
+                    , useResolvedIR = False
+                    }
+
+                renv : RE.REnv
+                renv =
+                    { locals = []
+                    , globals = Dict.empty
+                    , resolvedBodies = projectEnv.resolved.bodies
+                    , globalIdToName = projectEnv.resolved.globalIdToName
+                    , fallbackEnv = projectEnv.env
+                    , fallbackConfig = dispatchConfig
+                    , currentModule = [ "ResolvedEntry" ]
+                    , callStack = []
+                    }
+            in
+            case RE.evalR renv rexpr of
+                EvOk value ->
+                    Ok value
+
+                EvErr errorData ->
+                    Err (EvalError errorData)
+
+                _ ->
+                    Err
+                        (EvalError
+                            { currentModule = [ "ResolvedEntry" ]
+                            , callStack = []
+                            , error =
+                                Types.Unsupported
+                                    "EvalResult with trace/yield/memo — not supported through evalWithResolvedIR yet"
                             }
                         )
 
