@@ -99,18 +99,25 @@ type RExpr
 
 {-| A single binding inside an `RLet`.
 
-`arity` is `0` for simple value bindings and `> 0` for function bindings whose
-body is wrapped in an `RLambda`. Storing the arity explicitly lets the
-evaluator decide whether the binding produces a thunk (arity 0 — needs to be
-evaluated at binding time) or a closure (arity > 0 — value is the lambda).
+`pattern` is `RPVar` for the common case (`let x = ...`, `let f a b = ...`)
+and a composite pattern for destructuring lets (`let (a, b) = pair`). The
+evaluator uses the pattern's slot count to determine how many local slots the
+binding introduces.
+
+`arity` is `0` for simple value bindings and destructuring lets, and `> 0` for
+function bindings whose body is wrapped in an `RLambda`. Storing the arity
+explicitly lets the evaluator decide whether the binding produces a thunk
+(arity 0 — needs to be evaluated at binding time) or a closure (arity > 0 —
+value is the lambda).
 
 `debugName` is carried for error messages but is **not** part of the canonical
-form — two bindings with identical `body` and `arity` but different
+form — two bindings with identical `pattern`/`arity`/`body` but different
 `debugName` should be treated as equal by any future content-addressing pass.
 
 -}
 type alias RLetBinding =
-    { arity : Int
+    { pattern : RPattern
+    , arity : Int
     , body : RExpr
     , debugName : String
     }

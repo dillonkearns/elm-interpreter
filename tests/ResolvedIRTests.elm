@@ -156,12 +156,17 @@ constructionTests =
 
                     _ ->
                         Expect.fail "expected RLambda"
-        , test "let binding construction" <|
+        , test "let binding construction (simple value)" <|
             \_ ->
                 let
                     expr =
                         IR.RLet
-                            [ { arity = 0, body = IR.RInt 1, debugName = "x" } ]
+                            [ { pattern = IR.RPVar
+                              , arity = 0
+                              , body = IR.RInt 1
+                              , debugName = "x"
+                              }
+                            ]
                             (IR.RLocal 0)
                 in
                 case expr of
@@ -171,6 +176,19 @@ constructionTests =
 
                     _ ->
                         Expect.fail "expected RLet"
+        , test "let binding construction (destructuring)" <|
+            \_ ->
+                -- `let (a, b) = pair in a + b` — pattern binds 2 slots.
+                -- The body's view of locals: [b, a, ...outer] (b innermost).
+                let
+                    binding =
+                        { pattern = IR.RPTuple2 IR.RPVar IR.RPVar
+                        , arity = 0
+                        , body = IR.RLocal 0
+                        , debugName = "$destructure"
+                        }
+                in
+                IR.slotCount binding.pattern |> Expect.equal 2
         , test "case expression with two branches" <|
             \_ ->
                 let
