@@ -872,7 +872,11 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             continuation value
 
                         Nothing ->
-                            -- Then check currentModuleFunctions (module-level functions)
+                            -- Then check currentModuleFunctions (module-level functions).
+                            -- Top-level module functions never close over caller locals,
+                            -- so use the `callModuleFn` variants that zero out `values` and
+                            -- `letFunctions` on the stored env — keeps the PA's captured
+                            -- dict tiny and saves downstream Dict work on every call.
                             case Dict.get name env.currentModuleFunctions of
                                 Just function ->
                                     if List.isEmpty function.arguments then
@@ -882,10 +886,10 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                         continuation
                                             (PartiallyApplied
                                                 (if cfg.trace then
-                                                    Environment.call env.currentModule name env
+                                                    Environment.callModuleFn env.currentModule name env
 
                                                  else
-                                                    Environment.callNoStack env.currentModule name env
+                                                    Environment.callModuleFnNoStack env.currentModule name env
                                                 )
                                                 []
                                                 function.arguments
@@ -2569,12 +2573,14 @@ evalUnqualifiedAfterLocalMiss name cfg env =
                 qualifiedNameRef =
                     { moduleName = env.currentModule, name = name }
 
+                -- Top-level module function: zero out caller locals in the PA's
+                -- captured env (see `Environment.callModuleFn` docs).
                 callFn =
                     if cfg.trace then
-                        Environment.call
+                        Environment.callModuleFn
 
                     else
-                        Environment.callNoStack
+                        Environment.callModuleFnNoStack
             in
             if List.isEmpty function.arguments then
                 call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
@@ -2634,12 +2640,14 @@ evalQualifiedOrVariant moduleName name cfg env =
                                 qualifiedNameRef =
                                     { moduleName = env.currentModule, name = name }
 
+                                -- Top-level module function: trim caller locals
+                                -- out of the PA's captured env.
                                 callFn =
                                     if cfg.trace then
-                                        Environment.call
+                                        Environment.callModuleFn
 
                                     else
-                                        Environment.callNoStack
+                                        Environment.callModuleFnNoStack
                             in
                             if List.isEmpty function.arguments then
                                 call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
@@ -2670,8 +2678,11 @@ evalQualifiedOrVariantSlow moduleName name cfg env =
                     call (Just { moduleName = resolvedModule, name = name }) (AstImpl function.expression) cfg env
 
                 else
+                    -- Record alias constructor — its body is a RecordExpr that
+                    -- only references its own parameters, so it's safe to trim
+                    -- caller locals out of the PA's stored env.
                     PartiallyApplied
-                        (Environment.call resolvedModule name env)
+                        (Environment.callModuleFn resolvedModule name env)
                         []
                         function.arguments
                         (Just { moduleName = resolvedModule, name = name })
@@ -2883,7 +2894,10 @@ evalNonVariant moduleName name cfg env =
                                     { moduleName = resolvedModule, name = name }
                             in
                             if resolvedModuleKey == env.currentModuleKey then
-                                -- Same module: keep local values, use existing caches
+                                -- Same module: trim caller locals out of the stored
+                                -- env for the same reason the cross-module branch
+                                -- below does — a top-level module function's body
+                                -- never references caller-site locals.
                                 if List.isEmpty function.arguments then
                                     call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
 
@@ -2891,10 +2905,10 @@ evalNonVariant moduleName name cfg env =
                                     let
                                         callFn =
                                             if cfg.trace then
-                                                Environment.call
+                                                Environment.callModuleFn
 
                                             else
-                                                Environment.callNoStack
+                                                Environment.callModuleFnNoStack
                                     in
                                     PartiallyApplied
                                         (callFn resolvedModule name env)
