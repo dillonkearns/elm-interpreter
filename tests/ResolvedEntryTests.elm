@@ -25,11 +25,13 @@ import Types exposing (Error(..), EvalErrorKind(..), Value(..))
 
 suite : Test
 suite =
-    describe "Eval.Module.evalWithResolvedIR (Phase 3 iter 3b3 wire-up)"
+    describe "Eval.Module.evalWithResolvedIR"
         [ literalWireUp
         , userDeclarationDispatch
         , constructorCase
-        , coreDispatchStillUnsupported
+        , coreOperatorDispatch
+        , coreFunctionDispatch
+        , mixedUserAndCore
         ]
 
 
@@ -118,32 +120,69 @@ wrapped =
                     Expect.fail "buildProjectEnv failed"
 
 
-{-| An expression that tries to use a core function (`+`) still returns
-`Unsupported` — core dispatch is the next iteration. This test documents
-the current boundary and will need to be updated (or deleted) once
-core-dispatch wire-up lands.
+{-| Core operator delegation. `1 + 2` resolves to
+`RApply (RGlobal Basics.add-id) [RInt 1, RInt 2]`. Since the resolver
+stores no body for `Basics.add` (it's a core decl), the new evaluator's
+RApply fast path delegates the whole call to the old evaluator via a
+synthesized `Application` AST.
 -}
-coreDispatchStillUnsupported : Test
-coreDispatchStillUnsupported =
-    test "expression using a core operator returns Unsupported" <|
+coreOperatorDispatch : Test
+coreOperatorDispatch =
+    test "core operator (+) delegates to the old evaluator" <|
         \_ ->
             case Eval.Module.buildProjectEnv [] of
                 Ok projectEnv ->
-                    case Eval.Module.evalWithResolvedIR projectEnv "1 + 2" of
-                        Err (EvalError { error }) ->
-                            case error of
-                                Unsupported _ ->
-                                    Expect.pass
+                    Eval.Module.evalWithResolvedIR projectEnv "1 + 2"
+                        |> expectValue (Int 3)
 
-                                other ->
-                                    Expect.fail
-                                        ("expected Unsupported, got " ++ Debug.toString other)
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
 
-                        Err other ->
-                            Expect.fail ("expected EvalError, got " ++ Debug.toString other)
 
-                        Ok v ->
-                            Expect.fail ("expected Err, got Ok " ++ Debug.toString v)
+{-| Core function delegation. `List.map ((*) 2) [1, 2, 3]` exercises a
+higher-order core function with a closure argument. The closure is a
+core-backed `PartiallyApplied` value which the old evaluator handles
+natively.
+-}
+coreFunctionDispatch : Test
+coreFunctionDispatch =
+    test "List.map with literal list via core delegation" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "List.sum [ 1, 2, 3, 4 ]"
+                        |> expectValue (Int 10)
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+{-| Mixes user declarations with core function calls. `Foo.doubled`
+references a user decl which itself calls `Basics.*`. This exercises
+both paths in the same pipeline.
+-}
+mixedUserAndCore : Test
+mixedUserAndCore =
+    test "user declaration that calls core functions" <|
+        \_ ->
+            let
+                source : String
+                source =
+                    """module Foo exposing (..)
+
+base : Int
+base =
+    10
+
+doubled : Int
+doubled =
+    base + base
+"""
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Foo.doubled"
+                        |> expectValue (Int 20)
 
                 Err _ ->
                     Expect.fail "buildProjectEnv failed"

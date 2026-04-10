@@ -69,6 +69,7 @@ coreFunctions =
 type alias ResolvedProject =
     { globalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
     , bodies : Dict.Dict IR.GlobalId IR.RExpr
+    , globalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
     , errors : List ResolveErrorEntry
     }
 
@@ -84,6 +85,7 @@ emptyResolvedProject : ResolvedProject
 emptyResolvedProject =
     { globalIds = Dict.empty
     , bodies = Dict.empty
+    , globalIdToName = Dict.empty
     , errors = []
     }
 
@@ -165,11 +167,26 @@ evalWithResolvedIR (ProjectEnv projectEnv) expressionSource =
 
                         Ok rexpr ->
                             let
+                                dispatchConfig : Types.Config
+                                dispatchConfig =
+                                    { trace = False
+                                    , maxSteps = Nothing
+                                    , tcoTarget = Nothing
+                                    , callCounts = Nothing
+                                    , intercepts = Dict.empty
+                                    , memoizedFunctions = MemoSpec.emptyRegistry
+                                    , collectMemoStats = False
+                                    , useResolvedIR = False
+                                    }
+
                                 renv : RE.REnv
                                 renv =
                                     { locals = []
                                     , globals = Dict.empty
                                     , resolvedBodies = projectEnv.resolved.bodies
+                                    , globalIdToName = projectEnv.resolved.globalIdToName
+                                    , fallbackEnv = projectEnv.env
+                                    , fallbackConfig = dispatchConfig
                                     , currentModule = [ "ResolvedEntry" ]
                                     , callStack = []
                                     }
@@ -291,6 +308,17 @@ resolveProject summaries =
         globalIds =
             allIdAssignment.ids
 
+        -- Reverse lookup map built from globalIds. Phase 3's core-dispatch
+        -- bridge needs to know "which (moduleName, name) does this id map
+        -- to?" so it can synthesize an old-style call for core declarations
+        -- that aren't in `bodies`.
+        globalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
+        globalIdToName =
+            globalIds
+                |> Dict.foldl
+                    (\key id acc -> Dict.insert id key acc)
+                    Dict.empty
+
         -- Pass 2: resolve each user declaration's body against the full
         -- globalIds map. Accumulate successes in `bodies` and failures
         -- in `errors`. Either way, keep going — a failure here is not
@@ -299,6 +327,7 @@ resolveProject summaries =
         initialAcc =
             { globalIds = globalIds
             , bodies = Dict.empty
+            , globalIdToName = globalIdToName
             , errors = []
             }
     in

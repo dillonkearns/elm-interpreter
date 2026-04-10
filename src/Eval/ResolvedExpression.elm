@@ -32,20 +32,28 @@ supported here never produce those.
 
 -}
 
+import Elm.Syntax.Expression as Expression
 import Elm.Syntax.ModuleName exposing (ModuleName)
+import Elm.Syntax.Node as Node exposing (Node)
 import Elm.Syntax.Pattern exposing (QualifiedNameRef)
 import Environment
+import Eval.Expression
 import Eval.ResolvedIR as IR exposing (RExpr(..))
 import FastDict
+import MemoSpec
 import Rope
+import Syntax
 import Types
     exposing
-        ( EvalErrorData
+        ( Config
+        , Env
+        , EvalErrorData
         , EvalErrorKind(..)
         , EvalResult(..)
         , Implementation(..)
         , Value(..)
         )
+import Value
 
 
 {-| Evaluator context for the resolved IR.
@@ -72,6 +80,9 @@ type alias REnv =
     { locals : List Value
     , globals : FastDict.Dict IR.GlobalId Value
     , resolvedBodies : FastDict.Dict IR.GlobalId RExpr
+    , globalIdToName : FastDict.Dict IR.GlobalId ( ModuleName, String )
+    , fallbackEnv : Env
+    , fallbackConfig : Config
     , currentModule : ModuleName
     , callStack : List QualifiedNameRef
     }
@@ -79,14 +90,36 @@ type alias REnv =
 
 {-| A completely empty REnv useful for literal-only tests. Real callers
 build one from a `ProjectEnv` via `Eval.Module.evalWithResolvedIR`.
+
+The `fallbackEnv` is a completely empty `Env` with no core or user
+functions — that's fine for the literal/closure tests this is used
+for, because they never hit the core-dispatch path. Tests that need
+core dispatch build their own `REnv` with a real project env.
+
 -}
 emptyREnv : REnv
 emptyREnv =
     { locals = []
     , globals = FastDict.empty
     , resolvedBodies = FastDict.empty
+    , globalIdToName = FastDict.empty
+    , fallbackEnv = Environment.empty []
+    , fallbackConfig = emptyConfig
     , currentModule = []
     , callStack = []
+    }
+
+
+emptyConfig : Config
+emptyConfig =
+    { trace = False
+    , maxSteps = Nothing
+    , tcoTarget = Nothing
+    , callCounts = Nothing
+    , intercepts = FastDict.empty
+    , memoizedFunctions = MemoSpec.emptyRegistry
+    , collectMemoStats = False
+    , useResolvedIR = False
     }
 
 
@@ -342,15 +375,52 @@ evalR env expr =
             EvOk (makeClosure env lambda.arity lambda.body 0 Nothing)
 
         RApply headExpr argExprs ->
-            evalR env headExpr
-                |> andThenValue
-                    (\headValue ->
-                        evalExprList env argExprs
-                            |> andThenList
-                                (\argValues ->
-                                    applyClosure env headValue argValues
-                                )
-                    )
+            -- Fast path for core-backed globals: evaluate the args in the
+            -- new evaluator, then delegate the whole call to the old
+            -- evaluator via a synthesized `Application` AST. This
+            -- sidesteps the problem of representing old-style closures
+            -- in the new evaluator's apply loop.
+            case headExpr of
+                RGlobal id ->
+                    case FastDict.get id env.globals of
+                        Just cached ->
+                            evalExprList env argExprs
+                                |> andThenList
+                                    (\argValues ->
+                                        applyClosure env cached argValues
+                                    )
+
+                        Nothing ->
+                            case FastDict.get id env.resolvedBodies of
+                                Just _ ->
+                                    evalR env headExpr
+                                        |> andThenValue
+                                            (\headValue ->
+                                                evalExprList env argExprs
+                                                    |> andThenList
+                                                        (\argValues ->
+                                                            applyClosure env headValue argValues
+                                                        )
+                                            )
+
+                                Nothing ->
+                                    -- Core dispatch: delegate the whole call.
+                                    evalExprList env argExprs
+                                        |> andThenList
+                                            (\argValues ->
+                                                delegateCoreApply env id argValues
+                                            )
+
+                _ ->
+                    evalR env headExpr
+                        |> andThenValue
+                            (\headValue ->
+                                evalExprList env argExprs
+                                    |> andThenList
+                                        (\argValues ->
+                                            applyClosure env headValue argValues
+                                        )
+                            )
 
         RCtor ref ->
             evalConstructor ref
@@ -613,18 +683,72 @@ evalGlobal env id =
                     evalR topLevelEnv body
 
                 Nothing ->
-                    -- Not resolved and not cached. In iteration 3b3 this
-                    -- means it's a core declaration (the resolver stores
-                    -- user bodies only). Returning Unsupported is the
-                    -- signal to a future delegation layer that this is
-                    -- where it needs to bridge to the old evaluator.
-                    evErr env
-                        (Unsupported
-                            ("RGlobal "
-                                ++ String.fromInt id
-                                ++ " not in resolvedBodies (core call — Phase 3 core-dispatch wire-up deferred)"
+                    -- Core declaration — delegate a zero-arg reference to
+                    -- the old evaluator. Used for things like `Basics.pi`
+                    -- (a value, not a function) and for taking a core
+                    -- function reference without immediately applying it.
+                    delegateCoreApply env id []
+
+
+{-| Delegate a core declaration call to the old evaluator by synthesizing
+an `Application` AST (or a bare `FunctionOrValue` for zero-arg) and
+calling `Eval.Expression.evalExpression`.
+
+The args are the already-evaluated Values from the new evaluator; they
+get converted back to Expressions via `Value.toExpression` for the
+old evaluator to consume. This is lossy for closures and some other
+compound values, but fine for literals, constructors, records, and
+lists of those — the common arguments to core functions.
+
+The fallback `Env` already has every core function in
+`shared.functions`, so the old evaluator's dispatch just works. The
+`currentModule` on the fallback env is set per-call to the module
+containing the target declaration, so trace output matches the
+expected call site.
+
+-}
+delegateCoreApply : REnv -> IR.GlobalId -> List Value -> EvalResult Value
+delegateCoreApply env id args =
+    case FastDict.get id env.globalIdToName of
+        Nothing ->
+            evErr env
+                (Unsupported
+                    ("RGlobal " ++ String.fromInt id ++ " has no name metadata")
+                )
+
+        Just ( moduleName, name ) ->
+            let
+                headExpr : Node Expression.Expression
+                headExpr =
+                    Syntax.fakeNode (Expression.FunctionOrValue moduleName name)
+
+                fullExpr : Node Expression.Expression
+                fullExpr =
+                    if List.isEmpty args then
+                        headExpr
+
+                    else
+                        Syntax.fakeNode
+                            (Expression.Application
+                                (headExpr :: List.map Value.toExpression args)
                             )
-                        )
+
+                baseEnv : Env
+                baseEnv =
+                    env.fallbackEnv
+
+                dispatchEnv : Env
+                dispatchEnv =
+                    { baseEnv
+                        | currentModule = moduleName
+                        , currentModuleKey = Environment.moduleKey moduleName
+                        , currentModuleFunctions =
+                            FastDict.get (Environment.moduleKey moduleName)
+                                baseEnv.shared.functions
+                                |> Maybe.withDefault FastDict.empty
+                    }
+            in
+            Eval.Expression.evalExpression fullExpr env.fallbackConfig dispatchEnv
 
 
 
