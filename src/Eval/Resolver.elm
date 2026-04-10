@@ -2,6 +2,7 @@ module Eval.Resolver exposing
     ( ResolveError(..)
     , ResolverContext
     , initContext
+    , resolveDeclaration
     , resolveExpression
     , resolvePattern
     )
@@ -46,7 +47,7 @@ resolver treats all let groups as mutually-visible without further analysis.
 -}
 
 import Core
-import Elm.Syntax.Expression as Expression exposing (Expression, LetDeclaration(..))
+import Elm.Syntax.Expression as Expression exposing (Expression, FunctionImplementation, LetDeclaration(..))
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern)
 import Eval.ResolvedIR as IR exposing (GlobalId, RExpr(..), RPattern(..))
@@ -93,6 +94,48 @@ initContext currentModule globalIds =
     , globalIds = globalIds
     , currentModule = currentModule
     }
+
+
+{-| Resolve a top-level function declaration. Treats `let f a b = body in ...`
+-style functions (and top-level declarations with positional arguments) as
+sugar for `\a b -> body`, producing an `RLambda` wrapped IR. For zero-arity
+declarations (plain values) the body is resolved directly.
+
+This is the entry point Phase 2 iteration 2b uses to drive the resolver over
+every user declaration at `buildProjectEnv` time.
+
+-}
+resolveDeclaration :
+    ResolverContext
+    -> FunctionImplementation
+    -> Result ResolveError RExpr
+resolveDeclaration ctx impl =
+    case impl.arguments of
+        [] ->
+            resolveExpression ctx impl.expression
+
+        args ->
+            let
+                ( rewrittenArgs, rewrittenBody ) =
+                    desugarLambdaParams args impl.expression
+            in
+            resolvePatterns ctx rewrittenArgs
+                |> Result.andThen
+                    (\{ bindings } ->
+                        let
+                            innerCtx : ResolverContext
+                            innerCtx =
+                                { ctx | localNames = prependBindings bindings ctx.localNames }
+                        in
+                        resolveExpression innerCtx rewrittenBody
+                            |> Result.map
+                                (\body ->
+                                    RLambda
+                                        { arity = List.length rewrittenArgs
+                                        , body = body
+                                        }
+                                )
+                    )
 
 
 
@@ -406,64 +449,98 @@ desugarLambdaParams :
     -> Node Expression
     -> ( List (Node Pattern), Node Expression )
 desugarLambdaParams args body =
+    -- Every lambda parameter needs to occupy exactly one slot in the runtime
+    -- locals stack, because the evaluator pushes one value per positional
+    -- argument regardless of the parameter pattern. The resolver's context
+    -- has to mirror that, so this desugaring normalizes every parameter to
+    -- a named `VarPattern`:
+    --
+    --   * `VarPattern name` → stays `VarPattern name` (slot = that name)
+    --   * `AllPattern` → `VarPattern "$_wildcardN"` (slot = unreferenceable
+    --     placeholder)
+    --   * Any non-trivial pattern → `VarPattern "$_argN"` plus a
+    --     `let originalPattern = $_argN in ...` wrapping the body so the
+    --     pattern's bindings get pushed on top of the raw-arg slot.
+    --
+    -- Placeholders start with `$` so they can never collide with a
+    -- user-written identifier.
     let
         step :
             ( Int, Node Pattern )
             -> ( List (Node Pattern), Node Expression )
             -> ( List (Node Pattern), Node Expression )
         step ( idx, argNode ) ( accArgs, accBody ) =
-            if isTriviallyBindable argNode then
-                ( argNode :: accArgs, accBody )
+            case classifyLambdaParam argNode of
+                AlreadyNamed ->
+                    ( argNode :: accArgs, accBody )
 
-            else
-                let
-                    placeholder : String
-                    placeholder =
-                        "$_arg" ++ String.fromInt idx
+                WildcardParam ->
+                    let
+                        placeholder : String
+                        placeholder =
+                            "$_wildcard" ++ String.fromInt idx
 
-                    newParam : Node Pattern
-                    newParam =
-                        fakeNode (Pattern.VarPattern placeholder)
+                        newParam : Node Pattern
+                        newParam =
+                            fakeNode (Pattern.VarPattern placeholder)
+                    in
+                    ( newParam :: accArgs, accBody )
 
-                    placeholderRef : Node Expression
-                    placeholderRef =
-                        fakeNode (Expression.FunctionOrValue [] placeholder)
+                NontrivialParam ->
+                    let
+                        placeholder : String
+                        placeholder =
+                            "$_arg" ++ String.fromInt idx
 
-                    letDecl : Node LetDeclaration
-                    letDecl =
-                        fakeNode
-                            (LetDestructuring argNode placeholderRef)
+                        newParam : Node Pattern
+                        newParam =
+                            fakeNode (Pattern.VarPattern placeholder)
 
-                    newBody : Node Expression
-                    newBody =
-                        fakeNode
-                            (Expression.LetExpression
-                                { declarations = [ letDecl ]
-                                , expression = accBody
-                                }
-                            )
-                in
-                ( newParam :: accArgs, newBody )
+                        placeholderRef : Node Expression
+                        placeholderRef =
+                            fakeNode (Expression.FunctionOrValue [] placeholder)
+
+                        letDecl : Node LetDeclaration
+                        letDecl =
+                            fakeNode
+                                (LetDestructuring argNode placeholderRef)
+
+                        newBody : Node Expression
+                        newBody =
+                            fakeNode
+                                (Expression.LetExpression
+                                    { declarations = [ letDecl ]
+                                    , expression = accBody
+                                    }
+                                )
+                    in
+                    ( newParam :: accArgs, newBody )
     in
     args
         |> List.indexedMap (\i a -> ( i, a ))
         |> List.foldr step ( [], body )
 
 
-isTriviallyBindable : Node Pattern -> Bool
-isTriviallyBindable (Node _ pat) =
+type LambdaParamKind
+    = AlreadyNamed
+    | WildcardParam
+    | NontrivialParam
+
+
+classifyLambdaParam : Node Pattern -> LambdaParamKind
+classifyLambdaParam (Node _ pat) =
     case pat of
         Pattern.VarPattern _ ->
-            True
+            AlreadyNamed
 
         Pattern.AllPattern ->
-            True
+            WildcardParam
 
         Pattern.ParenthesizedPattern inner ->
-            isTriviallyBindable inner
+            classifyLambdaParam inner
 
         _ ->
-            False
+            NontrivialParam
 
 
 resolveLet :

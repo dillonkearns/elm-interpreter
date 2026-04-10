@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, projectEnvResolved, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Bitwise
 import Core
@@ -20,6 +20,8 @@ import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Environment
 import Eval.Expression
+import Eval.ResolvedIR as IR
+import Eval.Resolver as Resolver
 import FastDict as Dict
 import List.Extra
 import MemoRuntime
@@ -41,6 +43,171 @@ coreFunctions =
                 Dict.insert (Environment.moduleKey moduleName) moduleDict acc
             )
             Dict.empty
+
+
+{-| Carrier for resolver output attached to a ProjectEnv.
+
+  - `globalIds` is populated with **every** top-level (core + user)
+    (`(ModuleName, name)` → counter id). The resolver uses it to translate
+    qualified references to stable ids, and Phase 3's evaluator will use it
+    to look up pre-resolved bodies.
+
+  - `bodies` holds the resolved `RExpr` for user declarations only. Core
+    declarations get ids (so user code can reference them) but are **not**
+    resolved to RExpr — Phase 3's evaluator will fall back to the existing
+    string-keyed `shared.functions` path for any `RGlobal` id that isn't in
+    `bodies`.
+
+  - `errors` accumulates any `ResolveError` the resolver produced while
+    walking user declarations. The build does **not** fail on resolve
+    errors — the old evaluator still has the original FunctionImplementation
+    and can run the declaration the pre-Phase-2 way. Errors are a signal
+    that the resolver is missing coverage, not a correctness hazard.
+
+-}
+type alias ResolvedProject =
+    { globalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+    , bodies : Dict.Dict IR.GlobalId IR.RExpr
+    , errors : List ResolveErrorEntry
+    }
+
+
+type alias ResolveErrorEntry =
+    { moduleName : ModuleName
+    , name : String
+    , error : Resolver.ResolveError
+    }
+
+
+emptyResolvedProject : ResolvedProject
+emptyResolvedProject =
+    { globalIds = Dict.empty
+    , bodies = Dict.empty
+    , errors = []
+    }
+
+
+{-| Accessor for the resolver output attached to a ProjectEnv. Mostly for
+tests and diagnostics — Phase 3's evaluator will reach into this directly
+through its own code path inside this module.
+-}
+projectEnvResolved : ProjectEnv -> ResolvedProject
+projectEnvResolved (ProjectEnv projectEnv) =
+    projectEnv.resolved
+
+
+{-| Walk every declaration — core and user — to assign `GlobalId`s, then
+walk user declarations again to resolve their bodies to `RExpr`. Core
+bodies are deliberately **not** resolved (they reference kernel functions
+that Phase 3's evaluator handles via a separate dispatch path anyway).
+
+The two-pass structure is essential: pass 1 populates the id table so
+that pass 2 can resolve cross-module references to already-seen
+declarations without running into `UnknownName` errors. Since user code
+frequently references `Basics.add` and friends, the core ids need to be
+available when we resolve user declarations.
+
+-}
+resolveProject : List CachedModuleSummary -> ResolvedProject
+resolveProject summaries =
+    let
+        -- Pass 1a: assign ids to every core declaration. Fold over
+        -- `Core.functions` (the authoritative source) rather than
+        -- coreFunctions (which is keyed by joined module string and
+        -- loses the `ModuleName` shape needed by the resolver context).
+        coreIdAssignment : { next : Int, ids : Dict.Dict ( ModuleName, String ) IR.GlobalId }
+        coreIdAssignment =
+            Core.functions
+                |> Dict.foldl
+                    (\moduleName moduleDict outer ->
+                        moduleDict
+                            |> Dict.foldl
+                                (\name _ inner ->
+                                    { next = inner.next + 1
+                                    , ids = Dict.insert ( moduleName, name ) inner.next inner.ids
+                                    }
+                                )
+                                outer
+                    )
+                    { next = 0, ids = Dict.empty }
+
+        -- Pass 1b: assign ids to every user declaration.
+        allIdAssignment : { next : Int, ids : Dict.Dict ( ModuleName, String ) IR.GlobalId }
+        allIdAssignment =
+            summaries
+                |> List.foldl
+                    (\summary outer ->
+                        summary.functions
+                            |> List.foldl
+                                (\impl inner ->
+                                    let
+                                        name : String
+                                        name =
+                                            Node.value impl.name
+                                    in
+                                    { next = inner.next + 1
+                                    , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
+                                    }
+                                )
+                                outer
+                    )
+                    coreIdAssignment
+
+        globalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+        globalIds =
+            allIdAssignment.ids
+
+        -- Pass 2: resolve each user declaration's body against the full
+        -- globalIds map. Accumulate successes in `bodies` and failures
+        -- in `errors`. Either way, keep going — a failure here is not
+        -- fatal because the old evaluator path still works.
+        initialAcc : ResolvedProject
+        initialAcc =
+            { globalIds = globalIds
+            , bodies = Dict.empty
+            , errors = []
+            }
+    in
+    summaries
+        |> List.foldl
+            (\summary outer ->
+                summary.functions
+                    |> List.foldl
+                        (\impl inner ->
+                            let
+                                name : String
+                                name =
+                                    Node.value impl.name
+
+                                ctx : Resolver.ResolverContext
+                                ctx =
+                                    Resolver.initContext summary.moduleName globalIds
+                            in
+                            case Resolver.resolveDeclaration ctx impl of
+                                Ok rexpr ->
+                                    case Dict.get ( summary.moduleName, name ) inner.globalIds of
+                                        Just id ->
+                                            { inner
+                                                | bodies = Dict.insert id rexpr inner.bodies
+                                            }
+
+                                        Nothing ->
+                                            -- Should be impossible — pass 1 added this entry.
+                                            inner
+
+                                Err err ->
+                                    { inner
+                                        | errors =
+                                            { moduleName = summary.moduleName
+                                            , name = name
+                                            , error = err
+                                            }
+                                                :: inner.errors
+                                    }
+                        )
+                        outer
+            )
+            initialAcc
 
 
 eval : String -> Expression -> Result Error Value
@@ -122,6 +289,7 @@ type ProjectEnv
     = ProjectEnv
         { env : Env
         , allInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        , resolved : ResolvedProject
         }
 
 
@@ -272,6 +440,7 @@ buildProjectEnvFromSummaries summaries =
         (ProjectEnv
             { env = env
             , allInterfaces = allInterfaces
+            , resolved = resolveProject summaries
             }
         )
 
@@ -337,6 +506,7 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
                 ProjectEnv
                     { env = env
                     , allInterfaces = updatedInterfaces
+                    , resolved = projectEnv.resolved
                     }
             )
 
@@ -1572,6 +1742,7 @@ extendWithFiles (ProjectEnv projectEnv) additionalFiles =
                 ProjectEnv
                     { env = env
                     , allInterfaces = allInterfaces
+                    , resolved = projectEnv.resolved
                     }
             )
 
