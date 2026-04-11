@@ -2122,13 +2122,24 @@ Verifies all self-calls are in tail position.
 isTailRecursiveHelper : String -> Node Expression -> Bool
 isTailRecursiveHelper funcName (Node _ expr) =
     case expr of
-        -- If/else: both branches must be tail-safe
-        Expression.IfBlock _ (Node _ trueExpr) (Node _ falseExpr) ->
-            isTailSafe funcName trueExpr && isTailSafe funcName falseExpr
+        -- If/else: the condition is evaluated first (not a tail position),
+        -- so it must not contain any self-calls; then each branch must be
+        -- tail-safe.
+        Expression.IfBlock (Node _ cond) (Node _ trueExpr) (Node _ falseExpr) ->
+            not (containsSelfCall funcName cond)
+                && isTailSafe funcName trueExpr
+                && isTailSafe funcName falseExpr
 
-        -- Case: all branches must be tail-safe
-        Expression.CaseExpression { cases } ->
-            List.all (\( _, Node _ branchExpr ) -> isTailSafe funcName branchExpr) cases
+        -- Case: the scrutinee is evaluated first (not a tail position), so
+        -- it must not contain any self-calls; then every branch body must
+        -- be tail-safe.
+        Expression.CaseExpression { expression, cases } ->
+            let
+                (Node _ scrutinee) =
+                    expression
+            in
+            not (containsSelfCall funcName scrutinee)
+                && List.all (\( _, Node _ branchExpr ) -> isTailSafe funcName branchExpr) cases
 
         -- Let: declarations must NOT contain self-calls (they're not in tail position),
         -- and the body expression (the "in" part) must be tail-recursive
@@ -2165,13 +2176,22 @@ isTailSafe funcName expr =
                 -- Not a self-call: safe only if no self-calls anywhere
                 not (containsSelfCall funcName expr)
 
-        -- If/else: recurse into branches
-        Expression.IfBlock _ (Node _ trueExpr) (Node _ falseExpr) ->
-            isTailSafe funcName trueExpr && isTailSafe funcName falseExpr
+        -- If/else: the condition is evaluated before the branch and is
+        -- not a tail position, so it mustn't contain any self-calls.
+        Expression.IfBlock (Node _ cond) (Node _ trueExpr) (Node _ falseExpr) ->
+            not (containsSelfCall funcName cond)
+                && isTailSafe funcName trueExpr
+                && isTailSafe funcName falseExpr
 
-        -- Case: recurse into all branches
-        Expression.CaseExpression { cases } ->
-            List.all (\( _, Node _ branchExpr ) -> isTailSafe funcName branchExpr) cases
+        -- Case: scrutinee is evaluated first, so a self-call there is NOT
+        -- in tail position. Enforce that before inspecting branches.
+        Expression.CaseExpression { expression, cases } ->
+            let
+                (Node _ scrutinee) =
+                    expression
+            in
+            not (containsSelfCall funcName scrutinee)
+                && List.all (\( _, Node _ branchExpr ) -> isTailSafe funcName branchExpr) cases
 
         -- Let: declarations must not contain self-calls, body must be tail-safe
         Expression.LetExpression { declarations, expression } ->

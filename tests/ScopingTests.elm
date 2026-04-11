@@ -823,6 +823,51 @@ main =
 
                     Ok v ->
                         Expect.fail ("expected TypeError, got Ok " ++ Debug.toString v)
+        , test "self-call in case scrutinee is not a tail position" <|
+            \_ ->
+                -- Reduced from elmcraft/core-extra's `List.Extra.scanr`:
+                --     scanr f acc xs_ =
+                --         case xs_ of
+                --             [] -> [ acc ]
+                --             x :: xs ->
+                --                 case scanr f acc xs of
+                --                     (q :: _) as qs -> f x q :: qs
+                --                     [] -> []
+                --
+                -- The recursive call lives in the scrutinee of an inner
+                -- case — the scrutinee must be evaluated before pattern
+                -- matching can run, so it is NOT a tail-recursion position.
+                -- Our `isTailRecursive` used to treat `CaseExpression` as
+                -- tail-safe whenever every branch body was tail-safe,
+                -- ignoring the scrutinee. `rec` then got wrapped in a
+                -- `tcoLoop`, the recursive call produced a TailCall signal
+                -- instead of a value, and the surrounding case matched that
+                -- signal against `(q :: _) as qs` / `[]` — which returned
+                -- the base case's own result instead of threading through
+                -- the case. For `rec 1` that meant `[99]` instead of
+                -- `[100, 99]`.
+                Eval.Module.evalProject
+                    [ """module Main exposing (main)
+
+rec : Int -> List Int
+rec n =
+    if n == 0 then
+        [ 99 ]
+
+    else
+        case rec (n - 1) of
+            (q :: _) as qs ->
+                (n + q) :: qs
+
+            [] ->
+                [ -1 ]
+
+main =
+    rec 1
+"""
+                    ]
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (List [ Int 100, Int 99 ]))
         , test "qualified unresolved identifier keeps its module prefix" <|
             \_ ->
                 case
