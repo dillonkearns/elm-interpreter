@@ -2028,32 +2028,17 @@ call maybeQualifiedName implementation cfg env =
                 Recursion.base (f [] cfg env)
 
         RExprImpl payload ->
-            -- Resolved-IR closure reached the string-keyed evaluator
-            -- (usually via a higher-order core call: `List.foldl userFn
-            -- acc xs` where `userFn` is a closure built by the new
-            -- evaluator). Hand it to the bridge installed on
-            -- `env.shared.resolveBridge`, which runs the body through
-            -- `evalR` with the captured locals plus the bound args.
-            --
-            -- The args in this path are already bound into `env` by the
-            -- caller's `bindSimplePatterns` step, but we reconstruct the
-            -- arg list from the caller-captured `env.values` via the
-            -- currently-dispatching `PartiallyApplied`'s `patterns` —
-            -- except `call` doesn't have access to them here. Instead,
-            -- the caller passes the applied args explicitly via a
-            -- `Recursion.base` sibling: we get them from the
-            -- `maybeQualifiedName` + `boundEnv` path. Since `call` is
-            -- only invoked with fully-bound args, we need the pattern
-            -- list to extract them — but RExprImpl has no patterns
-            -- (new evaluator doesn't use them). So this `call` path is
-            -- currently only entered for the "zero-args already
-            -- applied" scenario, where the body can run with just the
-            -- captured locals.
-            --
-            -- For arity-N application with N > 0 args, the new-evaluator
-            -- closure flows through `evalFunction` instead (the
-            -- kernel-callback path), which *does* have explicit args.
-            -- See the `RExprImpl` branch in `evalFunction` below.
+            {- `call` is the 0-arg dispatch entry: used from
+               `evalQualifiedOrVariant` for name lookups whose target has
+               arity 0. Passing `[]` to the bridge is correct because the
+               function body has no parameter slots to fill.
+
+               The non-zero-arg RExprImpl path doesn't reach this branch
+               any more because `evalFullyAppliedWithEnv` now handles its
+               own RExprImpl case directly (with the real `args` list), and
+               `evalFunctionOrValue` gates the arity-0 shortcut on
+               `cachedArity == 0` before calling `call`.
+            -}
             let
                 selfClosure : Value
                 selfClosure =
@@ -2594,8 +2579,31 @@ evalFunctionOrValue moduleName name cfg env =
                 Nothing ->
                     -- Then check values (local bindings, parameters)
                     case Dict.get name env.values of
-                        Just (PartiallyApplied localEnv [] [] maybeName implementation _) ->
-                            call maybeName implementation cfg localEnv
+                        Just ((PartiallyApplied localEnv [] [] maybeName implementation cachedArity) as paValue) ->
+                            if cachedArity == 0 then
+                                call maybeName implementation cfg localEnv
+
+                            else
+                                {- Arity > 0 lookup: return the PA as a
+                                   value (partial application). For
+                                   AstImpl PAs this case never fires
+                                   because their `patterns` list matches
+                                   the function's arity — `[]` implies
+                                   a 0-arg function. But RExprImpl PAs
+                                   always carry `patterns = []` (the new
+                                   evaluator uses `cachedArity` directly
+                                   instead of counting patterns), so
+                                   without the `cachedArity` check an
+                                   arity-N RExprImpl PA would hit the
+                                   0-arg `call` path above, and `call`'s
+                                   RExprImpl branch would dispatch the
+                                   bridge with `[]` args — running the
+                                   body with the wrong locals stack.
+                                   This was the arg-binding bug
+                                   surfaced by widening the resolver
+                                   coverage.
+                                -}
+                                Types.succeedPartial paValue
 
                         Just value ->
                             Types.succeedPartial value
@@ -3112,11 +3120,6 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                         evalExpression expr cfg boundEnv
 
                     RExprImpl payload ->
-                        -- Resolved-IR closure dispatched from a kernel
-                        -- callback (e.g. `List.foldl` invoking its
-                        -- user-provided step function). Bridge back to
-                        -- the new evaluator via
-                        -- `env.shared.resolveBridge`.
                         let
                             selfClosure : Value
                             selfClosure =
@@ -3166,10 +3169,6 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                                     (localEnv |> Environment.withBindings newBindings)
 
                             RExprImpl payload ->
-                                -- Same bridge as above, but from the
-                                -- fallback pattern-binding path (when
-                                -- args arrive in a shape
-                                -- `bindSimplePatterns` can't handle).
                                 let
                                     selfClosure : Value
                                     selfClosure =
