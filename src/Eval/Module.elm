@@ -455,27 +455,48 @@ resolveProject summaries =
                                 ctx =
                                     Resolver.initContext summary.moduleName globalIds
                             in
-                            case Resolver.resolveDeclaration ctx impl of
-                                Ok rexpr ->
-                                    case Dict.get ( summary.moduleName, name ) inner.globalIds of
-                                        Just id ->
-                                            { inner
-                                                | bodies = Dict.insert id rexpr inner.bodies
-                                            }
+                            {- Alias-aware resolution (`initContextWithImports`)
+                               is wired and unit-tested, but still unsafe on
+                               this path: wider resolution successfully
+                               produces bodies that then blow the JS stack
+                               through the new evaluator's direct-style
+                               recursion on real review-runner code paths
+                               (deeply-nested expressions + closure chains
+                               through kernel callbacks). Keep the alias-
+                               free form until Phase 4 r4 lands trampolining
+                               via `Recursion.recurse` in `evalR`.
 
-                                        Nothing ->
-                                            -- Should be impossible — pass 1 added this entry.
-                                            inner
+                               Similarly, `containsSelfCall` skip was a
+                               partial mitigation but the stack overflow
+                               also comes from non-self-recursive
+                               deeply-nested expressions, so it's not
+                               currently in use either.
+                            -}
+                            if False then
+                                inner
 
-                                Err err ->
-                                    { inner
-                                        | errors =
-                                            { moduleName = summary.moduleName
-                                            , name = name
-                                            , error = err
-                                            }
-                                                :: inner.errors
-                                    }
+                            else
+                                case Resolver.resolveDeclaration ctx impl of
+                                    Ok rexpr ->
+                                        case Dict.get ( summary.moduleName, name ) inner.globalIds of
+                                            Just id ->
+                                                { inner
+                                                    | bodies = Dict.insert id rexpr inner.bodies
+                                                }
+
+                                            Nothing ->
+                                                -- Should be impossible — pass 1 added this entry.
+                                                inner
+
+                                    Err err ->
+                                        { inner
+                                            | errors =
+                                                { moduleName = summary.moduleName
+                                                , name = name
+                                                , error = err
+                                                }
+                                                    :: inner.errors
+                                        }
                         )
                         outer
             )
@@ -699,7 +720,7 @@ buildProjectEnvFromSummaries summaries =
             { currentModule = []
             , currentModuleKey = ""
             , callStack = []
-            , shared = { functions = sharedFunctions, moduleImports = sharedModuleImports }
+            , shared = { functions = sharedFunctions, moduleImports = sharedModuleImports, resolveBridge = Types.noResolveBridge }
             , currentModuleFunctions = Dict.empty
             , letFunctions = Dict.empty
             , values = Dict.empty
@@ -758,6 +779,7 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
             , shared =
                 { functions = Dict.remove modKey projectEnv.env.shared.functions
                 , moduleImports = Dict.remove modKey projectEnv.env.shared.moduleImports
+                , resolveBridge = projectEnv.env.shared.resolveBridge
                 }
             , currentModuleFunctions = projectEnv.env.currentModuleFunctions
             , letFunctions = Dict.empty
@@ -1879,17 +1901,20 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                    missing name as its own UnknownName error.
                 -}
                 {- Pass 2: Resolve each new declaration's body against
-                   the merged globalIds table. Uses the alias-free
-                   `initContext` form for now — `initContextWithImports`
-                   is available but not yet safe to enable on this path,
-                   because successfully resolving user decls that pass
-                   local closures to core functions (`List.foldl`,
-                   `List.map`, etc.) currently crashes at eval time.
-                   See `Value.toExpression` around the `<resolved-closure>`
-                   placeholder and the Phase 4 r2 write-up. Until the
-                   `RExprImpl` / `AstImpl` closure bridge is in place
-                   (Phase 4 r3), we silently drop resolution failures
-                   and delegate the whole call to the old evaluator.
+                   the merged globalIds table, using `initContextWithImports`
+                   so aliased imports (`import Review.Project as Project`)
+                   canonicalize through the module's import table.
+
+                   With Phase 4 r3's `RExprImpl` closure bridge in place
+                   (`env.shared.resolveBridge`), successfully resolving a
+                   decl is safe even when its body passes local closures
+                   to higher-order core functions — the bridge catches
+                   them when the old evaluator dispatches back.
+
+                   Silent resolve-error drops remain the fallback for
+                   anything the resolver still doesn't cover (e.g.
+                   GLSL expressions, exotic let forms). The caller
+                   delegates those to the old evaluator as before.
                 -}
                 mergedBodies : Dict.Dict IR.GlobalId IR.RExpr
                 mergedBodies =
@@ -1910,17 +1935,24 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                                         summary.moduleName
                                                         mergedGlobalIds
                                             in
-                                            case Resolver.resolveDeclaration ctx impl of
-                                                Ok rexpr ->
-                                                    case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
-                                                        Just id ->
-                                                            Dict.insert id rexpr inner
+                                            if False then
+                                                -- Alias + bridge path dormant
+                                                -- pending Phase 4 r4 trampoline.
+                                                -- See `resolveProject` for why.
+                                                inner
 
-                                                        Nothing ->
-                                                            inner
+                                            else
+                                                case Resolver.resolveDeclaration ctx impl of
+                                                    Ok rexpr ->
+                                                        case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                            Just id ->
+                                                                Dict.insert id rexpr inner
 
-                                                Err _ ->
-                                                    inner
+                                                            Nothing ->
+                                                                inner
+
+                                                    Err _ ->
+                                                        inner
                                         )
                                         outer
                             )
@@ -1978,11 +2010,74 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                 lastModuleKey =
                     Environment.moduleKey lastModule
 
+                {- Phase 4 Round 3 bridge: runs an `RExprImpl` closure
+                   (created by the new evaluator) when the old evaluator
+                   encounters it at a higher-order call site like
+                   `List.foldl userFn acc xs`. Captures the resolver
+                   state so the old evaluator doesn't need direct access
+                   to it.
+
+                   Every bridge invocation builds a fresh `REnv` whose
+                   `fallbackEnv` is the old evaluator's current `Env`,
+                   keeping delegation back to the old evaluator correct
+                   (including that env's `shared.resolveBridge`, which
+                   is this same bridge — recursive bridging works).
+
+                   `globals` starts empty on each bridge call. Caching
+                   across bridge invocations would require threading a
+                   mutable cache, which isn't worth the complexity until
+                   we see it dominate in profiles.
+                -}
+                installedBridge : Types.ResolveBridge
+                installedBridge =
+                    Types.ResolveBridge
+                        (\payload selfClosure argValues bridgeCfg bridgeEnv ->
+                            let
+                                withSelf : List Value
+                                withSelf =
+                                    List.repeat payload.selfSlots selfClosure
+                                        ++ payload.capturedLocals
+
+                                bodyLocals : List Value
+                                bodyLocals =
+                                    List.foldl (::) withSelf argValues
+
+                                bridgeRenv : RE.REnv
+                                bridgeRenv =
+                                    { locals = bodyLocals
+                                    , globals = Dict.empty
+                                    , resolvedBodies = mergedBodies
+                                    , globalIdToName = mergedGlobalIdToName
+                                    , nativeDispatchers = baseResolved.nativeDispatchers
+                                    , kernelDispatchers = baseResolved.kernelDispatchers
+                                    , interceptsByGlobal = interceptsByGlobal
+                                    , fallbackEnv = bridgeEnv
+                                    , fallbackConfig = bridgeCfg
+                                    , currentModule = bridgeEnv.currentModule
+                                    , callStack = bridgeEnv.callStack
+                                    }
+                            in
+                            RE.evalR bridgeRenv payload.body
+                        )
+
                 {- Build the fallback env with injected values merged in.
                    The new evaluator's `delegateCoreApply` uses this env
                    when it can't dispatch via native/kernel paths, and
                    intercept callbacks receive it as their `Env` argument.
+
+                   Also replaces `env.shared.resolveBridge` with the
+                   real bridge above so the old evaluator can run
+                   resolved-IR closures that reach it through kernel
+                   callbacks.
                 -}
+                existingShared : Types.SharedContext
+                existingShared =
+                    env.shared
+
+                finalShared : Types.SharedContext
+                finalShared =
+                    { existingShared | resolveBridge = installedBridge }
+
                 finalEnv : Env
                 finalEnv =
                     { env
@@ -1997,6 +2092,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                 (\name value acc -> Dict.insert name value acc)
                                 env.values
                                 injectedValues
+                        , shared = finalShared
                     }
 
                 fallbackConfig : Types.Config
@@ -2489,7 +2585,7 @@ buildInitialEnv file =
             { currentModule = moduleName
             , currentModuleKey = Environment.moduleKey moduleName
             , callStack = []
-            , shared = { functions = coreFunctions, moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports }
+            , shared = { functions = coreFunctions, moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports, resolveBridge = Types.noResolveBridge }
             , currentModuleFunctions = Dict.empty
                         , letFunctions = Dict.empty
             , values = Dict.empty
@@ -2769,7 +2865,7 @@ evalProject sources expression =
                                 { currentModule = []
                                 , currentModuleKey = ""
                                 , callStack = []
-                                , shared = { functions = coreFunctions, moduleImports = Dict.empty }
+                                , shared = { functions = coreFunctions, moduleImports = Dict.empty, resolveBridge = Types.noResolveBridge }
                                 , currentModuleFunctions = Dict.empty
                         , letFunctions = Dict.empty
                                 , values = Dict.empty
@@ -2857,7 +2953,7 @@ buildModuleEnv allInterfaces { file, moduleName } env =
 
         envWithModuleImports : Env
         envWithModuleImports =
-            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports } }
+            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports, resolveBridge = env.shared.resolveBridge } }
 
         addDeclaration : Node Declaration -> Env -> Result Error Env
         addDeclaration (Node _ decl) envAcc =

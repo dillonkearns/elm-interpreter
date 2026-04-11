@@ -316,17 +316,44 @@ resolveFunctionOrValue ctx moduleName name =
 
             Nothing ->
                 if isConstructorName name then
-                    -- Unqualified constructor: check the current
-                    -- module's exposedConstructors table (imports
-                    -- `exposing (..)` or `exposing (Type(..))` populate
-                    -- this so the evaluator can match by full qualified
-                    -- name later).
-                    case FastDict.get name ctx.imports.exposedConstructors of
-                        Just ( canonicalModule, _ ) ->
-                            Ok (RCtor { moduleName = canonicalModule, name = name })
+                    {- Uppercase reference. Either a real custom-type
+                       constructor (`type Foo = Bar`) or a record alias
+                       constructor (`type alias Bar = { ... }`).
+
+                       Both are registered as functions in
+                       `env.shared.functions` at buildProjectEnv time,
+                       so both show up in `globalIds`. Prefer the
+                       `RGlobal` form so the dispatch runs the actual
+                       function body — which is what distinguishes
+                       them: custom ctors accumulate `Custom qualRef
+                       [...]` via `applyClosure`'s Custom branch; record
+                       aliases have synthesized bodies that build a
+                       `Record dict`. Without this lookup, the resolver
+                       treated `Node 1 2 3` (a record alias) as an
+                       opaque `Custom "Node" [1, 2, 3]` and any later
+                       `.field` access on the result blew up with
+                       "field access on non-record".
+
+                       Fall back to `RCtor` only when the name is
+                       missing from `globalIds` (e.g. `True`/`False`,
+                       which the evaluator special-cases).
+                    -}
+                    case FastDict.get ( ctx.currentModule, name ) ctx.globalIds of
+                        Just id ->
+                            Ok (RGlobal id)
 
                         Nothing ->
-                            Ok (RCtor { moduleName = [], name = name })
+                            case FastDict.get name ctx.imports.exposedConstructors of
+                                Just ( canonicalModule, _ ) ->
+                                    case FastDict.get ( canonicalModule, name ) ctx.globalIds of
+                                        Just id ->
+                                            Ok (RGlobal id)
+
+                                        Nothing ->
+                                            Ok (RCtor { moduleName = canonicalModule, name = name })
+
+                                Nothing ->
+                                    Ok (RCtor { moduleName = [], name = name })
 
                 else
                     -- Unqualified value: try the current module first
@@ -372,7 +399,15 @@ resolveFunctionOrValue ctx moduleName name =
                         moduleName
         in
         if isConstructorName name then
-            Ok (RCtor { moduleName = canonicalModule, name = name })
+            -- Same `RGlobal`-first treatment as the unqualified branch
+            -- so record aliases dispatch through their synthesized
+            -- function body instead of getting wrapped in a `Custom`.
+            case FastDict.get ( canonicalModule, name ) ctx.globalIds of
+                Just id ->
+                    Ok (RGlobal id)
+
+                Nothing ->
+                    Ok (RCtor { moduleName = canonicalModule, name = name })
 
         else
             resolveGlobal ctx canonicalModule name

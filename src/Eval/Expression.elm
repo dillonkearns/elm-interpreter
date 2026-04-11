@@ -1,4 +1,4 @@
-module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs, kernelFunctions)
+module Eval.Expression exposing (containsSelfCall, deepHashValue, evalExpression, evalFunction, fingerprintArgs, isTailRecursive, kernelFunctions)
 
 import Array
 import Bitwise
@@ -23,7 +23,7 @@ import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
-import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, Value(..))
+import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, ResolveBridge(..), Value(..))
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -2019,16 +2019,48 @@ call maybeQualifiedName implementation cfg env =
             else
                 Recursion.base (f [] cfg env)
 
-        RExprImpl _ ->
-            -- Resolved-IR closures never reach the string-keyed evaluator.
-            -- Reaching here means the useResolvedIR gate is misrouted.
-            Recursion.base
-                (EvErr
-                    { currentModule = env.currentModule
-                    , callStack = env.callStack
-                    , error = TypeError "RExprImpl in old evaluator call path (useResolvedIR misrouted)"
-                    }
-                )
+        RExprImpl payload ->
+            -- Resolved-IR closure reached the string-keyed evaluator
+            -- (usually via a higher-order core call: `List.foldl userFn
+            -- acc xs` where `userFn` is a closure built by the new
+            -- evaluator). Hand it to the bridge installed on
+            -- `env.shared.resolveBridge`, which runs the body through
+            -- `evalR` with the captured locals plus the bound args.
+            --
+            -- The args in this path are already bound into `env` by the
+            -- caller's `bindSimplePatterns` step, but we reconstruct the
+            -- arg list from the caller-captured `env.values` via the
+            -- currently-dispatching `PartiallyApplied`'s `patterns` —
+            -- except `call` doesn't have access to them here. Instead,
+            -- the caller passes the applied args explicitly via a
+            -- `Recursion.base` sibling: we get them from the
+            -- `maybeQualifiedName` + `boundEnv` path. Since `call` is
+            -- only invoked with fully-bound args, we need the pattern
+            -- list to extract them — but RExprImpl has no patterns
+            -- (new evaluator doesn't use them). So this `call` path is
+            -- currently only entered for the "zero-args already
+            -- applied" scenario, where the body can run with just the
+            -- captured locals.
+            --
+            -- For arity-N application with N > 0 args, the new-evaluator
+            -- closure flows through `evalFunction` instead (the
+            -- kernel-callback path), which *does* have explicit args.
+            -- See the `RExprImpl` branch in `evalFunction` below.
+            let
+                selfClosure : Value
+                selfClosure =
+                    PartiallyApplied
+                        (Environment.empty [])
+                        []
+                        []
+                        maybeQualifiedName
+                        (RExprImpl payload)
+                        0
+
+                (ResolveBridge bridge) =
+                    env.shared.resolveBridge
+            in
+            Recursion.base (bridge payload selfClosure [] cfg env)
 
 
 
@@ -3062,11 +3094,27 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                     AstImpl expr ->
                         evalExpression expr cfg boundEnv
 
-                    RExprImpl _ ->
-                        -- Resolved-IR closures never reach the string-keyed
-                        -- evaluator. Reaching here means the useResolvedIR
-                        -- gate is misrouted.
-                        EvalResult.fail <| typeError localEnv "RExprImpl in old evaluator (useResolvedIR misrouted)"
+                    RExprImpl payload ->
+                        -- Resolved-IR closure dispatched from a kernel
+                        -- callback (e.g. `List.foldl` invoking its
+                        -- user-provided step function). Bridge back to
+                        -- the new evaluator via
+                        -- `env.shared.resolveBridge`.
+                        let
+                            selfClosure : Value
+                            selfClosure =
+                                PartiallyApplied
+                                    (Environment.empty [])
+                                    []
+                                    []
+                                    functionName
+                                    (RExprImpl payload)
+                                    patternsLength
+
+                            (ResolveBridge bridge) =
+                                localEnv.shared.resolveBridge
+                        in
+                        bridge payload selfClosure oldArgs cfg localEnv
 
             Nothing ->
                 let
@@ -3100,8 +3148,26 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                                     cfg
                                     (localEnv |> Environment.withBindings newBindings)
 
-                            RExprImpl _ ->
-                                EvalResult.fail <| typeError localEnv "RExprImpl in old evaluator (useResolvedIR misrouted)"
+                            RExprImpl payload ->
+                                -- Same bridge as above, but from the
+                                -- fallback pattern-binding path (when
+                                -- args arrive in a shape
+                                -- `bindSimplePatterns` can't handle).
+                                let
+                                    selfClosure : Value
+                                    selfClosure =
+                                        PartiallyApplied
+                                            (Environment.empty [])
+                                            []
+                                            []
+                                            functionName
+                                            (RExprImpl payload)
+                                            patternsLength
+
+                                    (ResolveBridge bridge) =
+                                        localEnv.shared.resolveBridge
+                                in
+                                bridge payload selfClosure oldArgs cfg localEnv
 
 
 {-| Check for native-kernel overrides registered against user-level modules

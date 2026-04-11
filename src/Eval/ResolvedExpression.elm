@@ -458,7 +458,19 @@ for let-bound recursive functions — see the `Implementation` docstring in
 makeClosure : REnv -> Int -> RExpr -> Int -> Maybe QualifiedNameRef -> Value
 makeClosure env arity body selfSlots debugName =
     PartiallyApplied
-        (Environment.empty [])
+        {- Save the current `fallbackEnv` in the `PartiallyApplied`
+           instead of an empty placeholder. The new evaluator itself
+           never reads this field, but the kernel marshalling layer
+           (`Kernel.function` in `src/Kernel.elm`) uses it as
+           `localEnv` when it converts a `PartiallyApplied` Value to a
+           pure-Elm higher-order function and invokes `evalFunction`
+           on each call. Without the real `fallbackEnv`, `localEnv`
+           has `shared.resolveBridge = noResolveBridge` and the
+           bridge fires into a stub error the moment a resolved-IR
+           closure reaches a core higher-order function (`List.foldl`,
+           `List.map`, `Dict.foldl`, etc.).
+        -}
+        env.fallbackEnv
         []
         []
         debugName
@@ -807,6 +819,35 @@ delegateViaAst env id args =
 
         Just ( moduleName, name ) ->
             let
+                {- Inject each argument Value into the dispatched env's
+                   `values` under a unique synthetic name, and reference
+                   those names in the synthesized AST instead of round-
+                   tripping each Value through `Value.toExpression`.
+
+                   This avoids the `<resolved-closure>` placeholder that
+                   `Value.toExpression` emits for `RExprImpl` closures,
+                   which previously crashed the old evaluator with a
+                   `NameError` inside `List.foldl` / `List.map` calls
+                   whose step function was built by the new evaluator.
+
+                   Literal args (Int, String, etc.) go through injection
+                   too — it's cheaper than a `Value.toExpression` round
+                   trip and produces smaller synthesized ASTs.
+                -}
+                argBindings : List ( String, Value )
+                argBindings =
+                    List.indexedMap
+                        (\i v -> ( "__re_arg_" ++ String.fromInt i ++ "__", v ))
+                        args
+
+                argReferences : List (Node Expression.Expression)
+                argReferences =
+                    argBindings
+                        |> List.map
+                            (\( argName, _ ) ->
+                                Syntax.fakeNode (Expression.FunctionOrValue [] argName)
+                            )
+
                 headExpr : Node Expression.Expression
                 headExpr =
                     Syntax.fakeNode (Expression.FunctionOrValue moduleName name)
@@ -818,9 +859,7 @@ delegateViaAst env id args =
 
                     else
                         Syntax.fakeNode
-                            (Expression.Application
-                                (headExpr :: List.map Value.toExpression args)
-                            )
+                            (Expression.Application (headExpr :: argReferences))
 
                 baseEnv : Env
                 baseEnv =
@@ -829,6 +868,15 @@ delegateViaAst env id args =
                 dispatchModuleKey : String
                 dispatchModuleKey =
                     Environment.moduleKey moduleName
+
+                dispatchValues : FastDict.Dict String Value
+                dispatchValues =
+                    List.foldl
+                        (\( argName, argValue ) acc ->
+                            FastDict.insert argName argValue acc
+                        )
+                        baseEnv.values
+                        argBindings
 
                 dispatchEnv : Env
                 dispatchEnv =
@@ -841,6 +889,7 @@ delegateViaAst env id args =
                         , imports =
                             FastDict.get dispatchModuleKey baseEnv.shared.moduleImports
                                 |> Maybe.withDefault baseEnv.imports
+                        , values = dispatchValues
                     }
             in
             Eval.Expression.evalExpression fullExpr env.fallbackConfig dispatchEnv

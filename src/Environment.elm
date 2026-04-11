@@ -4,7 +4,7 @@ import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node
 import FastDict as Dict
-import Types exposing (Env, EnvValues, Value)
+import Types exposing (Env, EnvValues, Value, noResolveBridge)
 
 
 moduleKey : ModuleName -> String
@@ -112,6 +112,7 @@ addFunction moduleName function env =
         | shared =
             { functions = Dict.insert key newInner env.shared.functions
             , moduleImports = env.shared.moduleImports
+            , resolveBridge = env.shared.resolveBridge
             }
         , currentModuleFunctions =
             if isCurrentModule then
@@ -160,7 +161,7 @@ empty moduleName =
     { currentModule = moduleName
     , currentModuleKey = moduleKey moduleName
     , callStack = []
-    , shared = { functions = Dict.empty, moduleImports = Dict.empty }
+    , shared = { functions = Dict.empty, moduleImports = Dict.empty, resolveBridge = noResolveBridge }
     , currentModuleFunctions = Dict.empty
     , letFunctions = Dict.empty
     , values = Dict.empty

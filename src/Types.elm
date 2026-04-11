@@ -1,4 +1,4 @@
-module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), InterceptContext, JsonDecoder(..), JsonVal(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, Value(..), evalErrorKindToString)
+module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), InterceptContext, JsonDecoder(..), JsonVal(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, ResolveBridge(..), SharedContext, Value(..), evalErrorKindToString, noResolveBridge)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -209,7 +209,74 @@ type Implementation
 type alias SharedContext =
     { functions : Dict String (Dict String FunctionImplementation)
     , moduleImports : Dict String ImportedNames
+    , resolveBridge : ResolveBridge
     }
+
+
+{-| Bridge that lets the string-keyed evaluator execute a resolved-IR
+closure by handing it back to the new evaluator.
+
+When `Eval.Expression.call` / `evalFunction` encounters an
+`Implementation.RExprImpl` payload — because the new evaluator created
+a closure and passed it through a higher-order call (e.g.
+`List.foldl userFn acc xs`) to code that runs in the old evaluator —
+it calls `cfg.env.shared.resolveBridge` to run the body.
+
+The bridge closure captures the resolver state (resolvedBodies,
+native/kernel dispatchers, interceptsByGlobal, etc.) at installation
+time in `Eval.Module.evalWithResolvedIRFromFilesAndIntercepts`. The
+default `noResolveBridge` (used on every code path that doesn't route
+through the new entry point) returns a `TypeError`, matching the
+pre-bridge "RExprImpl misrouted" behavior.
+
+The bridge takes:
+  - `payload` — the `RExprImpl` inner record with body, captured
+    locals, and selfSlots
+  - `selfClosure` — the `Value` to prepend for self-recursion; the
+    caller constructs it as the arity-restored `PartiallyApplied` it
+    just unpacked
+  - `args` — the fully-applied argument Values (already bound /
+    evaluated by the old evaluator's call machinery)
+  - `cfg`, `env` — the current evaluation context; the bridge pulls
+    resolver state from `env.shared.resolveBridge`'s closure capture,
+    not from these two directly
+
+Returns an `EvalResult Value` that may be `EvOk`, `EvErr`,
+`EvYield`, `EvMemoLookup`, or `EvMemoStore` — whatever the new
+evaluator produces. The old evaluator's surrounding `call` / trampoline
+machinery handles the non-Ok variants uniformly.
+
+-}
+type ResolveBridge
+    = ResolveBridge
+        ({ body : IR.RExpr
+         , capturedLocals : List Value
+         , selfSlots : Int
+         }
+         -> Value
+         -> List Value
+         -> Config
+         -> Env
+         -> EvalResult Value
+        )
+
+
+{-| Default bridge installed on code paths that never run the new
+evaluator. Returns an `Unsupported` error so misrouting shows up as a
+clearly-labeled evaluator failure, not a silent miscompile.
+-}
+noResolveBridge : ResolveBridge
+noResolveBridge =
+    ResolveBridge
+        (\_ _ _ _ env ->
+            EvErr
+                { currentModule = env.currentModule
+                , callStack = env.callStack
+                , error =
+                    Unsupported
+                        "RExprImpl encountered with noResolveBridge — useResolvedIR misrouted, or new evaluator state not installed"
+                }
+        )
 
 
 type alias Env =
