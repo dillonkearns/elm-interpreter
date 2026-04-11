@@ -2006,9 +2006,10 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
 
                                                     ctx : Resolver.ResolverContext
                                                     ctx =
-                                                        Resolver.initContext
+                                                        Resolver.initContextWithImports
                                                             summary.moduleName
                                                             mergedGlobalIds
+                                                            summary.importedNames
                                                 in
                                                 case Resolver.resolveDeclaration ctx impl of
                                                     Ok rexpr ->
