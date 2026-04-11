@@ -93,6 +93,7 @@ type alias REnv =
     , fallbackConfig : Config
     , currentModule : ModuleName
     , callStack : List QualifiedNameRef
+    , callDepth : Int
     }
 
 
@@ -118,6 +119,7 @@ emptyREnv =
     , fallbackConfig = emptyConfig
     , currentModule = []
     , callStack = []
+    , callDepth = 0
     }
 
 
@@ -623,7 +625,7 @@ runRExprClosure env implBody selfClosure args =
 
         bodyEnv : REnv
         bodyEnv =
-            { env | locals = bodyLocals }
+            { env | locals = bodyLocals, callDepth = env.callDepth + 1 }
     in
     evalR bodyEnv implBody.body
 
@@ -675,12 +677,17 @@ evalGlobal env id =
         Nothing ->
             case FastDict.get id env.resolvedBodies of
                 Just body ->
-                    let
-                        topLevelEnv : REnv
-                        topLevelEnv =
-                            { env | locals = [] }
-                    in
-                    evalR topLevelEnv body
+                    if env.callDepth >= evalRCallDepthBudget then
+                        -- See `dispatchGlobalApplyNoIntercept` for why.
+                        delegateCoreApply env id []
+
+                    else
+                        let
+                            topLevelEnv : REnv
+                            topLevelEnv =
+                                { env | locals = [] }
+                        in
+                        evalR topLevelEnv body
 
                 Nothing ->
                     -- Core declaration — delegate a zero-arg reference to
@@ -746,16 +753,34 @@ dispatchGlobalApplyNoIntercept env id argValues =
         Nothing ->
             case FastDict.get id env.resolvedBodies of
                 Just body ->
-                    let
-                        topLevelEnv : REnv
-                        topLevelEnv =
-                            { env | locals = [] }
-                    in
-                    evalR topLevelEnv body
-                        |> andThenValue
-                            (\headValue ->
-                                applyClosure env headValue argValues
-                            )
+                    {- Depth-budget fallback: `evalR` is direct-style and
+                       blows the JS stack on deeply-nested real Elm code.
+                       Before we run a resolved body, check how deep the
+                       call chain is; if it's past the budget, hand off
+                       to the old evaluator whose trampolined `call`
+                       machinery handles arbitrary depth. The old
+                       evaluator's `ResolveBridge` closes the loop in
+                       the other direction.
+                    -}
+                    if env.callDepth >= evalRCallDepthBudget then
+                        case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
+                            Just result ->
+                                EvOk result
+
+                            Nothing ->
+                                delegateCoreApply env id argValues
+
+                    else
+                        let
+                            topLevelEnv : REnv
+                            topLevelEnv =
+                                { env | locals = [] }
+                        in
+                        evalR topLevelEnv body
+                            |> andThenValue
+                                (\headValue ->
+                                    applyClosure env headValue argValues
+                                )
 
                 Nothing ->
                     case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
@@ -764,6 +789,24 @@ dispatchGlobalApplyNoIntercept env id argValues =
 
                         Nothing ->
                             delegateCoreApply env id argValues
+
+
+{-| Soft stack budget for `evalR`'s direct-style recursion. When a
+resolved body is about to be dispatched and `env.callDepth` is past
+this threshold, we fall through to `delegateCoreApply` so the old
+evaluator's trampolined machinery handles the rest of the chain. The
+old evaluator's `ResolveBridge` will loop back into `evalR` for any
+resolved closures it encounters, so correctness is preserved — we
+just trade new-evaluator speed for stack safety on deep chains.
+
+Chosen empirically so that `small-12` / `elm-spa-parity` workloads
+stay under the budget on their normal call depth while still tripping
+on the pathological chains that were crashing the resolver-widened
+configuration.
+-}
+evalRCallDepthBudget : Int
+evalRCallDepthBudget =
+    150
 
 
 {-| Delegate a core declaration call to the old evaluator by synthesizing
@@ -818,81 +861,86 @@ delegateViaAst env id args =
                 )
 
         Just ( moduleName, name ) ->
-            let
-                {- Inject each argument Value into the dispatched env's
-                   `values` under a unique synthetic name, and reference
-                   those names in the synthesized AST instead of round-
-                   tripping each Value through `Value.toExpression`.
+            delegateByName env moduleName name args
 
-                   This avoids the `<resolved-closure>` placeholder that
-                   `Value.toExpression` emits for `RExprImpl` closures,
-                   which previously crashed the old evaluator with a
-                   `NameError` inside `List.foldl` / `List.map` calls
-                   whose step function was built by the new evaluator.
 
-                   Literal args (Int, String, etc.) go through injection
-                   too — it's cheaper than a `Value.toExpression` round
-                   trip and produces smaller synthesized ASTs.
-                -}
-                argBindings : List ( String, Value )
-                argBindings =
-                    List.indexedMap
-                        (\i v -> ( "__re_arg_" ++ String.fromInt i ++ "__", v ))
-                        args
+{-| Synthesize an `Application` AST calling `moduleName.name` with the
+given arg Values and dispatch it through the old evaluator. Used both by
+`delegateViaAst` (which resolves a `GlobalId` to its name first) and by
+`applyClosure`'s Custom branch (which detects a record-alias constructor
+mis-routed through `RCtor` and needs to run its synthesized function body
+to produce the correct `Record` value).
 
-                argReferences : List (Node Expression.Expression)
-                argReferences =
-                    argBindings
-                        |> List.map
-                            (\( argName, _ ) ->
-                                Syntax.fakeNode (Expression.FunctionOrValue [] argName)
-                            )
+Each arg is injected into the dispatched env's `values` under a unique
+synthetic name and referenced from the synthesized AST instead of being
+round-tripped through `Value.toExpression`. That avoids the
+`<resolved-closure>` placeholder `Value.toExpression` emits for
+`RExprImpl` closures, which previously crashed the old evaluator inside
+kernel callbacks. Literal args go through injection too — it's cheaper
+than a `Value.toExpression` round trip.
+-}
+delegateByName : REnv -> ModuleName -> String -> List Value -> EvalResult Value
+delegateByName env moduleName name args =
+    let
+        argBindings : List ( String, Value )
+        argBindings =
+            List.indexedMap
+                (\i v -> ( "__re_arg_" ++ String.fromInt i ++ "__", v ))
+                args
 
-                headExpr : Node Expression.Expression
-                headExpr =
-                    Syntax.fakeNode (Expression.FunctionOrValue moduleName name)
+        argReferences : List (Node Expression.Expression)
+        argReferences =
+            argBindings
+                |> List.map
+                    (\( argName, _ ) ->
+                        Syntax.fakeNode (Expression.FunctionOrValue [] argName)
+                    )
 
-                fullExpr : Node Expression.Expression
-                fullExpr =
-                    if List.isEmpty args then
-                        headExpr
+        headExpr : Node Expression.Expression
+        headExpr =
+            Syntax.fakeNode (Expression.FunctionOrValue moduleName name)
 
-                    else
-                        Syntax.fakeNode
-                            (Expression.Application (headExpr :: argReferences))
+        fullExpr : Node Expression.Expression
+        fullExpr =
+            if List.isEmpty args then
+                headExpr
 
-                baseEnv : Env
-                baseEnv =
-                    env.fallbackEnv
+            else
+                Syntax.fakeNode
+                    (Expression.Application (headExpr :: argReferences))
 
-                dispatchModuleKey : String
-                dispatchModuleKey =
-                    Environment.moduleKey moduleName
+        baseEnv : Env
+        baseEnv =
+            env.fallbackEnv
 
-                dispatchValues : FastDict.Dict String Value
-                dispatchValues =
-                    List.foldl
-                        (\( argName, argValue ) acc ->
-                            FastDict.insert argName argValue acc
-                        )
-                        baseEnv.values
-                        argBindings
+        dispatchModuleKey : String
+        dispatchModuleKey =
+            Environment.moduleKey moduleName
 
-                dispatchEnv : Env
-                dispatchEnv =
-                    { baseEnv
-                        | currentModule = moduleName
-                        , currentModuleKey = dispatchModuleKey
-                        , currentModuleFunctions =
-                            FastDict.get dispatchModuleKey baseEnv.shared.functions
-                                |> Maybe.withDefault FastDict.empty
-                        , imports =
-                            FastDict.get dispatchModuleKey baseEnv.shared.moduleImports
-                                |> Maybe.withDefault baseEnv.imports
-                        , values = dispatchValues
-                    }
-            in
-            Eval.Expression.evalExpression fullExpr env.fallbackConfig dispatchEnv
+        dispatchValues : FastDict.Dict String Value
+        dispatchValues =
+            List.foldl
+                (\( argName, argValue ) acc ->
+                    FastDict.insert argName argValue acc
+                )
+                baseEnv.values
+                argBindings
+
+        dispatchEnv : Env
+        dispatchEnv =
+            { baseEnv
+                | currentModule = moduleName
+                , currentModuleKey = dispatchModuleKey
+                , currentModuleFunctions =
+                    FastDict.get dispatchModuleKey baseEnv.shared.functions
+                        |> Maybe.withDefault FastDict.empty
+                , imports =
+                    FastDict.get dispatchModuleKey baseEnv.shared.moduleImports
+                        |> Maybe.withDefault baseEnv.imports
+                , values = dispatchValues
+            }
+    in
+    Eval.Expression.evalExpression fullExpr env.fallbackConfig dispatchEnv
 
 
 

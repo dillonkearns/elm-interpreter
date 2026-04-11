@@ -246,6 +246,7 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                     , fallbackConfig = dispatchConfig
                     , currentModule = [ "ResolvedEntry" ]
                     , callStack = []
+                    , callDepth = 0
                     }
             in
             case RE.evalR renv rexpr of
@@ -2027,6 +2028,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                     , fallbackConfig = bridgeCfg
                                     , currentModule = bridgeEnv.currentModule
                                     , callStack = bridgeEnv.callStack
+                                    , callDepth = 0
                                     }
                             in
                             RE.evalR bridgeRenv payload.body
@@ -2108,6 +2110,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                             , fallbackConfig = fallbackConfig
                             , currentModule = lastModule
                             , callStack = []
+                            , callDepth = 0
                             }
                     in
                     RE.evalR renv rexpr
