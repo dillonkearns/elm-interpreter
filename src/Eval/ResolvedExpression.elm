@@ -1695,6 +1695,7 @@ buildHigherOrderRegistry lookupId =
 higherOrderDispatcherList : List ( ModuleName, String, HigherOrderDispatcher )
 higherOrderDispatcherList =
     [ ( [ "List" ], "foldl", HigherOrderDispatcher foldlDispatcher )
+    , ( [ "Dict" ], "foldl", HigherOrderDispatcher dictFoldlDispatcher )
     ]
 
 
@@ -1740,3 +1741,71 @@ foldlHelper env f acc remaining =
                     andThenValue
                         (\newAcc -> foldlHelper env f newAcc rest)
                         otherResult
+
+
+{-| `Dict.foldl : (k -> v -> b -> b) -> b -> Dict k v -> b`
+
+Dicts in the interpreter are represented as `Custom` red-black tree
+nodes — `RBNode_elm_builtin color key value left right` and
+`RBEmpty_elm_builtin`. We walk the tree in-order (left, node, right)
+and invoke the callback via `applyClosure env f [ k, v, acc ]` for
+each node. Same callback dispatch path as `foldlDispatcher`, which is
+specifically what the old kernel's `Kernel.function3` marshaling
+layer mis-handles for `RExprImpl` closures.
+-}
+dictFoldlDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+dictFoldlDispatcher env args =
+    case args of
+        [ f, init, dict ] ->
+            Just (dictFoldlHelper env f init dict)
+
+        _ ->
+            Nothing
+
+
+dictFoldlHelper : REnv -> Value -> Value -> Value -> EvalResult Value
+dictFoldlHelper env f acc node =
+    case node of
+        Custom { name } nodeArgs ->
+            if name == "RBEmpty_elm_builtin" then
+                EvOk acc
+
+            else
+                case nodeArgs of
+                    [ _, key, value, left, right ] ->
+                        case dictFoldlHelper env f acc left of
+                            EvOk leftAcc ->
+                                case applyClosure env f [ key, value, leftAcc ] of
+                                    EvOk midAcc ->
+                                        dictFoldlHelper env f midAcc right
+
+                                    EvErr e ->
+                                        EvErr e
+
+                                    otherResult ->
+                                        andThenValue
+                                            (\midAcc -> dictFoldlHelper env f midAcc right)
+                                            otherResult
+
+                            EvErr e ->
+                                EvErr e
+
+                            otherResult ->
+                                andThenValue
+                                    (\leftAcc ->
+                                        case applyClosure env f [ key, value, leftAcc ] of
+                                            EvOk midAcc ->
+                                                dictFoldlHelper env f midAcc right
+
+                                            other ->
+                                                andThenValue
+                                                    (\midAcc -> dictFoldlHelper env f midAcc right)
+                                                    other
+                                    )
+                                    otherResult
+
+                    _ ->
+                        EvOk acc
+
+        _ ->
+            EvOk acc

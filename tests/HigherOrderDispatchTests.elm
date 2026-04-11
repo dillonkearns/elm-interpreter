@@ -27,6 +27,11 @@ suite =
             , foldlWithUserDefinedCallback
             , foldlUserLetBoundCallback
             ]
+        , describe "Dict.foldl"
+            [ dictFoldlCountKeys
+            , dictFoldlLetBound3ArgCallback
+            , dictFoldlReverseBuild
+            ]
         ]
 
 
@@ -139,6 +144,88 @@ result =
                     Eval.Module.evalWithResolvedIR projectEnv "Foo.result"
                         -- 0 → (10+0+1) = 11 → (20+11+1) = 32 → (30+32+1) = 63
                         |> expectValue (Int 63)
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+
+dictFoldlCountKeys : Test
+dictFoldlCountKeys =
+    test "Dict.foldl counts keys with a KernelImpl callback" <|
+        \_ ->
+            let
+                source : String
+                source =
+                    """module Foo exposing (..)
+
+import Dict
+
+result : Int
+result =
+    Dict.foldl (\\_ _ acc -> acc + 1) 0 (Dict.fromList [ ( \"a\", 1 ), ( \"b\", 2 ), ( \"c\", 3 ) ])
+"""
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Foo.result"
+                        |> expectValue (Int 3)
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictFoldlLetBound3ArgCallback : Test
+dictFoldlLetBound3ArgCallback =
+    test "Dict.foldl with let-bound 3-arg closure (the flip regression shape)" <|
+        \_ ->
+            let
+                source : String
+                source =
+                    """module Foo exposing (..)
+
+import Dict
+
+result : Int
+result =
+    let
+        step : String -> Int -> Int -> Int
+        step key value acc =
+            acc + value
+    in
+    Dict.foldl step 0 (Dict.fromList [ ( \"a\", 10 ), ( \"b\", 20 ), ( \"c\", 30 ) ])
+"""
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Foo.result"
+                        |> expectValue (Int 60)
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictFoldlReverseBuild : Test
+dictFoldlReverseBuild =
+    test "Dict.foldl builds a sorted key list" <|
+        \_ ->
+            let
+                source : String
+                source =
+                    """module Foo exposing (..)
+
+import Dict
+
+result : List String
+result =
+    Dict.foldl (\\k _ acc -> k :: acc) [] (Dict.fromList [ ( \"a\", 1 ), ( \"c\", 3 ), ( \"b\", 2 ) ])
+"""
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Foo.result"
+                        -- foldl in-order visits a,b,c. Cons prepends → c,b,a.
+                        |> expectValue (List [ String "c", String "b", String "a" ])
 
                 Err _ ->
                     Expect.fail "buildProjectEnv failed"
