@@ -2658,37 +2658,50 @@ evalUnqualifiedAfterLocalMiss name cfg env =
             result
 
         Nothing ->
-            case Dict.get name env.currentModuleFunctions of
-                Just function ->
-                    let
-                        qualifiedNameRef : QualifiedNameRef
-                        qualifiedNameRef =
-                            { moduleName = env.currentModule, name = name }
-
-                        -- Top-level module function: zero out caller locals in the PA's
-                        -- captured env (see `Environment.callModuleFn` docs).
-                        callFn =
-                            if cfg.trace then
-                                Environment.callModuleFn
-
-                            else
-                                Environment.callModuleFnNoStack
-                    in
-                    if List.isEmpty function.arguments then
-                        call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
-
-                    else
-                        PartiallyApplied
-                            (callFn env.currentModule name env)
-                            []
-                            function.arguments
-                            (Just qualifiedNameRef)
-                            (AstImpl function.expression)
-                            (List.length function.arguments)
-                            |> Types.succeedPartial
+            -- Precomputed 0-arg constant cache. Populated during the
+            -- normalization pass (see `Eval.Module.tryNormalizeConstant`)
+            -- so references to heavy module-level values like
+            -- `String.Diacritics.lookupArray` return the cached `Value`
+            -- instead of re-walking the original `Array.initialize` body.
+            case
+                Dict.get env.currentModuleKey env.shared.precomputedValues
+                    |> Maybe.andThen (Dict.get name)
+            of
+                Just cachedValue ->
+                    Types.succeedPartial cachedValue
 
                 Nothing ->
-                    evalQualifiedOrVariantSlow [] name cfg env
+                    case Dict.get name env.currentModuleFunctions of
+                        Just function ->
+                            let
+                                qualifiedNameRef : QualifiedNameRef
+                                qualifiedNameRef =
+                                    { moduleName = env.currentModule, name = name }
+
+                                -- Top-level module function: zero out caller locals in the PA's
+                                -- captured env (see `Environment.callModuleFn` docs).
+                                callFn =
+                                    if cfg.trace then
+                                        Environment.callModuleFn
+
+                                    else
+                                        Environment.callModuleFnNoStack
+                            in
+                            if List.isEmpty function.arguments then
+                                call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+
+                            else
+                                PartiallyApplied
+                                    (callFn env.currentModule name env)
+                                    []
+                                    function.arguments
+                                    (Just qualifiedNameRef)
+                                    (AstImpl function.expression)
+                                    (List.length function.arguments)
+                                    |> Types.succeedPartial
+
+                        Nothing ->
+                            evalQualifiedOrVariantSlow [] name cfg env
 
 
 evalQualifiedOrVariant : ModuleName -> String -> PartialEval Value
@@ -2725,37 +2738,48 @@ evalQualifiedOrVariant moduleName name cfg env =
                             |> Types.succeedPartial
 
                 Nothing ->
-                    case Dict.get name env.currentModuleFunctions of
-                        Just function ->
-                            let
-                                qualifiedNameRef : QualifiedNameRef
-                                qualifiedNameRef =
-                                    { moduleName = env.currentModule, name = name }
-
-                                -- Top-level module function: trim caller locals
-                                -- out of the PA's captured env.
-                                callFn =
-                                    if cfg.trace then
-                                        Environment.callModuleFn
-
-                                    else
-                                        Environment.callModuleFnNoStack
-                            in
-                            if List.isEmpty function.arguments then
-                                call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
-
-                            else
-                                PartiallyApplied
-                                    (callFn env.currentModule name env)
-                                    []
-                                    function.arguments
-                                    (Just qualifiedNameRef)
-                                    (AstImpl function.expression)
-                                    (List.length function.arguments)
-                                    |> Types.succeedPartial
+                    -- Same precomputed-value cache check as the unqualified
+                    -- path, for direct same-module references.
+                    case
+                        Dict.get env.currentModuleKey env.shared.precomputedValues
+                            |> Maybe.andThen (Dict.get name)
+                    of
+                        Just cachedValue ->
+                            Types.succeedPartial cachedValue
 
                         Nothing ->
-                            evalQualifiedOrVariantSlow moduleName name cfg env
+                            case Dict.get name env.currentModuleFunctions of
+                                Just function ->
+                                    let
+                                        qualifiedNameRef : QualifiedNameRef
+                                        qualifiedNameRef =
+                                            { moduleName = env.currentModule, name = name }
+
+                                        -- Top-level module function: trim
+                                        -- caller locals out of the PA's
+                                        -- captured env.
+                                        callFn =
+                                            if cfg.trace then
+                                                Environment.callModuleFn
+
+                                            else
+                                                Environment.callModuleFnNoStack
+                                    in
+                                    if List.isEmpty function.arguments then
+                                        call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+
+                                    else
+                                        PartiallyApplied
+                                            (callFn env.currentModule name env)
+                                            []
+                                            function.arguments
+                                            (Just qualifiedNameRef)
+                                            (AstImpl function.expression)
+                                            (List.length function.arguments)
+                                            |> Types.succeedPartial
+
+                                Nothing ->
+                                    evalQualifiedOrVariantSlow moduleName name cfg env
 
         _ ->
             evalQualifiedOrVariantSlow moduleName name cfg env
@@ -2919,45 +2943,76 @@ evalNonVariant moduleName name cfg env =
             -- Note: env.values lookup for moduleName=[] is already done in
             -- evalFunctionOrValue before calling this function, so skip it here.
             --
-            -- Fast path: some user-level modules (Dict, Set, ...) have native
-            -- kernel implementations that bypass the interpreted RBTree walk.
-            -- Check kernelFunctions first before the AST lookup.
-            case userModuleKernelFastPath moduleName name cfg env of
-                Just result ->
-                    result
+            -- Precomputed cache: if the qualified ref resolves to a 0-arg
+            -- top-level constant whose value was computed during the
+            -- normalization pass, return it directly.
+            let
+                precomputedModuleKey : String
+                precomputedModuleKey =
+                    if List.isEmpty moduleName then
+                        env.currentModuleKey
+
+                    else
+                        Environment.moduleKey moduleName
+            in
+            case
+                Dict.get precomputedModuleKey env.shared.precomputedValues
+                    |> Maybe.andThen (Dict.get name)
+            of
+                Just cachedValue ->
+                    Types.succeedPartial cachedValue
 
                 Nothing ->
-                    let
-                        maybeFunction : Maybe ( ModuleName, String, Expression.FunctionImplementation )
-                        maybeFunction =
-                            if List.isEmpty moduleName then
-                                -- Unqualified: currentModuleFunctions was already checked
-                                -- in evalQualifiedOrVariant, so go straight to imports.
-                                case Dict.get name env.imports.exposedValues of
-                                    Just ( sourceModule, sourceModuleKey ) ->
-                                        Dict.get sourceModuleKey env.shared.functions
-                                            |> Maybe.andThen (Dict.get name)
-                                            |> Maybe.map (\f -> ( sourceModule, sourceModuleKey, f ))
+                    -- Fast path: some user-level modules (Dict, Set, ...) have native
+                    -- kernel implementations that bypass the interpreted RBTree walk.
+                    -- Check kernelFunctions first before the AST lookup.
+                    case userModuleKernelFastPath moduleName name cfg env of
+                        Just result ->
+                            result
 
-                                    Nothing ->
-                                        Nothing
-
-                            else
-                                let
-                                    moduleNameKey : String
-                                    moduleNameKey =
-                                        Environment.moduleKey moduleName
-                                in
-                                -- Try direct lookup first (common case: module not aliased)
-                                case Dict.get moduleNameKey env.shared.functions of
-                                    Just moduleDict ->
-                                        case Dict.get name moduleDict of
-                                            Just f ->
-                                                Just ( moduleName, moduleNameKey, f )
+                        Nothing ->
+                            let
+                                maybeFunction : Maybe ( ModuleName, String, Expression.FunctionImplementation )
+                                maybeFunction =
+                                    if List.isEmpty moduleName then
+                                        -- Unqualified: currentModuleFunctions was already checked
+                                        -- in evalQualifiedOrVariant, so go straight to imports.
+                                        case Dict.get name env.imports.exposedValues of
+                                            Just ( sourceModule, sourceModuleKey ) ->
+                                                Dict.get sourceModuleKey env.shared.functions
+                                                    |> Maybe.andThen (Dict.get name)
+                                                    |> Maybe.map (\f -> ( sourceModule, sourceModuleKey, f ))
 
                                             Nothing ->
-                                                -- Module exists but function not found.
-                                                -- Could be aliased to a different module.
+                                                Nothing
+
+                                    else
+                                        let
+                                            moduleNameKey : String
+                                            moduleNameKey =
+                                                Environment.moduleKey moduleName
+                                        in
+                                        -- Try direct lookup first (common case: module not aliased)
+                                        case Dict.get moduleNameKey env.shared.functions of
+                                            Just moduleDict ->
+                                                case Dict.get name moduleDict of
+                                                    Just f ->
+                                                        Just ( moduleName, moduleNameKey, f )
+
+                                                    Nothing ->
+                                                        -- Module exists but function not found.
+                                                        -- Could be aliased to a different module.
+                                                        case Dict.get moduleNameKey env.imports.aliases of
+                                                            Just ( canonical, canonicalKey ) ->
+                                                                Dict.get canonicalKey env.shared.functions
+                                                                    |> Maybe.andThen (Dict.get name)
+                                                                    |> Maybe.map (\f -> ( canonical, canonicalKey, f ))
+
+                                                            Nothing ->
+                                                                Nothing
+
+                                            Nothing ->
+                                                -- Module not found directly; try alias resolution
                                                 case Dict.get moduleNameKey env.imports.aliases of
                                                     Just ( canonical, canonicalKey ) ->
                                                         Dict.get canonicalKey env.shared.functions
@@ -2966,109 +3021,98 @@ evalNonVariant moduleName name cfg env =
 
                                                     Nothing ->
                                                         Nothing
-
-                                    Nothing ->
-                                        -- Module not found directly; try alias resolution
-                                        case Dict.get moduleNameKey env.imports.aliases of
-                                            Just ( canonical, canonicalKey ) ->
-                                                Dict.get canonicalKey env.shared.functions
-                                                    |> Maybe.andThen (Dict.get name)
-                                                    |> Maybe.map (\f -> ( canonical, canonicalKey, f ))
-
-                                            Nothing ->
-                                                Nothing
-                    in
-                    case maybeFunction of
-                        Just ( resolvedModule, resolvedModuleKey, function ) ->
-                            let
-                                qualifiedNameRef : QualifiedNameRef
-                                qualifiedNameRef =
-                                    { moduleName = resolvedModule, name = name }
                             in
-                            if resolvedModuleKey == env.currentModuleKey then
-                                -- Same module: trim caller locals out of the stored
-                                -- env for the same reason the cross-module branch
-                                -- below does — a top-level module function's body
-                                -- never references caller-site locals.
-                                if List.isEmpty function.arguments then
-                                    call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
-
-                                else
+                            case maybeFunction of
+                                Just ( resolvedModule, resolvedModuleKey, function ) ->
                                     let
-                                        callFn =
-                                            if cfg.trace then
-                                                Environment.callModuleFn
-
-                                            else
-                                                Environment.callModuleFnNoStack
+                                        qualifiedNameRef : QualifiedNameRef
+                                        qualifiedNameRef =
+                                            { moduleName = resolvedModule, name = name }
                                     in
-                                    PartiallyApplied
-                                        (callFn resolvedModule name env)
-                                        []
-                                        function.arguments
-                                        (Just qualifiedNameRef)
-                                        (AstImpl function.expression)
-                                        (List.length function.arguments)
-                                        |> Types.succeedPartial
+                                    if resolvedModuleKey == env.currentModuleKey then
+                                        -- Same module: trim caller locals out of the stored
+                                        -- env for the same reason the cross-module branch
+                                        -- below does — a top-level module function's body
+                                        -- never references caller-site locals.
+                                        if List.isEmpty function.arguments then
+                                            call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
 
-                            else
-                                -- Cross-module: combine clearing values + Environment.call
-                                -- into a single record construction. We know resolvedModule /=
-                                -- env.currentModule, so we inline the cross-module branch
-                                -- of Environment.call directly.
-                                let
-                                    callEnv : Env
-                                    callEnv =
-                                        { currentModule = resolvedModule
-                                        , currentModuleKey = resolvedModuleKey
-                                        , callStack =
-                                            if cfg.trace then
-                                                { moduleName = resolvedModule, name = name }
-                                                    :: env.callStack
+                                        else
+                                            let
+                                                callFn =
+                                                    if cfg.trace then
+                                                        Environment.callModuleFn
 
-                                            else
-                                                env.callStack
-                                        , shared = env.shared
-                                        , currentModuleFunctions =
-                                            Dict.get resolvedModuleKey env.shared.functions
-                                                |> Maybe.withDefault Dict.empty
-                                        , letFunctions = Dict.empty
-                                        , values = Dict.empty
-                                        , imports =
-                                            Dict.get resolvedModuleKey env.shared.moduleImports
-                                                |> Maybe.withDefault env.imports
-                                        , callDepth = env.callDepth + 1
-                                        , recursionCheck = env.recursionCheck
-                                        }
-                                in
-                                if List.isEmpty function.arguments then
-                                    Recursion.recurse ( function.expression, cfg, callEnv )
+                                                    else
+                                                        Environment.callModuleFnNoStack
+                                            in
+                                            PartiallyApplied
+                                                (callFn resolvedModule name env)
+                                                []
+                                                function.arguments
+                                                (Just qualifiedNameRef)
+                                                (AstImpl function.expression)
+                                                (List.length function.arguments)
+                                                |> Types.succeedPartial
 
-                                else
-                                    PartiallyApplied
-                                        callEnv
-                                        []
-                                        function.arguments
-                                        (Just qualifiedNameRef)
-                                        (AstImpl function.expression)
-                                        (List.length function.arguments)
-                                        |> Types.succeedPartial
+                                    else
+                                        -- Cross-module: combine clearing values + Environment.call
+                                        -- into a single record construction. We know resolvedModule /=
+                                        -- env.currentModule, so we inline the cross-module branch
+                                        -- of Environment.call directly.
+                                        let
+                                            callEnv : Env
+                                            callEnv =
+                                                { currentModule = resolvedModule
+                                                , currentModuleKey = resolvedModuleKey
+                                                , callStack =
+                                                    if cfg.trace then
+                                                        { moduleName = resolvedModule, name = name }
+                                                            :: env.callStack
 
-                        Nothing ->
-                            -- Preserve the form the user wrote: unqualified names
-                            -- stay bare in the error, so "a" doesn't get reported as
-                            -- "Main.a" just because evaluation happened inside Main.
-                            (if List.isEmpty moduleName then
-                                name
+                                                    else
+                                                        env.callStack
+                                                , shared = env.shared
+                                                , currentModuleFunctions =
+                                                    Dict.get resolvedModuleKey env.shared.functions
+                                                        |> Maybe.withDefault Dict.empty
+                                                , letFunctions = Dict.empty
+                                                , values = Dict.empty
+                                                , imports =
+                                                    Dict.get resolvedModuleKey env.shared.moduleImports
+                                                        |> Maybe.withDefault env.imports
+                                                , callDepth = env.callDepth + 1
+                                                , recursionCheck = env.recursionCheck
+                                                }
+                                        in
+                                        if List.isEmpty function.arguments then
+                                            Recursion.recurse ( function.expression, cfg, callEnv )
 
-                             else
-                                Syntax.qualifiedNameToString
-                                    { moduleName = Tuple.first (fixModuleName moduleName env)
-                                    , name = name
-                                    }
-                            )
-                                |> nameError env
-                                |> Types.failPartial
+                                        else
+                                            PartiallyApplied
+                                                callEnv
+                                                []
+                                                function.arguments
+                                                (Just qualifiedNameRef)
+                                                (AstImpl function.expression)
+                                                (List.length function.arguments)
+                                                |> Types.succeedPartial
+
+                                Nothing ->
+                                    -- Preserve the form the user wrote: unqualified names
+                                    -- stay bare in the error, so "a" doesn't get reported as
+                                    -- "Main.a" just because evaluation happened inside Main.
+                                    (if List.isEmpty moduleName then
+                                        name
+
+                                     else
+                                        Syntax.qualifiedNameToString
+                                            { moduleName = Tuple.first (fixModuleName moduleName env)
+                                            , name = name
+                                            }
+                                    )
+                                        |> nameError env
+                                        |> Types.failPartial
 
 
 evalIfBlock : Node Expression -> Node Expression -> Node Expression -> PartialEval Value

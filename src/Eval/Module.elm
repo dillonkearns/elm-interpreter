@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, replaceModuleFunctionsInEnv, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, replaceModuleFunctionsInEnv, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -260,7 +260,11 @@ buildProjectEnvFromSummaries summaries =
             { currentModule = []
             , currentModuleKey = ""
             , callStack = []
-            , shared = { functions = sharedFunctions, moduleImports = sharedModuleImports }
+            , shared =
+                { functions = sharedFunctions
+                , moduleImports = sharedModuleImports
+                , precomputedValues = Dict.empty
+                }
             , currentModuleFunctions = Dict.empty
             , letFunctions = Dict.empty
             , values = Dict.empty
@@ -317,8 +321,7 @@ normalizeSummaries summaries =
                     )
                 |> Dict.fromList
 
-        normalizedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
-        normalizedFunctions =
+        ( normalizedFunctions, _ ) =
             normalizeTopLevelConstants summaries sharedFunctionsBefore sharedModuleImports
     in
     summaries
@@ -373,10 +376,12 @@ normalizeTopLevelConstants :
     List CachedModuleSummary
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
     -> Dict.Dict String ImportedNames
-    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> ( Dict.Dict String (Dict.Dict String FunctionImplementation)
+       , Dict.Dict String (Dict.Dict String Value)
+       )
 normalizeTopLevelConstants summaries initialFunctions sharedImports =
     List.foldl
-        (\summary currentFunctions ->
+        (\summary ( currentFunctions, currentPrecomputed ) ->
             let
                 moduleKey : String
                 moduleKey =
@@ -388,49 +393,58 @@ normalizeTopLevelConstants summaries initialFunctions sharedImports =
                         |> Maybe.withDefault Dict.empty
 
                 -- Walk the module's functions, attempting normalization for
-                -- each zero-arg one. We thread `currentFunctions` through so
-                -- each newly-normalized function is visible to later siblings.
-                normalizedModuleFns : Dict.Dict String FunctionImplementation
-                normalizedModuleFns =
+                -- each zero-arg one. We thread `currentFunctions` AND
+                -- `currentPrecomputed` through so each newly-normalized
+                -- function is visible to later siblings — both as a
+                -- rewritten AST and as a precomputed `Value` cache hit.
+                ( normalizedModuleFns, normalizedPrecomputedFns ) =
                     List.foldl
-                        (\funcImpl acc ->
+                        (\funcImpl ( fnAcc, precomputedAcc ) ->
                             let
                                 name : String
                                 name =
                                     Node.value funcImpl.name
-
-                                normalized : FunctionImplementation
-                                normalized =
-                                    if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
-                                        tryNormalizeConstant
-                                            summary.moduleName
-                                            moduleKey
-                                            summary.importedNames
-                                            funcImpl
-                                            -- Use the partially-normalized
-                                            -- module dict so later constants
-                                            -- see earlier ones.
-                                            (Dict.insert moduleKey acc currentFunctions)
-                                            sharedImports
-                                            |> Maybe.withDefault funcImpl
-
-                                    else
-                                        funcImpl
                             in
-                            Dict.insert name normalized acc
+                            if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
+                                case
+                                    tryNormalizeConstant
+                                        summary.moduleName
+                                        moduleKey
+                                        summary.importedNames
+                                        funcImpl
+                                        (Dict.insert moduleKey fnAcc currentFunctions)
+                                        sharedImports
+                                        (Dict.insert moduleKey precomputedAcc currentPrecomputed)
+                                of
+                                    Just ( normalized, value ) ->
+                                        ( Dict.insert name normalized fnAcc
+                                        , Dict.insert name value precomputedAcc
+                                        )
+
+                                    Nothing ->
+                                        ( Dict.insert name funcImpl fnAcc, precomputedAcc )
+
+                            else
+                                ( Dict.insert name funcImpl fnAcc, precomputedAcc )
                         )
-                        originalModuleFns
+                        ( originalModuleFns
+                        , Dict.get moduleKey currentPrecomputed |> Maybe.withDefault Dict.empty
+                        )
                         summary.functions
             in
-            Dict.insert moduleKey normalizedModuleFns currentFunctions
+            ( Dict.insert moduleKey normalizedModuleFns currentFunctions
+            , Dict.insert moduleKey normalizedPrecomputedFns currentPrecomputed
+            )
         )
-        initialFunctions
+        ( initialFunctions, Dict.empty )
         summaries
 
 
-{-| Try to normalize a single zero-arg function. Returns `Just` the rewritten
-FunctionImplementation if eval succeeded and the result is losslessly
-round-trippable; `Nothing` if we should leave the AST alone.
+{-| Try to normalize a single zero-arg function. Returns `Just (funcImpl,
+value)` if eval succeeded and the result is losslessly round-trippable;
+`Nothing` if we should leave the AST alone. Callers persist both the
+rewritten expression (so the AST path is fast) and the `Value` (so the
+runtime precomputed cache hits for module-level references).
 -}
 tryNormalizeConstant :
     ModuleName
@@ -439,8 +453,9 @@ tryNormalizeConstant :
     -> FunctionImplementation
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
     -> Dict.Dict String ImportedNames
-    -> Maybe FunctionImplementation
-tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions sharedModuleImports =
+    -> Dict.Dict String (Dict.Dict String Value)
+    -> Maybe ( FunctionImplementation, Value )
+tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions sharedModuleImports sharedPrecomputedValues =
     let
         env : Env
         env =
@@ -450,6 +465,7 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
             , shared =
                 { functions = sharedFunctions
                 , moduleImports = sharedModuleImports
+                , precomputedValues = sharedPrecomputedValues
                 }
             , currentModuleFunctions =
                 Dict.get moduleKey sharedFunctions
@@ -482,15 +498,126 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
         Ok value ->
             if isLosslessValue value then
                 Just
-                    { funcImpl
+                    ( { funcImpl
                         | expression = Value.toExpression value
-                    }
+                      }
+                    , value
+                    )
 
             else
                 Nothing
 
         Err _ ->
             Nothing
+
+
+{-| Run `tryNormalizeConstant` over every 0-arg constant in a module,
+iterating until no further progress is made. A single pass is alphabetical
+(Dict iteration order), so a constant whose dependencies appear later in
+the alphabet — e.g. `Diacritics.lookupArray` depends on
+`Diacritics.lookupTable` — would be tried before its dependencies are
+cached and get stuck at the slow/expensive eval path. Re-running the pass
+lets the second attempt hit the now-populated `precomputedValues`.
+
+Returns the fully-normalized function dict, the delta (only the
+functions whose bodies changed), and the per-name precomputed `Value`
+dict. All three are keyed on the simple function name.
+-}
+runModuleNormalizationToFixpoint :
+    ModuleName
+    -> String
+    -> ImportedNames
+    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> Dict.Dict String ImportedNames
+    -> Dict.Dict String (Dict.Dict String Value)
+    -> Dict.Dict String FunctionImplementation
+    -> Dict.Dict String Value
+    ->
+        ( Dict.Dict String FunctionImplementation
+        , Dict.Dict String FunctionImplementation
+        , Dict.Dict String Value
+        )
+runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
+    let
+        step :
+            Dict.Dict String FunctionImplementation
+            -> Dict.Dict String FunctionImplementation
+            -> Dict.Dict String Value
+            ->
+                { fns : Dict.Dict String FunctionImplementation
+                , delta : Dict.Dict String FunctionImplementation
+                , precomputed : Dict.Dict String Value
+                , progress : Int
+                }
+        step currentFns currentDelta currentPrecomputed =
+            originalModuleFns
+                |> Dict.foldl
+                    (\name funcImpl acc ->
+                        let
+                            -- Start from whatever the previous pass
+                            -- produced for this name: either the normalized
+                            -- (rewritten) AST or the unchanged original.
+                            priorFn : FunctionImplementation
+                            priorFn =
+                                Dict.get name currentFns
+                                    |> Maybe.withDefault funcImpl
+                        in
+                        if Dict.member name acc.precomputed then
+                            -- Already normalized in a previous pass. Keep the
+                            -- rewritten body from the incoming `currentFns`.
+                            { acc | fns = Dict.insert name priorFn acc.fns }
+
+                        else if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
+                            case
+                                tryNormalizeConstant
+                                    moduleName
+                                    moduleKey
+                                    moduleImports
+                                    priorFn
+                                    (Dict.insert moduleKey acc.fns sharedFunctions)
+                                    sharedImports
+                                    (Dict.insert moduleKey acc.precomputed sharedPrecomputedValues)
+                            of
+                                Just ( normalized, value ) ->
+                                    { fns = Dict.insert name normalized acc.fns
+                                    , delta = Dict.insert name normalized acc.delta
+                                    , precomputed = Dict.insert name value acc.precomputed
+                                    , progress = acc.progress + 1
+                                    }
+
+                                Nothing ->
+                                    { acc | fns = Dict.insert name priorFn acc.fns }
+
+                        else
+                            { acc | fns = Dict.insert name priorFn acc.fns }
+                    )
+                    { fns = Dict.empty
+                    , delta = currentDelta
+                    , precomputed = currentPrecomputed
+                    , progress = 0
+                    }
+
+        loop : Int -> Dict.Dict String FunctionImplementation -> Dict.Dict String FunctionImplementation -> Dict.Dict String Value -> ( Dict.Dict String FunctionImplementation, Dict.Dict String FunctionImplementation, Dict.Dict String Value )
+        loop remaining fns delta precomputed =
+            if remaining <= 0 then
+                ( fns, delta, precomputed )
+
+            else
+                let
+                    result =
+                        step fns delta precomputed
+                in
+                if result.progress == 0 then
+                    ( result.fns, result.delta, result.precomputed )
+
+                else
+                    loop (remaining - 1) result.fns result.delta result.precomputed
+    in
+    -- Cap at a small number of passes to bound worst-case time. For any
+    -- realistic module this converges in 1-2 passes (the second pass picks
+    -- up constants whose alphabetical order placed them before their own
+    -- dependencies).
+    loop 4 originalModuleFns Dict.empty originalPrecomputedFns
 
 
 {-| Determine whether a `Value` can be losslessly round-tripped through
@@ -599,6 +726,7 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
             , shared =
                 { functions = Dict.remove modKey projectEnv.env.shared.functions
                 , moduleImports = Dict.remove modKey projectEnv.env.shared.moduleImports
+                , precomputedValues = Dict.remove modKey projectEnv.env.shared.precomputedValues
                 }
             , currentModuleFunctions = projectEnv.env.currentModuleFunctions
             , letFunctions = Dict.empty
@@ -2079,6 +2207,24 @@ moduleIsBlocklisted moduleName =
             False
 
 
+{-| Sum of all precomputed values across modules, for diagnostics.
+-}
+precomputedValuesCount : ProjectEnv -> Int
+precomputedValuesCount (ProjectEnv projectEnv) =
+    projectEnv.env.shared.precomputedValues
+        |> Dict.foldl (\_ inner acc -> acc + Dict.size inner) 0
+
+
+{-| For diagnostics: list the (moduleKey, count) pairs sorted by count.
+-}
+precomputedValuesByModule : ProjectEnv -> List ( String, Int )
+precomputedValuesByModule (ProjectEnv projectEnv) =
+    projectEnv.env.shared.precomputedValues
+        |> Dict.toList
+        |> List.map (\( k, inner ) -> ( k, Dict.size inner ))
+        |> List.filter (\( _, n ) -> n > 0)
+
+
 {-| Read the current normalized function dict for a single module out of a
 `ProjectEnv`. Returns the post-normalization bodies as they stand right now —
 useful for serializing to disk after normalization.
@@ -2118,6 +2264,7 @@ replaceModuleFunctionsInEnv moduleName newFunctions (ProjectEnv projectEnv) =
                 | shared =
                     { functions = updatedFunctions
                     , moduleImports = env.shared.moduleImports
+                    , precomputedValues = env.shared.precomputedValues
                     }
             }
     in
@@ -2148,6 +2295,10 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
         sharedImports =
             env.shared.moduleImports
 
+        sharedPrecomputedValues : Dict.Dict String (Dict.Dict String Value)
+        sharedPrecomputedValues =
+            env.shared.precomputedValues
+
         moduleKey : String
         moduleKey =
             Environment.moduleKey moduleName
@@ -2162,36 +2313,29 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
             Dict.get moduleKey env.shared.functions
                 |> Maybe.withDefault Dict.empty
 
-        ( normalizedModuleFns, delta ) =
-            originalModuleFns
-                |> Dict.foldl
-                    (\name funcImpl ( fnAcc, deltaAcc ) ->
-                        if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
-                            case
-                                tryNormalizeConstant
-                                    moduleName
-                                    moduleKey
-                                    moduleImports
-                                    funcImpl
-                                    (Dict.insert moduleKey fnAcc env.shared.functions)
-                                    sharedImports
-                            of
-                                Just normalized ->
-                                    ( Dict.insert name normalized fnAcc
-                                    , Dict.insert name normalized deltaAcc
-                                    )
+        originalPrecomputedFns : Dict.Dict String Value
+        originalPrecomputedFns =
+            Dict.get moduleKey sharedPrecomputedValues
+                |> Maybe.withDefault Dict.empty
 
-                                Nothing ->
-                                    ( Dict.insert name funcImpl fnAcc, deltaAcc )
-
-                        else
-                            ( Dict.insert name funcImpl fnAcc, deltaAcc )
-                    )
-                    ( Dict.empty, Dict.empty )
+        ( normalizedModuleFns, delta, normalizedPrecomputedFns ) =
+            runModuleNormalizationToFixpoint
+                moduleName
+                moduleKey
+                moduleImports
+                env.shared.functions
+                sharedImports
+                sharedPrecomputedValues
+                originalModuleFns
+                originalPrecomputedFns
 
         updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
         updatedFunctions =
             Dict.insert moduleKey normalizedModuleFns env.shared.functions
+
+        updatedPrecomputed : Dict.Dict String (Dict.Dict String Value)
+        updatedPrecomputed =
+            Dict.insert moduleKey normalizedPrecomputedFns sharedPrecomputedValues
 
         newEnv : Env
         newEnv =
@@ -2199,6 +2343,7 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
                 | shared =
                     { functions = updatedFunctions
                     , moduleImports = sharedImports
+                    , precomputedValues = updatedPrecomputed
                     }
             }
     in
@@ -2244,6 +2389,7 @@ mergeModuleFunctionsIntoEnv moduleName deltaFns (ProjectEnv projectEnv) =
                 | shared =
                     { functions = updatedFunctions
                     , moduleImports = env.shared.moduleImports
+                    , precomputedValues = env.shared.precomputedValues
                     }
             }
     in
@@ -2265,10 +2411,9 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
         sharedImports =
             env.shared.moduleImports
 
-        updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
-        updatedFunctions =
+        ( updatedFunctions, updatedPrecomputed ) =
             List.foldl
-                (\moduleName currentFunctions ->
+                (\moduleName ( currentFunctions, currentPrecomputed ) ->
                     let
                         moduleKey : String
                         moduleKey =
@@ -2284,37 +2429,44 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                             Dict.get moduleKey currentFunctions
                                 |> Maybe.withDefault Dict.empty
 
-                        normalizedModuleFns : Dict.Dict String FunctionImplementation
-                        normalizedModuleFns =
+                        originalPrecomputedFns : Dict.Dict String Value
+                        originalPrecomputedFns =
+                            Dict.get moduleKey currentPrecomputed
+                                |> Maybe.withDefault Dict.empty
+
+                        ( normalizedModuleFns, normalizedPrecomputedFns ) =
                             originalModuleFns
                                 |> Dict.foldl
-                                    (\name funcImpl acc ->
-                                        let
-                                            newFunc : FunctionImplementation
-                                            newFunc =
-                                                if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
-                                                    tryNormalizeConstant
-                                                        moduleName
-                                                        moduleKey
-                                                        moduleImports
-                                                        funcImpl
-                                                        -- In-progress fn dict
-                                                        -- (this module gets
-                                                        -- rebuilt as we go)
-                                                        (Dict.insert moduleKey acc currentFunctions)
-                                                        sharedImports
-                                                        |> Maybe.withDefault funcImpl
-
-                                                else
+                                    (\name funcImpl ( fnAcc, precomputedAcc ) ->
+                                        if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
+                                            case
+                                                tryNormalizeConstant
+                                                    moduleName
+                                                    moduleKey
+                                                    moduleImports
                                                     funcImpl
-                                        in
-                                        Dict.insert name newFunc acc
+                                                    (Dict.insert moduleKey fnAcc currentFunctions)
+                                                    sharedImports
+                                                    (Dict.insert moduleKey precomputedAcc currentPrecomputed)
+                                            of
+                                                Just ( normalized, value ) ->
+                                                    ( Dict.insert name normalized fnAcc
+                                                    , Dict.insert name value precomputedAcc
+                                                    )
+
+                                                Nothing ->
+                                                    ( Dict.insert name funcImpl fnAcc, precomputedAcc )
+
+                                        else
+                                            ( Dict.insert name funcImpl fnAcc, precomputedAcc )
                                     )
-                                    Dict.empty
+                                    ( Dict.empty, originalPrecomputedFns )
                     in
-                    Dict.insert moduleKey normalizedModuleFns currentFunctions
+                    ( Dict.insert moduleKey normalizedModuleFns currentFunctions
+                    , Dict.insert moduleKey normalizedPrecomputedFns currentPrecomputed
+                    )
                 )
-                env.shared.functions
+                ( env.shared.functions, env.shared.precomputedValues )
                 moduleNames
 
         newEnv : Env
@@ -2323,6 +2475,7 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                 | shared =
                     { functions = updatedFunctions
                     , moduleImports = env.shared.moduleImports
+                    , precomputedValues = updatedPrecomputed
                     }
             }
     in
@@ -2564,7 +2717,7 @@ buildInitialEnv file =
             { currentModule = moduleName
             , currentModuleKey = Environment.moduleKey moduleName
             , callStack = []
-            , shared = { functions = coreFunctions, moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports }
+            , shared = { functions = coreFunctions, moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports, precomputedValues = Dict.empty }
             , currentModuleFunctions = Dict.empty
                         , letFunctions = Dict.empty
             , values = Dict.empty
@@ -2844,7 +2997,7 @@ evalProject sources expression =
                                 { currentModule = []
                                 , currentModuleKey = ""
                                 , callStack = []
-                                , shared = { functions = coreFunctions, moduleImports = Dict.empty }
+                                , shared = { functions = coreFunctions, moduleImports = Dict.empty, precomputedValues = Dict.empty }
                                 , currentModuleFunctions = Dict.empty
                         , letFunctions = Dict.empty
                                 , values = Dict.empty
@@ -2932,7 +3085,7 @@ buildModuleEnv allInterfaces { file, moduleName } env =
 
         envWithModuleImports : Env
         envWithModuleImports =
-            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports } }
+            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports, precomputedValues = env.shared.precomputedValues } }
 
         addDeclaration : Node Declaration -> Env -> Result Error Env
         addDeclaration (Node _ decl) envAcc =

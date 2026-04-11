@@ -112,6 +112,7 @@ addFunction moduleName function env =
         | shared =
             { functions = Dict.insert key newInner env.shared.functions
             , moduleImports = env.shared.moduleImports
+            , precomputedValues = env.shared.precomputedValues
             }
         , currentModuleFunctions =
             if isCurrentModule then
@@ -160,7 +161,7 @@ empty moduleName =
     { currentModule = moduleName
     , currentModuleKey = moduleKey moduleName
     , callStack = []
-    , shared = { functions = Dict.empty, moduleImports = Dict.empty }
+    , shared = { functions = Dict.empty, moduleImports = Dict.empty, precomputedValues = Dict.empty }
     , currentModuleFunctions = Dict.empty
     , letFunctions = Dict.empty
     , values = Dict.empty

@@ -182,6 +182,17 @@ type Implementation
 type alias SharedContext =
     { functions : Dict String (Dict String FunctionImplementation)
     , moduleImports : Dict String ImportedNames
+
+    -- Module-level 0-arg values that have already been evaluated to a
+    -- concrete `Value`. Keyed by moduleKey → name. Populated during the
+    -- top-level-constant normalization pass (and, in principle, at runtime
+    -- as side-effect-free constants are first forced). Before eval walks a
+    -- 0-arg module function body, it checks here first and returns the
+    -- cached `Value` — avoiding expensive re-evaluation of things like
+    -- `String.Diacritics.lookupArray`, which is a 65k-element `Array`
+    -- built from a `Dict.fromList` over ~800 unicode code points and took
+    -- 87 s per reference without this cache.
+    , precomputedValues : Dict String (Dict String Value)
     }
 
 
