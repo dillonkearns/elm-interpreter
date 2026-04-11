@@ -1,5 +1,7 @@
 module Eval.ResolvedExpression exposing
-    ( REnv
+    ( HigherOrderDispatcher
+    , REnv
+    , buildHigherOrderRegistry
     , emptyREnv
     , evalR
     )
@@ -83,6 +85,7 @@ type alias REnv =
     , resolvedBodies : FastDict.Dict IR.GlobalId RExpr
     , globalIdToName : FastDict.Dict IR.GlobalId ( ModuleName, String )
     , nativeDispatchers : FastDict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+    , higherOrderDispatchers : FastDict.Dict IR.GlobalId HigherOrderDispatcher
     , kernelDispatchers :
         FastDict.Dict IR.GlobalId
             { arity : Int
@@ -95,6 +98,31 @@ type alias REnv =
     , callStack : List QualifiedNameRef
     , callDepth : Int
     }
+
+
+{-| A higher-order kernel dispatcher: a `REnv -> List Value -> Maybe
+(EvalResult Value)` that takes the current `REnv` and a list of
+already-evaluated arguments, and either returns `Just evalResult` if
+it handles that arg shape, or `Nothing` to fall through to the normal
+delegation path.
+
+These exist as a sibling to `NativeDispatch.NativeDispatcher` (which
+is pure, for scalar operators like `+` and `==`) to cover core
+functions like `List.foldl` that take a callback Value as one of
+their args. The dispatcher invokes the callback via `applyClosure`
+directly — bypassing the `Kernel.function` marshaling path in
+`Eval.Expression` that was designed for `AstImpl` closures and
+mishandles `RExprImpl` closures (which carry `patterns = []`).
+
+Yield / memo / error propagation is handled automatically by threading
+`applyClosure`'s result through `andThenValue` in the helper loop.
+
+Wrapped in a one-constructor `type` (not `type alias`) because Elm
+forbids recursive type aliases, and this type is (indirectly)
+self-referential via `REnv`.
+-}
+type HigherOrderDispatcher
+    = HigherOrderDispatcher (REnv -> List Value -> Maybe (EvalResult Value))
 
 
 {-| A completely empty REnv useful for literal-only tests. Real callers
@@ -113,6 +141,7 @@ emptyREnv =
     , resolvedBodies = FastDict.empty
     , globalIdToName = FastDict.empty
     , nativeDispatchers = FastDict.empty
+    , higherOrderDispatchers = FastDict.empty
     , kernelDispatchers = FastDict.empty
     , interceptsByGlobal = FastDict.empty
     , fallbackEnv = Environment.empty []
@@ -512,7 +541,7 @@ applyClosure env head newArgs =
 
     else
         case head of
-            PartiallyApplied _ appliedArgs _ debugName impl arity ->
+            PartiallyApplied paLocalEnv appliedArgs patterns debugName impl arity ->
                 case impl of
                     RExprImpl implBody ->
                         let
@@ -568,17 +597,35 @@ applyClosure env head newArgs =
                                         applyClosure env result extraArgs
                                     )
 
-                    AstImpl _ ->
-                        evErr env
-                            (Unsupported
-                                "applying new evaluator to old AST-backed closure (Phase 3 wire-up will bridge this)"
-                            )
+                    _ ->
+                        {- AstImpl / KernelImpl: delegate to the old
+                           evaluator's `evalFunction`, which already handles
+                           pattern binding for AstImpl and calls the kernel
+                           function directly for KernelImpl. This is the
+                           path that lets higher-order core callbacks like
+                           `List.foldl (+) 0 xs` work — `(+)` is a KernelImpl
+                           PA, and the dispatcher in `NativeDispatchHO`
+                           calls this with the fully-applied args list.
 
-                    KernelImpl _ _ _ ->
-                        evErr env
-                            (Unsupported
-                                "applying new evaluator to kernel-backed closure (Phase 3 wire-up will bridge this)"
-                            )
+                           For partial application (total < arity) we could
+                           return a PA here too, but the old evaluator's
+                           `evalFunction` already handles that case (it
+                           returns `Value.mkPartiallyApplied` when
+                           `oldArgsLength < patternsLength`).
+                        -}
+                        let
+                            totalArgs : List Value
+                            totalArgs =
+                                appliedArgs ++ newArgs
+                        in
+                        Eval.Expression.evalFunction
+                            totalArgs
+                            patterns
+                            arity
+                            debugName
+                            impl
+                            env.fallbackConfig
+                            paLocalEnv
 
             Custom qualRef existingArgs ->
                 -- Constructor application: treat as arg accumulation.
@@ -768,7 +815,12 @@ dispatchGlobalApplyNoIntercept env id argValues =
                                 EvOk result
 
                             Nothing ->
-                                delegateCoreApply env id argValues
+                                case tryHigherOrderDispatch env id argValues of
+                                    Just result ->
+                                        result
+
+                                    Nothing ->
+                                        delegateCoreApply env id argValues
 
                     else
                         let
@@ -788,7 +840,12 @@ dispatchGlobalApplyNoIntercept env id argValues =
                             EvOk result
 
                         Nothing ->
-                            delegateCoreApply env id argValues
+                            case tryHigherOrderDispatch env id argValues of
+                                Just result ->
+                                    result
+
+                                Nothing ->
+                                    delegateCoreApply env id argValues
 
 
 {-| Soft stack budget for `evalR`'s direct-style recursion. When a
@@ -1589,3 +1646,97 @@ evErr env kind =
         , callStack = env.callStack
         , error = kind
         }
+
+
+
+-- HIGHER-ORDER KERNEL DISPATCHERS
+--
+-- Parallel to `Eval.NativeDispatch` (scalar operators), but for
+-- core functions that take a callback Value as one of their args.
+-- Each dispatcher here invokes user callbacks via `applyClosure` so
+-- resolved closures (`RExprImpl` with `patterns = []`) are dispatched
+-- natively rather than round-tripping through the old evaluator's
+-- `Kernel.function` marshaling layer, which was built for named
+-- patterns and gets arg binding wrong for RExprImpl.
+
+
+{-| Try to dispatch a core call as a higher-order kernel. Mirrors
+`NativeDispatch.tryDispatch` but takes the REnv (needed to invoke
+callbacks via `applyClosure`).
+-}
+tryHigherOrderDispatch : REnv -> IR.GlobalId -> List Value -> Maybe (EvalResult Value)
+tryHigherOrderDispatch env id argValues =
+    case FastDict.get id env.higherOrderDispatchers of
+        Just (HigherOrderDispatcher dispatcher) ->
+            dispatcher env argValues
+
+        Nothing ->
+            Nothing
+
+
+{-| Build the registry at `buildProjectEnv` time. Takes the same
+`( ModuleName, String ) -> Maybe GlobalId` lookup function as
+`NativeDispatch.buildRegistry`, returns a Dict keyed by resolved
+`GlobalId`s.
+-}
+buildHigherOrderRegistry :
+    (( ModuleName, String ) -> Maybe IR.GlobalId)
+    -> FastDict.Dict IR.GlobalId HigherOrderDispatcher
+buildHigherOrderRegistry lookupId =
+    higherOrderDispatcherList
+        |> List.filterMap
+            (\( moduleName, name, dispatcher ) ->
+                lookupId ( moduleName, name )
+                    |> Maybe.map (\id -> ( id, dispatcher ))
+            )
+        |> FastDict.fromList
+
+
+higherOrderDispatcherList : List ( ModuleName, String, HigherOrderDispatcher )
+higherOrderDispatcherList =
+    [ ( [ "List" ], "foldl", HigherOrderDispatcher foldlDispatcher )
+    ]
+
+
+
+-- INDIVIDUAL DISPATCHERS
+
+
+{-| `List.foldl : (a -> b -> b) -> b -> List a -> b`
+
+The resolved callback is invoked via `applyClosure env f [ x, acc ]`.
+`andThenValue` threads `EvYield` / `EvMemoLookup` / `EvMemoStore`
+continuations automatically — the loop only stays hot on the `EvOk`
+path, which Elm's compiler emits as a host-Elm `while` loop due to
+tail-recursion on `foldlHelper`.
+-}
+foldlDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+foldlDispatcher env args =
+    case args of
+        [ f, init, List xs ] ->
+            Just (foldlHelper env f init xs)
+
+        _ ->
+            Nothing
+
+
+foldlHelper : REnv -> Value -> Value -> List Value -> EvalResult Value
+foldlHelper env f acc remaining =
+    case remaining of
+        [] ->
+            EvOk acc
+
+        x :: rest ->
+            case applyClosure env f [ x, acc ] of
+                EvOk newAcc ->
+                    -- Hot path: synchronous, tail-recursive in Elm → JS while loop.
+                    foldlHelper env f newAcc rest
+
+                EvErr e ->
+                    EvErr e
+
+                otherResult ->
+                    -- Yield / memo / trace: thread the continuation.
+                    andThenValue
+                        (\newAcc -> foldlHelper env f newAcc rest)
+                        otherResult

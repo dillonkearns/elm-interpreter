@@ -72,6 +72,7 @@ type alias ResolvedProject =
     , bodies : Dict.Dict IR.GlobalId IR.RExpr
     , globalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
     , nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+    , higherOrderDispatchers : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
     , kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
     , errors : List ResolveErrorEntry
     }
@@ -102,6 +103,7 @@ emptyResolvedProject =
     , bodies = Dict.empty
     , globalIdToName = Dict.empty
     , nativeDispatchers = Dict.empty
+    , higherOrderDispatchers = Dict.empty
     , kernelDispatchers = Dict.empty
     , errors = []
     }
@@ -240,6 +242,7 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                     , resolvedBodies = projectEnv.resolved.bodies
                     , globalIdToName = projectEnv.resolved.globalIdToName
                     , nativeDispatchers = projectEnv.resolved.nativeDispatchers
+                    , higherOrderDispatchers = projectEnv.resolved.higherOrderDispatchers
                     , kernelDispatchers = projectEnv.resolved.kernelDispatchers
                     , interceptsByGlobal = Dict.empty
                     , fallbackEnv = projectEnv.env
@@ -446,6 +449,17 @@ resolveProject summaries =
             NativeDispatch.buildRegistry
                 (\key -> Dict.get key globalIds)
 
+        -- Build the higher-order dispatcher registry — parallel to
+        -- `nativeDispatchers`, but for core functions like `List.foldl`
+        -- that take a callback Value. These dispatchers invoke callbacks
+        -- via `applyClosure` directly, bypassing the old evaluator's
+        -- `Kernel.function` marshaling layer which mis-handles
+        -- `RExprImpl` closures (patterns = [] but arity > 0).
+        higherOrderDispatchers : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
+        higherOrderDispatchers =
+            RE.buildHigherOrderRegistry
+                (\key -> Dict.get key globalIds)
+
         -- Build the kernel dispatcher registry by walking Core.functions
         -- and finding entries whose body is a direct kernel reference
         -- (the common "wrapper" pattern). For each such entry, precompute
@@ -505,6 +519,7 @@ resolveProject summaries =
             , bodies = Dict.empty
             , globalIdToName = globalIdToName
             , nativeDispatchers = nativeDispatchers
+            , higherOrderDispatchers = higherOrderDispatchers
             , kernelDispatchers = kernelDispatchers
             , errors = []
             }
@@ -2102,6 +2117,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                     , resolvedBodies = mergedBodies
                                     , globalIdToName = mergedGlobalIdToName
                                     , nativeDispatchers = baseResolved.nativeDispatchers
+                                    , higherOrderDispatchers = baseResolved.higherOrderDispatchers
                                     , kernelDispatchers = baseResolved.kernelDispatchers
                                     , interceptsByGlobal = interceptsByGlobal
                                     , fallbackEnv = bridgeEnv
@@ -2184,6 +2200,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                             , resolvedBodies = mergedBodies
                             , globalIdToName = mergedGlobalIdToName
                             , nativeDispatchers = baseResolved.nativeDispatchers
+                            , higherOrderDispatchers = baseResolved.higherOrderDispatchers
                             , kernelDispatchers = baseResolved.kernelDispatchers
                             , interceptsByGlobal = interceptsByGlobal
                             , fallbackEnv = finalEnv
