@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, projectEnvResolved, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, projectEnvResolved, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Bitwise
 import Core
@@ -241,6 +241,7 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                     , globalIdToName = projectEnv.resolved.globalIdToName
                     , nativeDispatchers = projectEnv.resolved.nativeDispatchers
                     , kernelDispatchers = projectEnv.resolved.kernelDispatchers
+                    , interceptsByGlobal = Dict.empty
                     , fallbackEnv = projectEnv.env
                     , fallbackConfig = dispatchConfig
                     , currentModule = [ "ResolvedEntry" ]
@@ -1729,6 +1730,348 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw (ProjectEnv projectEnv) add
                 , useResolvedIR = False
                 }
                 finalEnv
+
+
+{-| Resolved-IR variant of `evalWithEnvFromFilesAndValuesAndInterceptsRaw`.
+
+Takes the same inputs (additional Files to register, injected Values,
+intercepts dict, entry Expression) and routes them through the new
+`Eval.ResolvedExpression.evalR` path instead of `Eval.Expression`.
+
+The additional files are parsed-as-if-they-were-user-modules: each
+top-level declaration is assigned a fresh `GlobalId` and resolved to an
+`RExpr`, then spliced into a derived `ResolvedProject` that mirrors
+`projectEnv.resolved` plus the new entries. The env itself is also
+extended (via `buildModuleEnv`) so the fallback path — used by kernel
+calls and anything that doesn't hit the native/kernel dispatchers — sees
+the new modules exactly the same way the old evaluator does.
+
+Intercepts are precomputed into `interceptsByGlobal : Dict GlobalId (String, Intercept)`
+by joining the intercept keys against the merged `globalIds` table.
+Any intercept whose key doesn't match a known `(moduleName, name)` pair
+is silently dropped — this matches the old evaluator's behavior, which
+only fires intercepts on qualified function calls.
+
+Memoization is deliberately **not** supported in this path. Callers that
+need `memoizedFunctions` must route through the old entry point instead.
+This keeps the new path simple; Phase 4 Round 3 will port memo support.
+
+Injected Values are stored in `env.values` on the fallback env so that
+intercept callbacks invoking the fallback see them, matching the old
+path. They're **not** reachable from resolved-IR code directly — the
+new evaluator's `evalR` only looks up via `RLocal`/`RGlobal`, not by
+name. This matches the review runner's usage (injected values are
+consumed by intercept callbacks, not by user code).
+
+-}
+evalWithResolvedIRFromFilesAndIntercepts :
+    ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> Types.EvalResult Value
+evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
+    let
+        parsedModules =
+            additionalFiles
+                |> List.map
+                    (\file ->
+                        { file = file
+                        , moduleName = fileModuleName file
+                        , interface = buildInterfaceFromFile file
+                        }
+                    )
+
+        additionalInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces =
+            ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+        envResult =
+            parsedModules
+                |> Result.MyExtra.combineFoldl
+                    (\parsedModule envAcc ->
+                        buildModuleEnv allInterfaces parsedModule envAcc
+                    )
+                    (Ok projectEnv.env)
+    in
+    case envResult of
+        Err e ->
+            case e of
+                Types.ParsingError _ ->
+                    Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Env build error in evalWithResolvedIRFromFilesAndIntercepts" }
+
+                Types.EvalError evalErr ->
+                    Types.EvErr evalErr
+
+        Ok env ->
+            let
+                summaries : List CachedModuleSummary
+                summaries =
+                    buildCachedModuleSummariesFromParsed parsedModules
+
+                baseResolved : ResolvedProject
+                baseResolved =
+                    projectEnv.resolved
+
+                {- Pass 1: allocate a fresh GlobalId for every new
+                   top-level function in the additional modules. Start
+                   the counter at `1 + max(existing ids)` so it never
+                   collides with the base project's ids.
+                -}
+                nextInitialId : IR.GlobalId
+                nextInitialId =
+                    (baseResolved.globalIdToName
+                        |> Dict.keys
+                        |> List.maximum
+                        |> Maybe.withDefault -1
+                    )
+                        + 1
+
+                idAssignment : { next : Int, ids : Dict.Dict ( ModuleName, String ) IR.GlobalId, reverseIds : Dict.Dict IR.GlobalId ( ModuleName, String ) }
+                idAssignment =
+                    summaries
+                        |> List.foldl
+                            (\summary outer ->
+                                summary.functions
+                                    |> List.foldl
+                                        (\impl inner ->
+                                            let
+                                                name : String
+                                                name =
+                                                    Node.value impl.name
+                                            in
+                                            case Dict.get ( summary.moduleName, name ) inner.ids of
+                                                Just _ ->
+                                                    -- Re-registering an existing decl
+                                                    -- (e.g. same wrapper used twice).
+                                                    -- Reuse the existing id.
+                                                    inner
+
+                                                Nothing ->
+                                                    { next = inner.next + 1
+                                                    , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
+                                                    , reverseIds = Dict.insert inner.next ( summary.moduleName, name ) inner.reverseIds
+                                                    }
+                                        )
+                                        outer
+                            )
+                            { next = nextInitialId
+                            , ids = baseResolved.globalIds
+                            , reverseIds = baseResolved.globalIdToName
+                            }
+
+                mergedGlobalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+                mergedGlobalIds =
+                    idAssignment.ids
+
+                mergedGlobalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
+                mergedGlobalIdToName =
+                    idAssignment.reverseIds
+
+                {- Pass 2: resolve each new declaration's body against the
+                   merged globalIds table. Silently drop resolve errors —
+                   the entry expression resolution below will surface any
+                   missing name as its own UnknownName error.
+                -}
+                {- Pass 2: Resolve each new declaration's body against
+                   the merged globalIds table. Uses the alias-free
+                   `initContext` form for now — `initContextWithImports`
+                   is available but not yet safe to enable on this path,
+                   because successfully resolving user decls that pass
+                   local closures to core functions (`List.foldl`,
+                   `List.map`, etc.) currently crashes at eval time.
+                   See `Value.toExpression` around the `<resolved-closure>`
+                   placeholder and the Phase 4 r2 write-up. Until the
+                   `RExprImpl` / `AstImpl` closure bridge is in place
+                   (Phase 4 r3), we silently drop resolution failures
+                   and delegate the whole call to the old evaluator.
+                -}
+                mergedBodies : Dict.Dict IR.GlobalId IR.RExpr
+                mergedBodies =
+                    summaries
+                        |> List.foldl
+                            (\summary outer ->
+                                summary.functions
+                                    |> List.foldl
+                                        (\impl inner ->
+                                            let
+                                                name : String
+                                                name =
+                                                    Node.value impl.name
+
+                                                ctx : Resolver.ResolverContext
+                                                ctx =
+                                                    Resolver.initContext
+                                                        summary.moduleName
+                                                        mergedGlobalIds
+                                            in
+                                            case Resolver.resolveDeclaration ctx impl of
+                                                Ok rexpr ->
+                                                    case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                        Just id ->
+                                                            Dict.insert id rexpr inner
+
+                                                        Nothing ->
+                                                            inner
+
+                                                Err _ ->
+                                                    inner
+                                        )
+                                        outer
+                            )
+                            baseResolved.bodies
+
+                {- Precompute intercepts keyed by GlobalId so the hot
+                   RApply path can do a single Dict.get instead of
+                   formatting a qualified-name String on every function
+                   call.
+                -}
+                interceptsByGlobal : Dict.Dict IR.GlobalId ( String, Types.Intercept )
+                interceptsByGlobal =
+                    intercepts
+                        |> Dict.foldl
+                            (\key intercept acc ->
+                                case parseInterceptKey key of
+                                    Just ( moduleName, name ) ->
+                                        case Dict.get ( moduleName, name ) mergedGlobalIds of
+                                            Just id ->
+                                                Dict.insert id ( key, intercept ) acc
+
+                                            Nothing ->
+                                                acc
+
+                                    Nothing ->
+                                        acc
+                            )
+                            Dict.empty
+
+                lastModule : ModuleName
+                lastModule =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .moduleName
+                        |> Maybe.withDefault [ "Main" ]
+
+                lastFile : Maybe File
+                lastFile =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .file
+
+                finalImports =
+                    case lastFile of
+                        Just file ->
+                            (defaultImports ++ file.imports)
+                                |> List.foldl (processImport allInterfaces) emptyImports
+
+                        Nothing ->
+                            emptyImports
+
+                lastModuleKey : String
+                lastModuleKey =
+                    Environment.moduleKey lastModule
+
+                {- Build the fallback env with injected values merged in.
+                   The new evaluator's `delegateCoreApply` uses this env
+                   when it can't dispatch via native/kernel paths, and
+                   intercept callbacks receive it as their `Env` argument.
+                -}
+                finalEnv : Env
+                finalEnv =
+                    { env
+                        | currentModule = lastModule
+                        , currentModuleKey = lastModuleKey
+                        , currentModuleFunctions =
+                            Dict.get lastModuleKey env.shared.functions
+                                |> Maybe.withDefault Dict.empty
+                        , imports = finalImports
+                        , values =
+                            Dict.foldl
+                                (\name value acc -> Dict.insert name value acc)
+                                env.values
+                                injectedValues
+                    }
+
+                fallbackConfig : Types.Config
+                fallbackConfig =
+                    { trace = False
+                    , maxSteps = Nothing
+                    , tcoTarget = Nothing
+                    , callCounts = Nothing
+                    , intercepts = intercepts
+                    , memoizedFunctions = MemoSpec.emptyRegistry
+                    , collectMemoStats = False
+                    , useResolvedIR = False
+                    }
+
+                resolverCtx : Resolver.ResolverContext
+                resolverCtx =
+                    Resolver.initContext lastModule mergedGlobalIds
+            in
+            case Resolver.resolveExpression resolverCtx (fakeNode expression) of
+                Err resolveError ->
+                    Types.EvErr
+                        { currentModule = lastModule
+                        , callStack = []
+                        , error =
+                            Types.Unsupported
+                                ("resolver error in evalWithResolvedIRFromFilesAndIntercepts: " ++ resolverErrorToString resolveError)
+                        }
+
+                Ok rexpr ->
+                    let
+                        renv : RE.REnv
+                        renv =
+                            { locals = []
+                            , globals = Dict.empty
+                            , resolvedBodies = mergedBodies
+                            , globalIdToName = mergedGlobalIdToName
+                            , nativeDispatchers = baseResolved.nativeDispatchers
+                            , kernelDispatchers = baseResolved.kernelDispatchers
+                            , interceptsByGlobal = interceptsByGlobal
+                            , fallbackEnv = finalEnv
+                            , fallbackConfig = fallbackConfig
+                            , currentModule = lastModule
+                            , callStack = []
+                            }
+                    in
+                    RE.evalR renv rexpr
+
+
+{-| Split an intercept key like `"Review.Rule.initialCachePartsMarker"`
+into the `(moduleName, name)` pair that the resolver's `globalIds` table
+is keyed by. The last dot-separated segment is the function name; the
+rest is the module path.
+
+Returns `Nothing` for malformed keys (no dot, or empty name), matching
+the old evaluator's behavior of only firing intercepts on qualified
+function calls.
+
+-}
+parseInterceptKey : String -> Maybe ( ModuleName, String )
+parseInterceptKey key =
+    let
+        segments : List String
+        segments =
+            String.split "." key
+    in
+    case List.reverse segments of
+        name :: revModule ->
+            if String.isEmpty name || List.isEmpty revModule then
+                Nothing
+
+            else
+                Just ( List.reverse revModule, name )
+
+        [] ->
+            Nothing
 
 
 {-| Evaluate with function intercepts. Intercepts are checked before normal

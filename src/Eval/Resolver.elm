@@ -2,6 +2,7 @@ module Eval.Resolver exposing
     ( ResolveError(..)
     , ResolverContext
     , initContext
+    , initContextWithImports
     , resolveDeclaration
     , resolveExpression
     , resolvePattern
@@ -50,9 +51,11 @@ import Core
 import Elm.Syntax.Expression as Expression exposing (Expression, FunctionImplementation, LetDeclaration(..))
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern)
+import Environment
 import Eval.ResolvedIR as IR exposing (GlobalId, RExpr(..), RPattern(..))
 import FastDict
 import Syntax exposing (fakeNode)
+import Types exposing (ImportedNames)
 
 
 {-| Context threaded through the resolver.
@@ -74,6 +77,7 @@ type alias ResolverContext =
     { localNames : List String
     , globalIds : FastDict.Dict ( List String, String ) GlobalId
     , currentModule : List String
+    , imports : ImportedNames
     }
 
 
@@ -93,6 +97,38 @@ initContext currentModule globalIds =
     { localNames = []
     , globalIds = globalIds
     , currentModule = currentModule
+    , imports = emptyImports
+    }
+
+
+{-| Build a resolver context that also knows about the current module's
+import table, so the resolver can canonicalize aliased module references
+(`import Review.Project as Project` → `Project.addElmJson` resolves to
+`(["Review", "Project"], "addElmJson")`) and pick up values exposed via
+`exposing (..)` or `exposing (name, ...)`.
+
+Without this the resolver fails with `UnknownName` on any real user
+module that uses aliased imports — which is most of them.
+
+-}
+initContextWithImports :
+    List String
+    -> FastDict.Dict ( List String, String ) GlobalId
+    -> ImportedNames
+    -> ResolverContext
+initContextWithImports currentModule globalIds imports =
+    { localNames = []
+    , globalIds = globalIds
+    , currentModule = currentModule
+    , imports = imports
+    }
+
+
+emptyImports : ImportedNames
+emptyImports =
+    { aliases = FastDict.empty
+    , exposedValues = FastDict.empty
+    , exposedConstructors = FastDict.empty
     }
 
 
@@ -280,25 +316,66 @@ resolveFunctionOrValue ctx moduleName name =
 
             Nothing ->
                 if isConstructorName name then
-                    Ok (RCtor { moduleName = [], name = name })
+                    -- Unqualified constructor: check the current
+                    -- module's exposedConstructors table (imports
+                    -- `exposing (..)` or `exposing (Type(..))` populate
+                    -- this so the evaluator can match by full qualified
+                    -- name later).
+                    case FastDict.get name ctx.imports.exposedConstructors of
+                        Just ( canonicalModule, _ ) ->
+                            Ok (RCtor { moduleName = canonicalModule, name = name })
+
+                        Nothing ->
+                            Ok (RCtor { moduleName = [], name = name })
 
                 else
                     -- Unqualified value: try the current module first
                     -- (matches Elm's semantics for module-local references),
-                    -- then fall back to the explicit-empty key for imports
-                    -- that the caller may have pre-populated.
+                    -- then fall back to imported exposed values, then to
+                    -- the explicit-empty key that the caller may have
+                    -- pre-populated.
                     case FastDict.get ( ctx.currentModule, name ) ctx.globalIds of
                         Just id ->
                             Ok (RGlobal id)
 
                         Nothing ->
-                            resolveGlobal ctx [] name
+                            case FastDict.get name ctx.imports.exposedValues of
+                                Just ( canonicalModule, _ ) ->
+                                    case FastDict.get ( canonicalModule, name ) ctx.globalIds of
+                                        Just id ->
+                                            Ok (RGlobal id)
 
-    else if isConstructorName name then
-        Ok (RCtor { moduleName = moduleName, name = name })
+                                        Nothing ->
+                                            resolveGlobal ctx [] name
+
+                                Nothing ->
+                                    resolveGlobal ctx [] name
 
     else
-        resolveGlobal ctx moduleName name
+        let
+            -- Canonicalize the source module name through the imports
+            -- alias table. `import Review.Project as Project` gives an
+            -- `aliases` entry keyed by `"Project"` (the alias's module
+            -- key) that maps to `(["Review", "Project"], ...)`.
+            --
+            -- If the alias isn't in the table, we assume the source
+            -- module name is already canonical (e.g., an implicit-imported
+            -- module like `Basics`, or a module that was written fully
+            -- qualified without an alias).
+            canonicalModule : List String
+            canonicalModule =
+                case FastDict.get (Environment.moduleKey moduleName) ctx.imports.aliases of
+                    Just ( canonical, _ ) ->
+                        canonical
+
+                    Nothing ->
+                        moduleName
+        in
+        if isConstructorName name then
+            Ok (RCtor { moduleName = canonicalModule, name = name })
+
+        else
+            resolveGlobal ctx canonicalModule name
 
 
 findLocal : String -> Int -> List String -> Maybe Int

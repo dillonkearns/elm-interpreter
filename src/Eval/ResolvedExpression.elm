@@ -42,7 +42,6 @@ import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedIR as IR exposing (RExpr(..))
 import FastDict
 import MemoSpec
-import Rope
 import Syntax
 import Types
     exposing
@@ -52,6 +51,7 @@ import Types
         , EvalErrorKind(..)
         , EvalResult(..)
         , Implementation(..)
+        , Intercept(..)
         , Value(..)
         )
 import Value
@@ -88,6 +88,7 @@ type alias REnv =
             { arity : Int
             , kernelFn : List Value -> Config -> Env -> EvalResult Value
             }
+    , interceptsByGlobal : FastDict.Dict IR.GlobalId ( String, Intercept )
     , fallbackEnv : Env
     , fallbackConfig : Config
     , currentModule : ModuleName
@@ -112,6 +113,7 @@ emptyREnv =
     , globalIdToName = FastDict.empty
     , nativeDispatchers = FastDict.empty
     , kernelDispatchers = FastDict.empty
+    , interceptsByGlobal = FastDict.empty
     , fallbackEnv = Environment.empty []
     , fallbackConfig = emptyConfig
     , currentModule = []
@@ -166,13 +168,13 @@ evalR env expr =
                     EvOk (Float -f)
 
                 EvOk other ->
-                    evErr env (TypeError ("negate applied to non-numeric " ++ Debug.toString other))
+                    evErr env (TypeError ("negate applied to non-numeric " ++ Value.toString other))
 
                 other ->
                     other
 
         RList items ->
-            evalList env items
+            evalExprList env items
                 |> mapResult (\vs -> List vs)
 
         RTuple2 a b ->
@@ -237,7 +239,7 @@ evalR env expr =
                                 evErr env
                                     (TypeError
                                         ("if condition not Bool: "
-                                            ++ Debug.toString other
+                                            ++ Value.toString other
                                         )
                                     )
                     )
@@ -262,7 +264,7 @@ evalR env expr =
                                                     evErr env
                                                         (TypeError
                                                             ("&& right not Bool: "
-                                                                ++ Debug.toString other
+                                                                ++ Value.toString other
                                                             )
                                                         )
                                         )
@@ -270,7 +272,7 @@ evalR env expr =
                             other ->
                                 evErr env
                                     (TypeError
-                                        ("&& left not Bool: " ++ Debug.toString other)
+                                        ("&& left not Bool: " ++ Value.toString other)
                                     )
                     )
 
@@ -294,7 +296,7 @@ evalR env expr =
                                                     evErr env
                                                         (TypeError
                                                             ("|| right not Bool: "
-                                                                ++ Debug.toString other
+                                                                ++ Value.toString other
                                                             )
                                                         )
                                         )
@@ -302,7 +304,7 @@ evalR env expr =
                             other ->
                                 evErr env
                                     (TypeError
-                                        ("|| left not Bool: " ++ Debug.toString other)
+                                        ("|| left not Bool: " ++ Value.toString other)
                                     )
                     )
 
@@ -330,7 +332,7 @@ evalR env expr =
                                 evErr env
                                     (TypeError
                                         (".field access on non-record: "
-                                            ++ Debug.toString other
+                                            ++ Value.toString other
                                         )
                                     )
                     )
@@ -357,7 +359,7 @@ evalR env expr =
                             ("record update target (slot "
                                 ++ String.fromInt slotIdx
                                 ++ ") is not a record: "
-                                ++ Debug.toString other
+                                ++ Value.toString other
                             )
                         )
 
@@ -391,42 +393,11 @@ evalR env expr =
             -- `Application` AST.
             case headExpr of
                 RGlobal id ->
-                    case FastDict.get id env.globals of
-                        Just cached ->
-                            evalExprList env argExprs
-                                |> andThenList
-                                    (\argValues ->
-                                        applyClosure env cached argValues
-                                    )
-
-                        Nothing ->
-                            case FastDict.get id env.resolvedBodies of
-                                Just _ ->
-                                    evalR env headExpr
-                                        |> andThenValue
-                                            (\headValue ->
-                                                evalExprList env argExprs
-                                                    |> andThenList
-                                                        (\argValues ->
-                                                            applyClosure env headValue argValues
-                                                        )
-                                            )
-
-                                Nothing ->
-                                    -- Core dispatch: try the native
-                                    -- dispatcher registry first to avoid
-                                    -- the Value.toExpression + synthesized
-                                    -- AST round-trip for hot functions.
-                                    evalExprList env argExprs
-                                        |> andThenList
-                                            (\argValues ->
-                                                case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
-                                                    Just result ->
-                                                        EvOk result
-
-                                                    Nothing ->
-                                                        delegateCoreApply env id argValues
-                                            )
+                    evalExprList env argExprs
+                        |> andThenList
+                            (\argValues ->
+                                dispatchGlobalApply env id argValues
+                            )
 
                 _ ->
                     evalR env headExpr
@@ -604,7 +575,7 @@ applyClosure env head newArgs =
             other ->
                 evErr env
                     (TypeError
-                        ("apply on non-callable: " ++ Debug.toString other)
+                        ("apply on non-callable: " ++ Value.toString other)
                     )
 
 
@@ -707,6 +678,82 @@ evalGlobal env id =
                     delegateCoreApply env id []
 
 
+{-| Dispatch an RGlobal being called with the given (already-evaluated)
+argument Values. Order of precedence:
+
+1. **Intercepts.** If the GlobalId has a registered intercept, call its
+   callback with the args + fallback Config/Env. Matches the old
+   evaluator's intercept check in `Eval.Expression` around line 1892.
+2. **Cached globals.** If the global value is memoized in `env.globals`
+   (e.g., a top-level arity-0 value), apply args to that value.
+3. **User declarations.** If the global has an `RExpr` body in
+   `env.resolvedBodies`, evaluate it to a Value (which produces a
+   closure for arity > 0) and apply args.
+4. **Native dispatch.** Hot operators like `+`, `-`, `==` go directly
+   through `NativeDispatch.tryDispatch`.
+5. **Delegation fallback.** Synthesize a Core call and hand it to the
+   old evaluator.
+
+The intercept check happens **first** because intercepts are how the
+framework short-circuits dispatch at specific qualified names — they
+must beat every other path.
+
+-}
+dispatchGlobalApply : REnv -> IR.GlobalId -> List Value -> EvalResult Value
+dispatchGlobalApply env id argValues =
+    case FastDict.get id env.interceptsByGlobal of
+        Just ( qualifiedName, Intercept interceptFn ) ->
+            let
+                evaluateOriginal : () -> EvalResult Value
+                evaluateOriginal () =
+                    dispatchGlobalApplyNoIntercept env id argValues
+            in
+            interceptFn
+                { qualifiedName = qualifiedName
+                , evaluateOriginal = evaluateOriginal
+                }
+                argValues
+                env.fallbackConfig
+                env.fallbackEnv
+
+        Nothing ->
+            dispatchGlobalApplyNoIntercept env id argValues
+
+
+{-| Same as `dispatchGlobalApply` but skips the intercept check. Used as
+the `evaluateOriginal` continuation for intercept callbacks that want to
+fall back to normal dispatch, and for calls that have already been
+intercept-checked.
+-}
+dispatchGlobalApplyNoIntercept : REnv -> IR.GlobalId -> List Value -> EvalResult Value
+dispatchGlobalApplyNoIntercept env id argValues =
+    case FastDict.get id env.globals of
+        Just cached ->
+            applyClosure env cached argValues
+
+        Nothing ->
+            case FastDict.get id env.resolvedBodies of
+                Just body ->
+                    let
+                        topLevelEnv : REnv
+                        topLevelEnv =
+                            { env | locals = [] }
+                    in
+                    evalR topLevelEnv body
+                        |> andThenValue
+                            (\headValue ->
+                                applyClosure env headValue argValues
+                            )
+
+                Nothing ->
+                    case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
+                        Just result ->
+                            EvOk result
+
+                        Nothing ->
+                            delegateCoreApply env id argValues
+
+
 {-| Delegate a core declaration call to the old evaluator by synthesizing
 an `Application` AST (or a bare `FunctionOrValue` for zero-arg) and
 calling `Eval.Expression.evalExpression`.
@@ -779,15 +826,21 @@ delegateViaAst env id args =
                 baseEnv =
                     env.fallbackEnv
 
+                dispatchModuleKey : String
+                dispatchModuleKey =
+                    Environment.moduleKey moduleName
+
                 dispatchEnv : Env
                 dispatchEnv =
                     { baseEnv
                         | currentModule = moduleName
-                        , currentModuleKey = Environment.moduleKey moduleName
+                        , currentModuleKey = dispatchModuleKey
                         , currentModuleFunctions =
-                            FastDict.get (Environment.moduleKey moduleName)
-                                baseEnv.shared.functions
+                            FastDict.get dispatchModuleKey baseEnv.shared.functions
                                 |> Maybe.withDefault FastDict.empty
+                        , imports =
+                            FastDict.get dispatchModuleKey baseEnv.shared.moduleImports
+                                |> Maybe.withDefault baseEnv.imports
                     }
             in
             Eval.Expression.evalExpression fullExpr env.fallbackConfig dispatchEnv
@@ -837,7 +890,7 @@ evalCaseBranches env scrutinee branches =
             evErr env
                 (TypeError
                     ("case expression failed to match any branch for value: "
-                        ++ Debug.toString scrutinee
+                        ++ Value.toString scrutinee
                     )
                 )
 
@@ -855,65 +908,44 @@ evalCaseBranches env scrutinee branches =
 
 
 {-| Evaluate a list of RExprs to a list of Values in order. Propagates
-errors from any element; short-circuits on the first failure.
+errors from any element; short-circuits on the first failure. Properly
+threads `EvYield` / `EvMemoLookup` / `EvMemoStore` continuations so that
+any intercept or memo hook encountered while evaluating a sub-expression
+resumes at the right position in the list.
 -}
 evalExprList : REnv -> List RExpr -> EvalResult (List Value)
 evalExprList env exprs =
-    List.foldr
-        (\expr acc ->
-            case acc of
-                EvOk vs ->
-                    case evalR env expr of
-                        EvOk v ->
-                            EvOk (v :: vs)
+    case exprs of
+        [] ->
+            EvOk []
 
-                        EvErr e ->
-                            EvErr e
-
-                        other ->
-                            unsupportedResult "evalExprList" other
-
-                EvErr _ ->
-                    acc
-
-                _ ->
-                    acc
-        )
-        (EvOk [])
-        exprs
+        expr :: rest ->
+            bindValueResult (evalR env expr)
+                (\v ->
+                    mapListResult (\vs -> v :: vs) (evalExprList env rest)
+                )
 
 
 {-| Evaluate a record's field list in source order, returning the list of
 `(name, Value)` pairs. Callers fold this into a `FastDict` to produce the
-final `Record` value.
+final `Record` value. Threads yield/memo continuations through field
+evaluation, matching `evalExprList`.
 -}
 evalRecordFields :
     REnv
     -> List ( String, RExpr )
     -> EvalResult (List ( String, Value ))
 evalRecordFields env fields =
-    List.foldr
-        (\( fieldName, fieldExpr ) acc ->
-            case acc of
-                EvOk rest ->
-                    case evalR env fieldExpr of
-                        EvOk v ->
-                            EvOk (( fieldName, v ) :: rest)
+    case fields of
+        [] ->
+            EvOk []
 
-                        EvErr e ->
-                            EvErr e
-
-                        other ->
-                            unsupportedResult "record field" other
-
-                EvErr _ ->
-                    acc
-
-                _ ->
-                    acc
-        )
-        (EvOk [])
-        fields
+        ( fieldName, fieldExpr ) :: rest ->
+            bindValueResultToField (evalR env fieldExpr)
+                (\v ->
+                    mapFieldResult (\vs -> ( fieldName, v ) :: vs)
+                        (evalRecordFields env rest)
+                )
 
 
 {-| Sequential let evaluation.
@@ -937,80 +969,65 @@ evalLetBindings :
     -> List IR.RLetBinding
     -> EvalResult (List Value)
 evalLetBindings env bindings =
-    List.foldl
-        (\binding accResult ->
-            case accResult of
-                EvOk locals ->
-                    let
-                        bodyEnv : REnv
-                        bodyEnv =
-                            { env | locals = locals }
-                    in
-                    if binding.arity > 0 then
-                        -- Function binding: the body is an `RLambda` whose
-                        -- body was resolved expecting `self` in the locals
-                        -- stack (selfRecExtendedLocals in the resolver).
-                        -- Build the closure with selfSlots = 1 so the
-                        -- evaluator prepends the closure itself to
-                        -- captured locals at call time, matching the
-                        -- resolver's layout.
-                        --
-                        -- We look *inside* the RLambda rather than calling
-                        -- evalR on it because evalR would produce a
-                        -- regular closure with selfSlots = 0.
-                        case binding.body of
-                            RLambda lambda ->
-                                let
-                                    closureValue : Value
-                                    closureValue =
-                                        makeClosure
-                                            bodyEnv
-                                            lambda.arity
-                                            lambda.body
-                                            1
-                                            Nothing
-                                in
-                                EvOk (closureValue :: locals)
+    evalLetBindingsHelp env env.locals bindings
 
-                            _ ->
+
+evalLetBindingsHelp :
+    REnv
+    -> List Value
+    -> List IR.RLetBinding
+    -> EvalResult (List Value)
+evalLetBindingsHelp env locals bindings =
+    case bindings of
+        [] ->
+            EvOk locals
+
+        binding :: rest ->
+            let
+                bodyEnv : REnv
+                bodyEnv =
+                    { env | locals = locals }
+            in
+            if binding.arity > 0 then
+                case binding.body of
+                    RLambda lambda ->
+                        let
+                            closureValue : Value
+                            closureValue =
+                                makeClosure
+                                    bodyEnv
+                                    lambda.arity
+                                    lambda.body
+                                    1
+                                    Nothing
+                        in
+                        evalLetBindingsHelp env (closureValue :: locals) rest
+
+                    _ ->
+                        evErr env
+                            (TypeError
+                                ("let function binding '"
+                                    ++ binding.debugName
+                                    ++ "' body is not an RLambda"
+                                )
+                            )
+
+            else
+                bindValueResult (evalR bodyEnv binding.body)
+                    (\value ->
+                        case matchPattern binding.pattern value locals of
+                            Just newLocals ->
+                                evalLetBindingsHelp env newLocals rest
+
+                            Nothing ->
                                 evErr env
                                     (TypeError
-                                        ("let function binding '"
+                                        ("pattern match failed in let binding '"
                                             ++ binding.debugName
-                                            ++ "' body is not an RLambda"
+                                            ++ "'"
                                         )
                                     )
-
-                    else
-                        case evalR bodyEnv binding.body of
-                            EvOk value ->
-                                case matchPattern binding.pattern value locals of
-                                    Just newLocals ->
-                                        EvOk newLocals
-
-                                    Nothing ->
-                                        evErr env
-                                            (TypeError
-                                                ("pattern match failed in let binding '"
-                                                    ++ binding.debugName
-                                                    ++ "'"
-                                                )
-                                            )
-
-                            EvErr e ->
-                                EvErr e
-
-                            other ->
-                                unsupportedResult "let binding" other
-
-                EvErr _ ->
-                    accResult
-
-                _ ->
-                    accResult
-        )
-        (EvOk env.locals)
-        bindings
+                    )
 
 
 {-| Match a value against a pattern, extending the locals stack with the
@@ -1252,6 +1269,16 @@ bindRecordFields fieldNames fieldDict locals =
                     Nothing
 
 
+{-| Bind the result of an `EvalResult Value` to a continuation, correctly
+propagating `EvYield` / `EvMemoLookup` / `EvMemoStore` by wrapping their
+resume callbacks. Used across every caller that needs to sequence work
+after evaluating a sub-expression.
+
+`EvOkTrace` / `EvErrTrace` aren't actively used by the review runner
+benchmark (trace is off), so they short-circuit to `EvErr` if
+encountered — matches previous behavior.
+
+-}
 andThenValue :
     (Value -> EvalResult Value)
     -> EvalResult Value
@@ -1264,8 +1291,20 @@ andThenValue f result =
         EvErr e ->
             EvErr e
 
-        _ ->
-            unsupportedResult "andThenValue" result
+        EvYield tag payload resume ->
+            EvYield tag payload (\value -> andThenValue f (resume value))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> andThenValue f (resume maybeValue))
+
+        EvMemoStore payload inner ->
+            EvMemoStore payload (andThenValue f inner)
+
+        EvOkTrace _ _ _ ->
+            evErrBlank "andThenValue: EvOkTrace not supported in new evaluator"
+
+        EvErrTrace e tree logs ->
+            EvErrTrace e tree logs
 
 
 andThenList :
@@ -1280,72 +1319,139 @@ andThenList f result =
         EvErr e ->
             EvErr e
 
-        _ ->
-            -- Same limitation as andThenValue: trace/yield/memo not
-            -- propagated in iteration 3b1.
-            EvErr
-                { currentModule = []
-                , callStack = []
-                , error = Unsupported "andThenList non-Ok/non-Err result"
-                }
+        EvYield tag payload resume ->
+            EvYield tag payload (\value -> andThenList f (resume value))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> andThenList f (resume maybeValue))
+
+        EvMemoStore payload inner ->
+            EvMemoStore payload (andThenList f inner)
+
+        EvOkTrace _ _ _ ->
+            evErrBlank "andThenList: EvOkTrace not supported in new evaluator"
+
+        EvErrTrace e tree logs ->
+            EvErrTrace e tree logs
 
 
-unsupportedResult : String -> EvalResult a -> EvalResult b
-unsupportedResult context _ =
-    EvErr
-        { currentModule = []
-        , callStack = []
-        , error =
-            Unsupported
-                (context ++ ": non-Ok/non-Err EvalResult not supported in iteration 3b1")
-        }
+{-| Bind an `EvalResult Value` to a continuation that itself returns an
+`EvalResult (List Value)`. Separate from `andThenValue` because the
+return type differs. Propagates yield/memo.
+-}
+bindValueResult :
+    EvalResult Value
+    -> (Value -> EvalResult (List Value))
+    -> EvalResult (List Value)
+bindValueResult result f =
+    case result of
+        EvOk v ->
+            f v
+
+        EvErr e ->
+            EvErr e
+
+        EvYield tag payload resume ->
+            EvYield tag payload (\value -> bindValueResult (resume value) f)
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> bindValueResult (resume maybeValue) f)
+
+        EvMemoStore payload inner ->
+            EvMemoStore payload (bindValueResult inner f)
+
+        EvOkTrace _ _ _ ->
+            evErrBlank "bindValueResult: EvOkTrace not supported in new evaluator"
+
+        EvErrTrace e tree logs ->
+            EvErrTrace e tree logs
 
 
-evalList : REnv -> List RExpr -> EvalResult (List Value)
-evalList env exprs =
-    case exprs of
-        [] ->
-            EvOk []
+bindValueResultToField :
+    EvalResult Value
+    -> (Value -> EvalResult (List ( String, Value )))
+    -> EvalResult (List ( String, Value ))
+bindValueResultToField result f =
+    case result of
+        EvOk v ->
+            f v
 
-        head :: rest ->
-            case evalR env head of
-                EvOk v ->
-                    case evalList env rest of
-                        EvOk vs ->
-                            EvOk (v :: vs)
+        EvErr e ->
+            EvErr e
 
-                        err ->
-                            err
+        EvYield tag payload resume ->
+            EvYield tag payload (\value -> bindValueResultToField (resume value) f)
 
-                EvErr e ->
-                    EvErr e
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> bindValueResultToField (resume maybeValue) f)
 
-                EvOkTrace v tree logs ->
-                    case evalList env rest of
-                        EvOk vs ->
-                            EvOkTrace (v :: vs) tree logs
+        EvMemoStore payload inner ->
+            EvMemoStore payload (bindValueResultToField inner f)
 
-                        EvOkTrace vs tree2 logs2 ->
-                            EvOkTrace (v :: vs) (Rope.appendTo tree tree2) (Rope.appendTo logs logs2)
+        EvOkTrace _ _ _ ->
+            evErrBlank "bindValueResultToField: EvOkTrace not supported in new evaluator"
 
-                        other ->
-                            other
-
-                EvErrTrace e tree logs ->
-                    EvErrTrace e tree logs
-
-                EvYield _ _ _ ->
-                    -- Yield/memo support is a later-iteration concern.
-                    evErr env (Unsupported "EvYield in RList (iteration 3b)")
-
-                EvMemoLookup _ _ ->
-                    evErr env (Unsupported "EvMemoLookup in RList (iteration 3b)")
-
-                EvMemoStore _ _ ->
-                    evErr env (Unsupported "EvMemoStore in RList (iteration 3b)")
+        EvErrTrace e tree logs ->
+            EvErrTrace e tree logs
 
 
-mapResult : (a -> b) -> EvalResult a -> EvalResult b
+mapListResult :
+    (List Value -> List Value)
+    -> EvalResult (List Value)
+    -> EvalResult (List Value)
+mapListResult f result =
+    case result of
+        EvOk vs ->
+            EvOk (f vs)
+
+        EvErr e ->
+            EvErr e
+
+        EvYield tag payload resume ->
+            EvYield tag payload (\value -> mapListResult f (resume value))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> mapListResult f (resume maybeValue))
+
+        EvMemoStore payload inner ->
+            EvMemoStore payload (mapListResult f inner)
+
+        EvOkTrace _ _ _ ->
+            evErrBlank "mapListResult: EvOkTrace not supported in new evaluator"
+
+        EvErrTrace e tree logs ->
+            EvErrTrace e tree logs
+
+
+mapFieldResult :
+    (List ( String, Value ) -> List ( String, Value ))
+    -> EvalResult (List ( String, Value ))
+    -> EvalResult (List ( String, Value ))
+mapFieldResult f result =
+    case result of
+        EvOk vs ->
+            EvOk (f vs)
+
+        EvErr e ->
+            EvErr e
+
+        EvYield tag payload resume ->
+            EvYield tag payload (\value -> mapFieldResult f (resume value))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> mapFieldResult f (resume maybeValue))
+
+        EvMemoStore payload inner ->
+            EvMemoStore payload (mapFieldResult f inner)
+
+        EvOkTrace _ _ _ ->
+            evErrBlank "mapFieldResult: EvOkTrace not supported in new evaluator"
+
+        EvErrTrace e tree logs ->
+            EvErrTrace e tree logs
+
+
+mapResult : (a -> Value) -> EvalResult a -> EvalResult Value
 mapResult f result =
     case result of
         EvOk v ->
@@ -1354,32 +1460,29 @@ mapResult f result =
         EvErr e ->
             EvErr e
 
+        EvYield tag payload resume ->
+            EvYield tag payload (\value -> mapResult f (resume value))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> mapResult f (resume maybeValue))
+
+        EvMemoStore payload inner ->
+            EvMemoStore payload (mapResult f inner)
+
         EvOkTrace v tree logs ->
             EvOkTrace (f v) tree logs
 
         EvErrTrace e tree logs ->
             EvErrTrace e tree logs
 
-        EvYield _ _ _ ->
-            EvErr
-                { currentModule = []
-                , callStack = []
-                , error = Unsupported "EvYield in mapResult"
-                }
 
-        EvMemoLookup _ _ ->
-            EvErr
-                { currentModule = []
-                , callStack = []
-                , error = Unsupported "EvMemoLookup in mapResult"
-                }
-
-        EvMemoStore _ _ ->
-            EvErr
-                { currentModule = []
-                , callStack = []
-                , error = Unsupported "EvMemoStore in mapResult"
-                }
+evErrBlank : String -> EvalResult a
+evErrBlank msg =
+    EvErr
+        { currentModule = []
+        , callStack = []
+        , error = Unsupported msg
+        }
 
 
 evErr : REnv -> EvalErrorKind -> EvalResult a
