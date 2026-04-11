@@ -44,6 +44,7 @@ import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedIR as IR exposing (RExpr(..))
 import FastDict
 import MemoSpec
+import Set
 import Syntax
 import Types
     exposing
@@ -155,6 +156,8 @@ emptyREnv =
 emptyConfig : Config
 emptyConfig =
     { trace = False
+    , coverage = False
+    , coverageProbeLines = Set.empty
     , maxSteps = Nothing
     , tcoTarget = Nothing
     , callCounts = Nothing
@@ -1460,6 +1463,12 @@ andThenValue f result =
         EvErrTrace e tree logs ->
             EvErrTrace e tree logs
 
+        EvOkCoverage _ _ ->
+            evErrBlank "andThenValue: EvOkCoverage not supported in new evaluator"
+
+        EvErrCoverage _ _ ->
+            evErrBlank "andThenValue: EvErrCoverage not supported in new evaluator"
+
 
 andThenList :
     (List Value -> EvalResult Value)
@@ -1487,6 +1496,12 @@ andThenList f result =
 
         EvErrTrace e tree logs ->
             EvErrTrace e tree logs
+
+        EvOkCoverage _ _ ->
+            evErrBlank "andThenList: EvOkCoverage not supported in new evaluator"
+
+        EvErrCoverage _ _ ->
+            evErrBlank "andThenList: EvErrCoverage not supported in new evaluator"
 
 
 {-| Bind an `EvalResult Value` to a continuation that itself returns an
@@ -1520,6 +1535,12 @@ bindValueResult result f =
         EvErrTrace e tree logs ->
             EvErrTrace e tree logs
 
+        EvOkCoverage _ _ ->
+            evErrBlank "bindValueResult: EvOkCoverage not supported in new evaluator"
+
+        EvErrCoverage _ _ ->
+            evErrBlank "bindValueResult: EvErrCoverage not supported in new evaluator"
+
 
 bindValueResultToField :
     EvalResult Value
@@ -1547,6 +1568,12 @@ bindValueResultToField result f =
 
         EvErrTrace e tree logs ->
             EvErrTrace e tree logs
+
+        EvOkCoverage _ _ ->
+            evErrBlank "bindValueResultToField: EvOkCoverage not supported in new evaluator"
+
+        EvErrCoverage _ _ ->
+            evErrBlank "bindValueResultToField: EvErrCoverage not supported in new evaluator"
 
 
 mapListResult :
@@ -1576,6 +1603,12 @@ mapListResult f result =
         EvErrTrace e tree logs ->
             EvErrTrace e tree logs
 
+        EvOkCoverage _ _ ->
+            evErrBlank "mapListResult: EvOkCoverage not supported in new evaluator"
+
+        EvErrCoverage _ _ ->
+            evErrBlank "mapListResult: EvErrCoverage not supported in new evaluator"
+
 
 mapFieldResult :
     (List ( String, Value ) -> List ( String, Value ))
@@ -1604,6 +1637,12 @@ mapFieldResult f result =
         EvErrTrace e tree logs ->
             EvErrTrace e tree logs
 
+        EvOkCoverage _ _ ->
+            evErrBlank "mapFieldResult: EvOkCoverage not supported in new evaluator"
+
+        EvErrCoverage _ _ ->
+            evErrBlank "mapFieldResult: EvErrCoverage not supported in new evaluator"
+
 
 mapResult : (a -> Value) -> EvalResult a -> EvalResult Value
 mapResult f result =
@@ -1628,6 +1667,12 @@ mapResult f result =
 
         EvErrTrace e tree logs ->
             EvErrTrace e tree logs
+
+        EvOkCoverage v s ->
+            EvOkCoverage (f v) s
+
+        EvErrCoverage e s ->
+            EvErrCoverage e s
 
 
 evErrBlank : String -> EvalResult a

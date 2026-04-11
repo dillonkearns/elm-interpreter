@@ -59,5 +59,8 @@ interpretModule source =
 
                             Todo msg ->
                                 "Todo: " ++ msg
+
+                            TailCall _ ->
+                                "TailCall (escaped)"
                        )
                 )

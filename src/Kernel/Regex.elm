@@ -12,6 +12,7 @@ import EvalResult
 import FastDict as Dict
 import Regex
 import Rope
+import Set
 import Types exposing (Eval, EvalResult(..), Value(..))
 import Value
 
@@ -214,3 +215,20 @@ replaceHelp matches replacerFn original offset acc cfg env =
 
                 EvMemoStore payload _ ->
                     EvMemoStore payload (EvalResult.succeed original)
+
+                EvOkCoverage (String replacement) s ->
+                    case replaceHelp rest replacerFn original (m.index + String.length m.match) (acc ++ before ++ replacement) cfg env of
+                        EvOkCoverage v s2 ->
+                            EvOkCoverage v (Set.union s s2)
+
+                        EvOk v ->
+                            EvOkCoverage v s
+
+                        other ->
+                            other
+
+                EvOkCoverage other _ ->
+                    EvalResult.fail (Value.typeError env ("Regex.replace: replacer must return a String, got: " ++ Value.toString other))
+
+                EvErrCoverage e s ->
+                    EvErrCoverage e s

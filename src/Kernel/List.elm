@@ -86,6 +86,12 @@ mapResumeAfterFx f rest acc cfg env fxResult =
             EvMemoStore payload
                 (mapResumeAfterFx f rest acc cfg env next)
 
+        EvOkCoverage mapped _ ->
+            mapHelp f rest (mapped :: acc) cfg env
+
+        EvErrCoverage e _ ->
+            EvErr e
+
 
 {-| Like `attachTrace` but for `EvalResult (List Value)` — used inside
 `mapResumeAfterFx` where the result type is a list, not a single value.
@@ -113,6 +119,12 @@ attachTraceList prevCalls prevLogs result =
 
         EvMemoStore payload next ->
             EvMemoStore payload (attachTraceList prevCalls prevLogs next)
+
+        EvOkCoverage vs _ ->
+            EvOkTrace vs prevCalls prevLogs
+
+        EvErrCoverage e _ ->
+            EvErrTrace e prevCalls prevLogs
 
 
 {-| Kernel List.foldl: reduces a list from the left.
@@ -217,6 +229,22 @@ foldlResumeAfterFx f acc rest cfg env fxResult =
             EvMemoStore payload
                 (foldlResumeAfterFx f acc rest cfg env next)
 
+        EvOkCoverage g _ ->
+            let
+                innerCfg : Types.Config
+                innerCfg =
+                    { cfg | tcoTarget = Nothing }
+            in
+            case g acc innerCfg env of
+                EvOk newAcc ->
+                    foldlHelp f newAcc rest cfg env
+
+                otherAccResult ->
+                    foldlResumeAfterAcc f rest cfg env otherAccResult
+
+        EvErrCoverage e _ ->
+            EvErr e
+
 
 {-| Continuation used after `g acc` returns something other than `EvOk`.
 On success we rejoin the TCO'd main loop at `foldlHelp`; otherwise we
@@ -256,6 +284,12 @@ foldlResumeAfterAcc f rest cfg env accResult =
             EvMemoStore payload
                 (foldlResumeAfterAcc f rest cfg env next)
 
+        EvOkCoverage newAcc _ ->
+            foldlHelp f newAcc rest cfg env
+
+        EvErrCoverage e _ ->
+            EvErr e
+
 
 {-| Prepend accumulated calls/logs to an `EvalResult`, preserving the
 outer variant. Used to keep trace information flowing through fold
@@ -284,6 +318,12 @@ attachTrace prevCalls prevLogs result =
 
         EvMemoStore payload next ->
             EvMemoStore payload (attachTrace prevCalls prevLogs next)
+
+        EvOkCoverage v _ ->
+            EvOkTrace v prevCalls prevLogs
+
+        EvErrCoverage e _ ->
+            EvErrTrace e prevCalls prevLogs
 
 
 {-| Kernel List.filter: keeps elements where the predicate returns True.

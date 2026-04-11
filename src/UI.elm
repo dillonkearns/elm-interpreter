@@ -22,7 +22,7 @@ import Html
 import Json.Encode
 import List.Extra
 import MemoSpec
-import Rope
+import Rope exposing (Rope)
 import Set
 import Types exposing (CallTree(..), Error(..), Value)
 import UI.Source as Source
@@ -483,9 +483,53 @@ viewOutput output =
 
 viewCallTree : String -> CallTreeZipper -> Element Msg
 viewCallTree source ((CallTreeZipper { current, parent }) as zipper) =
+    case current of
+        CoverageRange _ ->
+            Element.none
+
+        CoverageSet _ ->
+            Element.none
+
+        CallNode callNodeData ->
+            viewCallNode source zipper callNodeData current parent
+
+
+viewCallNode :
+    String
+    -> CallTreeZipper
+    ->
+        { expression : Node.Node Expression.Expression
+        , result : Result Types.EvalErrorData Types.Value
+        , children : Rope CallTree
+        , env : Types.Env
+        }
+    -> CallTree
+    -> Maybe CallTreeZipper
+    -> Element Msg
+viewCallNode source zipper { expression, children, env, result } current parent =
     let
-        (CallNode { expression, children, env, result }) =
-            current
+        childButton child =
+            case child of
+                CallNode childData ->
+                    Just
+                        { range = Node.range childData.expression
+                        , onPress =
+                            Focus
+                                { current = child
+                                , parent = Just zipper
+                                }
+                                |> Just
+                        , tooltip =
+                            case childData.result of
+                                Err _ ->
+                                    Nothing
+
+                                Ok value ->
+                                    Just (Value.toString value)
+                        }
+
+                _ ->
+                    Nothing
 
         sourceViewConfig : Source.Config Msg
         sourceViewConfig =
@@ -493,24 +537,7 @@ viewCallTree source ((CallTreeZipper { current, parent }) as zipper) =
                 { highlight = Just <| Node.range expression
                 , buttons =
                     Rope.toList children
-                        |> List.map
-                            (\((CallNode childData) as child) ->
-                                { range = Node.range childData.expression
-                                , onPress =
-                                    Focus
-                                        { current = child
-                                        , parent = Just zipper
-                                        }
-                                        |> Just
-                                , tooltip =
-                                    case childData.result of
-                                        Err _ ->
-                                            Nothing
-
-                                        Ok value ->
-                                            Just (Value.toString value)
-                                }
-                            )
+                        |> List.filterMap childButton
                 , source = source
                 }
 
@@ -652,7 +679,20 @@ viewEnv { values } =
 
 
 viewNode : CallTree -> Maybe CallTree -> Element msg
-viewNode (CallNode { expression, result }) child =
+viewNode tree child =
+    case tree of
+        CoverageRange _ ->
+            Element.none
+
+        CoverageSet _ ->
+            Element.none
+
+        CallNode { expression, result } ->
+            viewCallNodeRow expression result child
+
+
+viewCallNodeRow : Node.Node Expression.Expression -> Result Types.EvalErrorData Types.Value -> Maybe CallTree -> Element msg
+viewCallNodeRow expression result child =
     let
         expressionString : String
         expressionString =
@@ -666,33 +706,39 @@ viewNode (CallNode { expression, result }) child =
 
                 Err e ->
                     Types.evalErrorToString e
+
+        childHighlight childTree =
+            case childTree of
+                CallNode childNode ->
+                    let
+                        expressionStart : Location
+                        expressionStart =
+                            (Node.range expression).start
+
+                        { start, end } =
+                            Node.range childNode.expression
+
+                        move : Location -> Location
+                        move location =
+                            { row = location.row - expressionStart.row + 1
+                            , column = location.column - expressionStart.column + 1
+                            }
+                    in
+                    Just
+                        { start = move start
+                        , end = move end
+                        }
+
+                _ ->
+                    Nothing
     in
     Theme.row []
         [ Source.viewExpression []
             { source = expressionString
             , buttons = []
             , highlight =
-                Maybe.map
-                    (\(CallNode childNode) ->
-                        let
-                            expressionStart : Location
-                            expressionStart =
-                                (Node.range expression).start
-
-                            { start, end } =
-                                Node.range childNode.expression
-
-                            move : Location -> Location
-                            move location =
-                                { row = location.row - expressionStart.row + 1
-                                , column = location.column - expressionStart.column + 1
-                                }
-                        in
-                        { start = move start
-                        , end = move end
-                        }
-                    )
-                    child
+                child
+                    |> Maybe.andThen childHighlight
                     |> Debug.log ("highlight for " ++ expressionString)
             }
         , el
@@ -712,8 +758,16 @@ viewNode (CallNode { expression, result }) child =
 
 
 nodeSize : CallTree -> number
-nodeSize (CallNode { children }) =
-    List.foldl (\child acc -> acc + nodeSize child) 1 (Rope.toList children)
+nodeSize tree =
+    case tree of
+        CallNode { children } ->
+            List.foldl (\child acc -> acc + nodeSize child) 1 (Rope.toList children)
+
+        CoverageRange _ ->
+            0
+
+        CoverageSet _ ->
+            0
 
 
 viewLogLines : List String -> Element msg
@@ -743,7 +797,7 @@ update msg model =
 
                 ( result, callTree, logLines ) =
                     Eval.Module.traceOrEvalModule
-                        { trace = tracing, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
+                        { trace = tracing, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = FastDict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
                         moduleSource
                         (Expression.FunctionOrValue [] "main")
 

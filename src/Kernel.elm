@@ -394,6 +394,32 @@ functions evalFunction =
         , ( "findSubString", parserFindSubString )
         ]
       )
+
+    -- Native Random.next / Random.peel / Random.int / Random.float fast paths.
+    -- elm/random is a tight bit-math module but each primitive goes through
+    -- the AST evaluator per call, which dominates fuzz-test throughput.
+    -- Random.int and Random.float construct a Generator wrapping a native
+    -- KernelImpl closure — when Random.step (still in user source) unwraps
+    -- and applies it, the kernel runs host-Elm bit math directly with lo/hi
+    -- captured as oldArgs on the PartiallyApplied.
+    , ( [ "Random" ]
+      , [ ( "next", randomNextKernel )
+        , ( "peel", randomPeelKernel )
+        , ( "int", randomIntKernel )
+        , ( "float", randomFloatKernel )
+        ]
+      )
+
+    -- Native Fuzz.Float.reorderExponent. The user-source version builds a
+    -- 2048-element sorted Array every call (because top-level constants are
+    -- re-evaluated on every reference in the interpreter). At ~1.4s per build
+    -- that turns Fuzz.niceFloat into a ~1.3s-per-value operation. The kernel
+    -- uses a true host-Elm module-level constant, so the sort runs once at
+    -- load time and every call is just `Array.get`.
+    , ( [ "Fuzz", "Float" ]
+      , [ ( "reorderExponent", fuzzFloatReorderExponentKernel )
+        ]
+      )
     ]
         |> List.map
             (\( moduleName, moduleFunctions ) ->
@@ -418,6 +444,427 @@ log =
                 , fakeNode <| FunctionOrValue [] "$x"
                 ]
     }
+
+
+{-| Native Random.next. Unwraps a Random.Seed Int Int custom value,
+runs the PCG transition, and rewraps. Matches elm/random's source exactly:
+
+    next (Seed state0 incr) =
+        Seed (Bitwise.shiftRightZfBy 0 ((state0 * 1664525) + incr)) incr
+
+-}
+randomNextKernel : ModuleName -> ( Int, List Value -> Eval Value )
+randomNextKernel _ =
+    ( 1
+    , \args _ env ->
+        case args of
+            [ seedValue ] ->
+                case seedValue of
+                    Custom ref [ Int state0, Int incr ] ->
+                        if ref.moduleName == [ "Random" ] && ref.name == "Seed" then
+                            EvalResult.succeed
+                                (Custom ref
+                                    [ Int (Bitwise.shiftRightZfBy 0 ((state0 * 1664525) + incr))
+                                    , Int incr
+                                    ]
+                                )
+
+                        else
+                            EvalResult.fail <|
+                                typeError env <|
+                                    "Random.next (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+                    _ ->
+                        EvalResult.fail <|
+                            typeError env <|
+                                "Random.next (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Random.next (kernel): expected exactly one arg"
+    )
+
+
+{-| Precomputed exponent mapping for Fuzz.Float.reorderExponent.
+
+The user-source `exponentMapping` in elm-explorations/test is a top-level
+`Array Int` produced by sorting `List.range 0 2047` by `exponentKey`. Because
+the interpreter re-evaluates every reference to a top-level constant, each
+call into `Fuzz.niceFloat` was rebuilding this 2048-element sorted array —
+roughly 1.4 seconds of interpreted work per value.
+
+Defining it here makes it a real host-Elm module-level constant: computed
+once at Kernel module load time, then looked up in O(log n) via `Array.get`.
+-}
+fuzzFloatExponentMapping : Array Int
+fuzzFloatExponentMapping =
+    List.range 0 fuzzFloatMaxExponent
+        |> List.sortBy fuzzFloatExponentKey
+        |> Array.fromList
+
+
+fuzzFloatMaxExponent : Int
+fuzzFloatMaxExponent =
+    0x07FF
+
+
+{-| Matches Fuzz.Float.exponentKey exactly.
+-}
+fuzzFloatExponentKey : Int -> Int
+fuzzFloatExponentKey e =
+    if e == fuzzFloatMaxExponent then
+        round (1 / 0)
+
+    else
+        let
+            unbiased : Int
+            unbiased =
+                e - 1023
+        in
+        if unbiased < 0 then
+            10000 - unbiased
+
+        else
+            unbiased
+
+
+fuzzFloatReorderExponentKernel : ModuleName -> ( Int, List Value -> Eval Value )
+fuzzFloatReorderExponentKernel _ =
+    ( 1
+    , \args _ env ->
+        case args of
+            [ Int e ] ->
+                case Array.get e fuzzFloatExponentMapping of
+                    Just v ->
+                        EvalResult.succeed (Int v)
+
+                    Nothing ->
+                        EvalResult.succeed (Int 0)
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Fuzz.Float.reorderExponent (kernel): expected one Int"
+    )
+
+
+{-| Native Random.peel. Matches elm/random's source exactly:
+
+    peel (Seed state _) =
+        let
+            word =
+                (Bitwise.xor state (Bitwise.shiftRightZfBy ((Bitwise.shiftRightZfBy 28 state) + 4) state)) * 277803737
+        in
+            Bitwise.shiftRightZfBy 0 (Bitwise.xor (Bitwise.shiftRightZfBy 22 word) word)
+
+-}
+randomPeelKernel : ModuleName -> ( Int, List Value -> Eval Value )
+randomPeelKernel _ =
+    ( 1
+    , \args _ env ->
+        case args of
+            [ seedValue ] ->
+                case seedValue of
+                    Custom ref [ Int state, _ ] ->
+                        if ref.moduleName == [ "Random" ] && ref.name == "Seed" then
+                            EvalResult.succeed (Int (peelStateRaw state))
+
+                        else
+                            EvalResult.fail <|
+                                typeError env <|
+                                    "Random.peel (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+                    _ ->
+                        EvalResult.fail <|
+                            typeError env <|
+                                "Random.peel (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Random.peel (kernel): expected exactly one arg"
+    )
+
+
+{-| Host-Elm peel: extracts a pseudo-random Int from the state. Shared by
+`randomPeelKernel`, `randomIntStepKernel`, and `randomFloatStepKernel`.
+-}
+peelStateRaw : Int -> Int
+peelStateRaw state =
+    let
+        shiftAmount : Int
+        shiftAmount =
+            Bitwise.shiftRightZfBy 28 state + 4
+
+        word : Int
+        word =
+            Bitwise.xor state (Bitwise.shiftRightZfBy shiftAmount state) * 277803737
+    in
+    Bitwise.shiftRightZfBy 0 (Bitwise.xor (Bitwise.shiftRightZfBy 22 word) word)
+
+
+{-| Host-Elm next: advances the PCG state.
+-}
+nextStateRaw : Int -> Int -> Int
+nextStateRaw state0 incr =
+    Bitwise.shiftRightZfBy 0 ((state0 * 1664525) + incr)
+
+
+seedRef : QualifiedNameRef
+seedRef =
+    { moduleName = [ "Random" ], name = "Seed" }
+
+
+generatorRef : QualifiedNameRef
+generatorRef =
+    { moduleName = [ "Random" ], name = "Generator" }
+
+
+{-| Native Random.int a b.
+
+Returns `Generator (lo, hi, seed -> (Int, Seed))` — wraps a `PartiallyApplied`
+whose body is `KernelImpl "Random" "intStep" intStepKernel`. The lo/hi are
+stored as `oldArgs` so when `Random.step` (pure Elm source) unwraps the
+Generator and applies the closure to the seed, the interpreter concatenates
+oldArgs ++ [seed] and hands all three to `intStepKernel` in one shot.
+-}
+randomIntKernel : ModuleName -> ( Int, List Value -> Eval Value )
+randomIntKernel _ =
+    ( 2
+    , \args _ env ->
+        case args of
+            [ Int a, Int b ] ->
+                EvalResult.succeed (makeNativeGenerator (Int a) (Int b) intStepKernelImpl)
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Random.int (kernel): expected two Ints"
+    )
+
+
+randomFloatKernel : ModuleName -> ( Int, List Value -> Eval Value )
+randomFloatKernel _ =
+    ( 2
+    , \args _ env ->
+        case args of
+            [ firstArg, secondArg ] ->
+                let
+                    a : Maybe Float
+                    a =
+                        case firstArg of
+                            Float f ->
+                                Just f
+
+                            Int i ->
+                                Just (toFloat i)
+
+                            _ ->
+                                Nothing
+
+                    b : Maybe Float
+                    b =
+                        case secondArg of
+                            Float f ->
+                                Just f
+
+                            Int i ->
+                                Just (toFloat i)
+
+                            _ ->
+                                Nothing
+                in
+                case ( a, b ) of
+                    ( Just fa, Just fb ) ->
+                        EvalResult.succeed (makeNativeGenerator (Float fa) (Float fb) floatStepKernelImpl)
+
+                    _ ->
+                        EvalResult.fail <|
+                            typeError env "Random.float (kernel): expected two Floats"
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Random.float (kernel): expected two Floats"
+    )
+
+
+{-| Wrap (a, b, seed -> result) as a Generator Custom containing a
+PartiallyApplied with KernelImpl.
+-}
+makeNativeGenerator : Value -> Value -> (List Value -> Eval Value) -> Value
+makeNativeGenerator a b stepKernelFn =
+    Custom generatorRef
+        [ PartiallyApplied
+            (Environment.empty [ "Random" ])
+            [ a, b ]
+            [ fakeNode (VarPattern "$a"), fakeNode (VarPattern "$b"), fakeNode (VarPattern "$seed") ]
+            (Just { moduleName = [ "Random" ], name = "nativeGenerator" })
+            (KernelImpl [ "Random" ] "nativeGeneratorStep" stepKernelFn)
+            3
+        ]
+
+
+{-| Native Random.int's step. Given [lo, hi, seed] returns `(Int, Seed)`.
+Implements exactly what elm/random's `int` closure body does.
+-}
+intStepKernelImpl : List Value -> Eval Value
+intStepKernelImpl args _ env =
+    case args of
+        [ Int ra, Int rb, seedValue ] ->
+            case seedValue of
+                Custom _ [ Int state0, Int incr ] ->
+                    let
+                        ( lo, hi ) =
+                            if ra < rb then
+                                ( ra, rb )
+
+                            else
+                                ( rb, ra )
+
+                        range : Int
+                        range =
+                            hi - lo + 1
+
+                        nextSeed : Value
+                        nextSeed =
+                            Custom seedRef [ Int (nextStateRaw state0 incr), Int incr ]
+                    in
+                    if Bitwise.and (range - 1) range == 0 then
+                        -- Power-of-2 fast path
+                        EvalResult.succeed
+                            (Tuple
+                                (Int (Bitwise.shiftRightZfBy 0 (Bitwise.and (range - 1) (peelStateRaw state0)) + lo))
+                                nextSeed
+                            )
+
+                    else
+                        -- Rejection sampling path
+                        let
+                            threshhold : Int
+                            threshhold =
+                                Bitwise.shiftRightZfBy 0 (remainderBy range (Bitwise.shiftRightZfBy 0 -range))
+
+                            ( value, finalState, finalIncr ) =
+                                accountForBiasLoop threshhold range lo state0 incr
+                        in
+                        EvalResult.succeed
+                            (Tuple
+                                (Int value)
+                                (Custom seedRef [ Int finalState, Int finalIncr ])
+                            )
+
+                _ ->
+                    EvalResult.fail <|
+                        typeError env <|
+                            "Random.int step (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+        _ ->
+            EvalResult.fail <|
+                typeError env "Random.int step (kernel): wrong argument count"
+
+
+{-| Rejection sampling loop for the non-power-of-2 case. Recurses in host Elm
+instead of the interpreter trampoline.
+-}
+accountForBiasLoop : Int -> Int -> Int -> Int -> Int -> ( Int, Int, Int )
+accountForBiasLoop threshhold range lo state incr =
+    let
+        x : Int
+        x =
+            peelStateRaw state
+
+        newState : Int
+        newState =
+            nextStateRaw state incr
+    in
+    if x < threshhold then
+        accountForBiasLoop threshhold range lo newState incr
+
+    else
+        ( remainderBy range x + lo, newState, incr )
+
+
+{-| Native Random.float's step. Given [lo, hi, seed] returns `(Float, Seed)`.
+Implements exactly what elm/random's `float` closure body does.
+-}
+floatStepKernelImpl : List Value -> Eval Value
+floatStepKernelImpl args _ env =
+    case args of
+        [ firstBound, secondBound, seedValue ] ->
+            let
+                a : Maybe Float
+                a =
+                    case firstBound of
+                        Float f ->
+                            Just f
+
+                        Int i ->
+                            Just (toFloat i)
+
+                        _ ->
+                            Nothing
+
+                b : Maybe Float
+                b =
+                    case secondBound of
+                        Float f ->
+                            Just f
+
+                        Int i ->
+                            Just (toFloat i)
+
+                        _ ->
+                            Nothing
+            in
+            case ( a, b, seedValue ) of
+                ( Just fa, Just fb, Custom _ [ Int state0, Int incr ] ) ->
+                    let
+                        state1 : Int
+                        state1 =
+                            nextStateRaw state0 incr
+
+                        n0 : Int
+                        n0 =
+                            peelStateRaw state0
+
+                        n1 : Int
+                        n1 =
+                            peelStateRaw state1
+
+                        hi : Float
+                        hi =
+                            toFloat (Bitwise.and 0x03FFFFFF n0) * 1.0
+
+                        loF : Float
+                        loF =
+                            toFloat (Bitwise.and 0x07FFFFFF n1) * 1.0
+
+                        val : Float
+                        val =
+                            (hi * 134217728.0 + loF) / 9007199254740992.0
+
+                        range : Float
+                        range =
+                            abs (fb - fa)
+
+                        scaled : Float
+                        scaled =
+                            val * range + fa
+
+                        finalState : Int
+                        finalState =
+                            nextStateRaw state1 incr
+                    in
+                    EvalResult.succeed
+                        (Tuple
+                            (Float scaled)
+                            (Custom seedRef [ Int finalState, Int incr ])
+                        )
+
+                _ ->
+                    EvalResult.fail <|
+                        typeError env "Random.float step (kernel): expected (Float, Float, Seed)"
+
+        _ ->
+            EvalResult.fail <|
+                typeError env "Random.float step (kernel): wrong argument count"
 
 
 
@@ -649,7 +1096,11 @@ jsArray selector =
             array
                 |> Array.map selector.toValue
                 |> JsArray
-    , name = "JsArray " ++ selector.name
+
+    -- User-facing name: Elm users see `List X` in their source (the host
+    -- `JsArray` representation is an internal optimization). Show "List"
+    -- in type-error messages so the text matches what's in their code.
+    , name = "List " ++ selector.name
     }
 
 
@@ -1002,6 +1453,7 @@ threeWithError firstSelector secondSelector thirdSelector _ output f implementat
             _ ->
                 err ("[ " ++ String.join ", " (List.map Value.toString args) ++ " ]")
     )
+
 
 
 partiallyApply : ModuleName -> List Value -> FunctionImplementation -> EvalResult Value

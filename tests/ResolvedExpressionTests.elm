@@ -824,6 +824,12 @@ resultToString result =
         EvMemoStore _ _ ->
             "EvMemoStore"
 
+        EvOkCoverage _ _ ->
+            "EvOkCoverage"
+
+        EvErrCoverage _ _ ->
+            "EvErrCoverage"
+
 
 kindToString : EvalErrorKind -> String
 kindToString kind =

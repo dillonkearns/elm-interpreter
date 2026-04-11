@@ -5,6 +5,7 @@ import Eval.Module
 import FastDict as Dict
 import MemoSpec
 import Rope exposing (Rope)
+import Set
 import Types exposing (CallTree, Config, Error, Value)
 
 
@@ -12,7 +13,7 @@ eval : String -> Result Error Value
 eval expressionSource =
     let
         ( result, _, _ ) =
-            traceOrEval { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } expressionSource
+            traceOrEval { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } expressionSource
     in
     result
 
@@ -21,14 +22,14 @@ evalWithMaxSteps : Maybe Int -> String -> Result Error Value
 evalWithMaxSteps maxSteps expressionSource =
     let
         ( result, _, _ ) =
-            traceOrEval { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } expressionSource
+            traceOrEval { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } expressionSource
     in
     result
 
 
 trace : String -> ( Result Error Value, Rope CallTree, Rope String )
 trace expressionSource =
-    traceOrEval { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } expressionSource
+    traceOrEval { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } expressionSource
 
 
 traceOrEval : Config -> String -> ( Result Error Value, Rope CallTree, Rope String )
@@ -49,7 +50,6 @@ toModule : String -> String
 toModule expression =
     "module Main exposing (main)\n\nmain =\n"
         ++ indent 4 expression
-
 
 indent : Int -> String -> String
 indent count input =
