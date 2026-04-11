@@ -409,6 +409,17 @@ functions evalFunction =
         , ( "float", randomFloatKernel )
         ]
       )
+
+    -- Native Fuzz.Float.reorderExponent. The user-source version builds a
+    -- 2048-element sorted Array every call (because top-level constants are
+    -- re-evaluated on every reference in the interpreter). At ~1.4s per build
+    -- that turns Fuzz.niceFloat into a ~1.3s-per-value operation. The kernel
+    -- uses a true host-Elm module-level constant, so the sort runs once at
+    -- load time and every call is just `Array.get`.
+    , ( [ "Fuzz", "Float" ]
+      , [ ( "reorderExponent", fuzzFloatReorderExponentKernel )
+        ]
+      )
     ]
         |> List.map
             (\( moduleName, moduleFunctions ) ->
@@ -471,6 +482,68 @@ randomNextKernel _ =
             _ ->
                 EvalResult.fail <|
                     typeError env "Random.next (kernel): expected exactly one arg"
+    )
+
+
+{-| Precomputed exponent mapping for Fuzz.Float.reorderExponent.
+
+The user-source `exponentMapping` in elm-explorations/test is a top-level
+`Array Int` produced by sorting `List.range 0 2047` by `exponentKey`. Because
+the interpreter re-evaluates every reference to a top-level constant, each
+call into `Fuzz.niceFloat` was rebuilding this 2048-element sorted array —
+roughly 1.4 seconds of interpreted work per value.
+
+Defining it here makes it a real host-Elm module-level constant: computed
+once at Kernel module load time, then looked up in O(log n) via `Array.get`.
+-}
+fuzzFloatExponentMapping : Array Int
+fuzzFloatExponentMapping =
+    List.range 0 fuzzFloatMaxExponent
+        |> List.sortBy fuzzFloatExponentKey
+        |> Array.fromList
+
+
+fuzzFloatMaxExponent : Int
+fuzzFloatMaxExponent =
+    0x07FF
+
+
+{-| Matches Fuzz.Float.exponentKey exactly.
+-}
+fuzzFloatExponentKey : Int -> Int
+fuzzFloatExponentKey e =
+    if e == fuzzFloatMaxExponent then
+        round (1 / 0)
+
+    else
+        let
+            unbiased : Int
+            unbiased =
+                e - 1023
+        in
+        if unbiased < 0 then
+            10000 - unbiased
+
+        else
+            unbiased
+
+
+fuzzFloatReorderExponentKernel : ModuleName -> ( Int, List Value -> Eval Value )
+fuzzFloatReorderExponentKernel _ =
+    ( 1
+    , \args _ env ->
+        case args of
+            [ Int e ] ->
+                case Array.get e fuzzFloatExponentMapping of
+                    Just v ->
+                        EvalResult.succeed (Int v)
+
+                    Nothing ->
+                        EvalResult.succeed (Int 0)
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Fuzz.Float.reorderExponent (kernel): expected one Int"
     )
 
 

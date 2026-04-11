@@ -919,24 +919,32 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             -- dict tiny and saves downstream Dict work on every call.
                             case Dict.get name env.currentModuleFunctions of
                                 Just function ->
-                                    if List.isEmpty function.arguments then
-                                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
+                                    -- Kernel fast path: if a user-level kernel is registered
+                                    -- for (currentModule, name), route through the slow path
+                                    -- so the kernel fires instead of the AST body.
+                                    case Dict.get env.currentModuleKey kernelFunctions |> Maybe.andThen (Dict.get name) of
+                                        Just _ ->
+                                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
-                                    else
-                                        continuation
-                                            (PartiallyApplied
-                                                (if cfg.trace then
-                                                    Environment.callModuleFn env.currentModule name env
+                                        Nothing ->
+                                            if List.isEmpty function.arguments then
+                                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
-                                                 else
-                                                    Environment.callModuleFnNoStack env.currentModule name env
-                                                )
-                                                []
-                                                function.arguments
-                                                (Just { moduleName = env.currentModule, name = name })
-                                                (AstImpl function.expression)
-                                                (List.length function.arguments)
-                                            )
+                                            else
+                                                continuation
+                                                    (PartiallyApplied
+                                                        (if cfg.trace then
+                                                            Environment.callModuleFn env.currentModule name env
+
+                                                         else
+                                                            Environment.callModuleFnNoStack env.currentModule name env
+                                                        )
+                                                        []
+                                                        function.arguments
+                                                        (Just { moduleName = env.currentModule, name = name })
+                                                        (AstImpl function.expression)
+                                                        (List.length function.arguments)
+                                                    )
 
                                 Nothing ->
                                     Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
@@ -2608,37 +2616,46 @@ Skips the redundant `letFunctions` lookup that the old path did via
 -}
 evalUnqualifiedAfterLocalMiss : String -> PartialEval Value
 evalUnqualifiedAfterLocalMiss name cfg env =
-    case Dict.get name env.currentModuleFunctions of
-        Just function ->
-            let
-                qualifiedNameRef : QualifiedNameRef
-                qualifiedNameRef =
-                    { moduleName = env.currentModule, name = name }
-
-                -- Top-level module function: zero out caller locals in the PA's
-                -- captured env (see `Environment.callModuleFn` docs).
-                callFn =
-                    if cfg.trace then
-                        Environment.callModuleFn
-
-                    else
-                        Environment.callModuleFnNoStack
-            in
-            if List.isEmpty function.arguments then
-                call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
-
-            else
-                PartiallyApplied
-                    (callFn env.currentModule name env)
-                    []
-                    function.arguments
-                    (Just qualifiedNameRef)
-                    (AstImpl function.expression)
-                    (List.length function.arguments)
-                    |> Types.succeedPartial
+    -- Check for a kernel fast path first. Unqualified references to top-level
+    -- module functions (e.g. `reorderExponent` inside `wellShrinkingFloat`)
+    -- otherwise skip `userModuleKernelFastPath` entirely, and any kernel
+    -- registered against the user-level module name never fires.
+    case userModuleKernelFastPath env.currentModule name cfg env of
+        Just result ->
+            result
 
         Nothing ->
-            evalQualifiedOrVariantSlow [] name cfg env
+            case Dict.get name env.currentModuleFunctions of
+                Just function ->
+                    let
+                        qualifiedNameRef : QualifiedNameRef
+                        qualifiedNameRef =
+                            { moduleName = env.currentModule, name = name }
+
+                        -- Top-level module function: zero out caller locals in the PA's
+                        -- captured env (see `Environment.callModuleFn` docs).
+                        callFn =
+                            if cfg.trace then
+                                Environment.callModuleFn
+
+                            else
+                                Environment.callModuleFnNoStack
+                    in
+                    if List.isEmpty function.arguments then
+                        call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+
+                    else
+                        PartiallyApplied
+                            (callFn env.currentModule name env)
+                            []
+                            function.arguments
+                            (Just qualifiedNameRef)
+                            (AstImpl function.expression)
+                            (List.length function.arguments)
+                            |> Types.succeedPartial
+
+                Nothing ->
+                    evalQualifiedOrVariantSlow [] name cfg env
 
 
 evalQualifiedOrVariant : ModuleName -> String -> PartialEval Value
