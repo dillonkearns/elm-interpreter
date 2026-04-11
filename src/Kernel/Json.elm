@@ -39,6 +39,7 @@ import Elm.Syntax.Pattern
 import EvalResult
 import FastDict as Dict
 import Rope
+import Set
 import Types exposing (Eval, EvalResult(..), JsonDecoder(..), JsonVal(..), Value(..))
 import Value
 
@@ -309,6 +310,30 @@ encodeListHelp func remaining acc cfg env =
                 Types.EvYield tag payload resume ->
                     Types.EvYield tag payload resume
 
+                Types.EvMemoLookup payload resume ->
+                    Types.EvMemoLookup payload resume
+
+                Types.EvMemoStore payload next ->
+                    Types.EvMemoStore payload next
+
+                Types.EvOkCoverage encoded s ->
+                    case encoded of
+                        JsonValue json ->
+                            case encodeListHelp func rest (json :: acc) cfg env of
+                                Types.EvOkCoverage v s2 ->
+                                    Types.EvOkCoverage v (Set.union s s2)
+
+                                Types.EvOk v ->
+                                    Types.EvOkCoverage v s
+
+                                other ->
+                                    other
+
+                        _ ->
+                            EvalResult.fail <| Value.typeError env ("Json.Encode.list: encoder did not produce a JSON value, got: " ++ Value.toString encoded)
+
+                Types.EvErrCoverage e s ->
+                    Types.EvErrCoverage e s
 
 {-| Json.Encode.object : List ( String, Value ) -> Value
 Build a JSON object from key-value pairs.
@@ -813,6 +838,7 @@ runOneOf evalFn decoders json errors cfg env =
 type alias EvalFunction =
     List Value
     -> List (Elm.Syntax.Node.Node Elm.Syntax.Pattern.Pattern)
+    -> Int
     -> Maybe Elm.Syntax.Pattern.QualifiedNameRef
     -> Types.Implementation
     -> Types.Eval Value
@@ -830,7 +856,7 @@ applyFunction evalFn func arg cfg _ =
                     oldArgs ++ [ arg ]
             in
             if List.length newArgs >= arity then
-                case evalFn newArgs patterns maybeName implementation cfg closureEnv of
+                case evalFn newArgs patterns arity maybeName implementation cfg closureEnv of
                     EvOk val ->
                         Ok val
 
@@ -846,6 +872,17 @@ applyFunction evalFn func arg cfg _ =
                     EvYield _ _ _ ->
                         Err "Cannot yield inside JSON decoder"
 
+                    EvMemoLookup _ _ ->
+                        Err "Cannot yield inside JSON decoder"
+
+                    EvMemoStore _ _ ->
+                        Err "Cannot yield inside JSON decoder"
+
+                    EvOkCoverage val _ ->
+                        Ok val
+
+                    EvErrCoverage e _ ->
+                        Err (Types.evalErrorKindToString e.error)
             else
                 Ok (PartiallyApplied closureEnv newArgs patterns maybeName implementation arity)
 

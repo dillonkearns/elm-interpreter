@@ -1,11 +1,12 @@
-module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseThen, resolveRecWithStep, succeedPartial)
+module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseMapThenWithEval, recurseThen, recurseThenWithEval, resolveRecWithStep, succeedPartial)
 
 import Elm.Syntax.Expression exposing (Expression)
 import Elm.Syntax.Node exposing (Node)
 import EvalResult
 import Parser
-import Recursion exposing (Rec)
+import Recursion exposing (Rec, resolveRec)
 import Rope exposing (Rope)
+import Set
 import Syntax
 import Types exposing (Config, Env, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), PartialResult, Value)
 
@@ -37,24 +38,27 @@ wrapThenWithEval evalFn f er =
             Recursion.base
                 (EvYield tag
                     payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvOk v ->
-                                resolveRecWithStep evalFn (f v)
-
-                            EvOkTrace v _ _ ->
-                                resolveRecWithStep evalFn (f v)
-
-                            EvErr e ->
-                                EvErr e
-
-                            EvErrTrace e _ _ ->
-                                EvErr e
-
-                            EvYield t2 p2 r2 ->
-                                EvYield t2 p2 r2
-                    )
+                    (resumeThenWithEval evalFn f resume)
                 )
+
+        EvMemoLookup payload resume ->
+            Recursion.base
+                (EvMemoLookup payload
+                    (resumeThenWithEvalMaybe evalFn f resume)
+                )
+
+        EvMemoStore payload next ->
+            Recursion.base
+                (EvMemoStore payload
+                    (continueThenWithEval evalFn f next)
+                )
+
+        EvOkCoverage v s ->
+            f v
+                |> Recursion.map (mergeCoverageInto s)
+
+        EvErrCoverage e s ->
+            Recursion.base (EvErrCoverage e s)
 
 
 {-| Resolve a Rec using the eval function from Config.
@@ -66,14 +70,65 @@ resolveRecWithStep :
     -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value)
     -> EvalResult Value
 resolveRecWithStep evalFn =
-    Recursion.runRecursion
+    resolveRec
         (\( expr, cfg, env ) ->
-            let
-                result =
-                    evalFn expr cfg env
-            in
-            Recursion.base result
+            Recursion.base (evalFn expr cfg env)
         )
+
+
+resumeThenWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> (Value -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value))
+    -> (Value -> EvalResult Value)
+    -> (Value -> EvalResult Value)
+resumeThenWithEval evalFn f resume resumeValue =
+    continueThenWithEval evalFn f (resume resumeValue)
+
+
+resumeThenWithEvalMaybe :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> (Value -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value))
+    -> (Maybe Value -> EvalResult Value)
+    -> (Maybe Value -> EvalResult Value)
+resumeThenWithEvalMaybe evalFn f resume maybeResumeValue =
+    continueThenWithEval evalFn f (resume maybeResumeValue)
+
+
+continueThenWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> (Value -> Rec ( Node Expression, Config, Env ) (EvalResult Value) (EvalResult Value))
+    -> EvalResult Value
+    -> EvalResult Value
+continueThenWithEval evalFn f resumedResult =
+    case resumedResult of
+        EvOk v ->
+            resolveRecWithStep evalFn (f v)
+
+        EvOkTrace v trees logs ->
+            resolveRecWithStep evalFn (f v)
+                |> mergeTraceInto trees logs
+
+        EvErr e ->
+            EvErr e
+
+        EvErrTrace e trees logs ->
+            EvErrTrace e trees logs
+
+        EvYield tag payload nestedResume ->
+            EvYield tag payload (resumeThenWithEval evalFn f nestedResume)
+
+        EvMemoLookup payload nestedResume ->
+            EvMemoLookup payload (resumeThenWithEvalMaybe evalFn f nestedResume)
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (continueThenWithEval evalFn f next)
+
+        EvOkCoverage v s ->
+            resolveRecWithStep evalFn (f v)
+                |> mergeCoverageInto s
+
+        EvErrCoverage e s ->
+            EvErrCoverage e s
 
 
 combineMap : (a -> Eval b) -> List a -> Eval (List b)
@@ -85,6 +140,9 @@ combineMap f xs cfg env =
                     acc
 
                 EvErrTrace _ _ _ ->
+                    acc
+
+                EvErrCoverage _ _ ->
                     acc
 
                 _ ->
@@ -107,6 +165,9 @@ foldl f init xs cfg env =
                 EvOkTrace a _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
+                EvOkCoverage a _ ->
+                    EvalResult.andThen (\a2 -> f el a2 cfg env) acc
+
                 _ ->
                     acc
         )
@@ -123,6 +184,9 @@ foldr f init xs cfg env =
                     f el a cfg env
 
                 EvOkTrace a _ _ ->
+                    EvalResult.andThen (\a2 -> f el a2 cfg env) acc
+
+                EvOkCoverage a _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
                 _ ->
@@ -223,30 +287,21 @@ wrapThen f er =
         EvErrTrace e trees logs ->
             Recursion.base (EvErrTrace e trees logs)
 
-        EvYield tag payload resume ->
-            -- Yield from inside a recursion step. After resume, apply f
-            -- and resolve any trampoline steps manually.
-            Recursion.base
-                (EvYield tag
-                    payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvOk v ->
-                                resolveRec (f v)
+        EvYield tag payload _ ->
+            Recursion.base (EvYield tag payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvYield cannot resume inside recursion scheme" }))
 
-                            EvOkTrace v _ _ ->
-                                resolveRec (f v)
+        EvMemoLookup payload _ ->
+            Recursion.base (EvMemoLookup payload (\_ -> EvErr { currentModule = [], callStack = [], error = Unsupported "EvMemoLookup cannot resume inside recursion scheme" }))
 
-                            EvErr e ->
-                                EvErr e
+        EvMemoStore payload _ ->
+            Recursion.base (EvMemoStore payload (EvErr { currentModule = [], callStack = [], error = Unsupported "EvMemoStore cannot resume inside recursion scheme" }))
 
-                            EvErrTrace e _ _ ->
-                                EvErr e
+        EvOkCoverage v s ->
+            f v
+                |> Recursion.map (mergeCoverageInto s)
 
-                            EvYield t2 p2 r2 ->
-                                EvYield t2 p2 r2
-                    )
-                )
+        EvErrCoverage e s ->
+            Recursion.base (EvErrCoverage e s)
 
 
 {-| Merge trace data from an outer evaluation into an inner result.
@@ -269,13 +324,67 @@ mergeTraceInto trees logs er =
         EvYield tag payload resume ->
             EvYield tag payload resume
 
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload resume
 
-recurseMapThen :
+        EvMemoStore payload next ->
+            EvMemoStore payload next
+
+        EvOkCoverage v s ->
+            EvOkCoverage v s
+
+        EvErrCoverage e s ->
+            EvErrCoverage e s
+
+
+{-| Merge coverage data from an outer evaluation into an inner result.
+-}
+mergeCoverageInto : Set.Set Int -> EvalResult a -> EvalResult a
+mergeCoverageInto outerSet er =
+    case er of
+        EvOk v ->
+            EvOkCoverage v outerSet
+
+        EvErr e ->
+            EvErrCoverage e outerSet
+
+        EvOkTrace v _ _ ->
+            EvOkCoverage v outerSet
+
+        EvErrTrace e _ _ ->
+            EvErrCoverage e outerSet
+
+        EvYield tag payload resume ->
+            EvYield tag payload (\v -> mergeCoverageInto outerSet (resume v))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\maybeValue -> mergeCoverageInto outerSet (resume maybeValue))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (mergeCoverageInto outerSet next)
+
+        EvOkCoverage v innerSet ->
+            EvOkCoverage v (Set.union outerSet innerSet)
+
+        EvErrCoverage e innerSet ->
+            EvErrCoverage e (Set.union outerSet innerSet)
+
+
+recurseMapThen : 
     ( List (Node Expression), Config, Env )
     -> (List out -> PartialResult out)
     -> PartialResult out
 recurseMapThen ( exprs, cfg, env ) f =
     recurseMapPlain (List.reverse exprs) cfg env [] f
+
+
+recurseMapThenWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> ( List (Node Expression), Config, Env )
+    -> (List Value -> PartialResult Value)
+    -> PartialResult Value
+recurseMapThenWithEval evalFn ( exprs, cfg, env ) f =
+    recurseMapPlainWithEval evalFn (List.reverse exprs) cfg env [] f
 
 
 {-| Fast path: no trace data seen yet. Unwraps EvOk immediately during fold.
@@ -304,6 +413,38 @@ recurseMapPlain items cfg env vacc f =
 
                         EvYield tag payload resume ->
                             Recursion.base (EvYield tag payload resume)
+
+                        EvMemoLookup payload resume ->
+                            Recursion.base (EvMemoLookup payload resume)
+
+                        EvMemoStore payload next ->
+                            Recursion.base (EvMemoStore payload next)
+
+                        EvOkCoverage v s ->
+                            recurseMapCoverage rest cfg env (v :: vacc) s f
+
+                        EvErrCoverage e s ->
+                            Recursion.base (EvErrCoverage e s)
+                )
+
+
+recurseMapPlainWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> List (Node Expression)
+    -> Config
+    -> Env
+    -> List Value
+    -> (List Value -> PartialResult Value)
+    -> PartialResult Value
+recurseMapPlainWithEval evalFn items cfg env vacc f =
+    case items of
+        [] ->
+            f vacc
+
+        item :: rest ->
+            recurseThenWithEval evalFn ( item, cfg, env )
+                (\v ->
+                    recurseMapPlainWithEval evalFn rest cfg env (v :: vacc) f
                 )
 
 
@@ -334,4 +475,81 @@ recurseMapTraced items cfg env vacc tacc lacc f =
 
                         EvYield tag payload resume ->
                             Recursion.base (EvYield tag payload resume)
+
+                        EvMemoLookup payload resume ->
+                            Recursion.base (EvMemoLookup payload resume)
+
+                        EvMemoStore payload next ->
+                            Recursion.base (EvMemoStore payload next)
+
+                        EvOkCoverage v _ ->
+                            recurseMapTraced rest cfg env (v :: vacc) tacc lacc f
+
+                        EvErrCoverage e _ ->
+                            Recursion.base (EvErrTrace e tacc lacc)
+                )
+
+
+{-| Coverage path: accumulates coverage set alongside values.
+-}
+recurseMapCoverage : List (Node Expression) -> Config -> Env -> List out -> Set.Set Int -> (List out -> PartialResult out) -> PartialResult out
+recurseMapCoverage items cfg env vacc sacc f =
+    case items of
+        [] ->
+            f vacc
+                |> Recursion.map (mergeCoverageInto sacc)
+
+        item :: rest ->
+            Recursion.recurseThen ( item, cfg, env )
+                (\result ->
+                    case result of
+                        EvOk v ->
+                            recurseMapCoverage rest cfg env (v :: vacc) sacc f
+
+                        EvErr e ->
+                            Recursion.base (EvErrCoverage e sacc)
+
+                        EvOkTrace v _ _ ->
+                            recurseMapCoverage rest cfg env (v :: vacc) sacc f
+
+                        EvErrTrace e _ _ ->
+                            Recursion.base (EvErrCoverage e sacc)
+
+                        EvYield tag payload resume ->
+                            Recursion.base (EvYield tag payload resume)
+
+                        EvMemoLookup payload resume ->
+                            Recursion.base (EvMemoLookup payload resume)
+
+                        EvMemoStore payload next ->
+                            Recursion.base (EvMemoStore payload next)
+
+                        EvOkCoverage v s ->
+                            recurseMapCoverage rest cfg env (v :: vacc) (Set.union sacc s) f
+
+                        EvErrCoverage e s ->
+                            Recursion.base (EvErrCoverage e (Set.union sacc s))
+                )
+
+
+recurseMapTracedWithEval :
+    (Node Expression -> Config -> Env -> EvalResult Value)
+    -> List (Node Expression)
+    -> Config
+    -> Env
+    -> List Value
+    -> Rope Types.CallTree
+    -> Rope String
+    -> (List Value -> PartialResult Value)
+    -> PartialResult Value
+recurseMapTracedWithEval evalFn items cfg env vacc tacc lacc f =
+    case items of
+        [] ->
+            f vacc
+                |> Recursion.map (mergeTraceInto tacc lacc)
+
+        item :: rest ->
+            recurseThenWithEval evalFn ( item, cfg, env )
+                (\v ->
+                    recurseMapTracedWithEval evalFn rest cfg env (v :: vacc) tacc lacc f
                 )

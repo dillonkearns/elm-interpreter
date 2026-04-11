@@ -9,8 +9,8 @@ insertion sort that correctly preserves the relative order of equal elements.
 -}
 
 import EvalResult
-import FastDict as Dict
 import Kernel.Utils
+import Rope
 import Types exposing (Eval, EvalResult(..), Value(..))
 import Value
 
@@ -25,60 +25,106 @@ map f xs cfg env =
 
 mapHelp : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
 mapHelp f remaining acc cfg env =
-    if Dict.isEmpty cfg.intercepts then
-        -- Fast path: no intercepts means no EvYield possible.
-        -- Tight loop with only EvOk/EvErr branches for V8 to optimize.
-        mapHelpFast f remaining acc { cfg | tcoTarget = Nothing } env
-
-    else
-        mapHelpWithYield f remaining acc cfg env
-
-
-mapHelpFast : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
-mapHelpFast f remaining acc cfg env =
     case remaining of
         [] ->
             EvalResult.succeed (List.reverse acc)
 
         x :: rest ->
-            case EvalResult.toResult (f x cfg env) of
-                Ok mapped ->
-                    mapHelpFast f rest (mapped :: acc) cfg env
-
-                Err e ->
-                    EvErr e
-
-
-mapHelpWithYield : (Value -> Eval Value) -> List Value -> List Value -> Eval (List Value)
-mapHelpWithYield f remaining acc cfg env =
-    let
-        innerCfg =
-            { cfg | tcoTarget = Nothing }
-    in
-    case remaining of
-        [] ->
-            EvalResult.succeed (List.reverse acc)
-
-        x :: rest ->
+            let
+                innerCfg : Types.Config
+                innerCfg =
+                    { cfg | tcoTarget = Nothing }
+            in
+            -- Fast path: `f x` produces EvOk, keep the TCO'd while loop
+            -- alive. Anything else (yields, traces, memo ops, errors) is
+            -- handed off to a helper that propagates the effect correctly
+            -- and re-enters the main loop on resume.
             case f x innerCfg env of
-                EvYield tag payload resume ->
-                    EvYield tag payload
-                        (\v ->
-                            case EvalResult.toResult (resume v) of
-                                Ok mapped ->
-                                    mapHelpWithYield f rest (mapped :: acc) cfg env
+                EvOk mapped ->
+                    mapHelp f rest (mapped :: acc) cfg env
 
-                                Err e ->
-                                    EvErr e
-                        )
+                other ->
+                    mapResumeAfterFx f rest acc cfg env other
 
-                fxResult ->
-                    case EvalResult.toResult fxResult of
-                        Ok mapped ->
-                            mapHelpWithYield f rest (mapped :: acc) cfg env
 
-                        Err e ->
-                            EvErr e
+{-| Continuation used after `f x` returns something other than `EvOk` in
+`mapHelp`. Propagates EvYield / EvMemoLookup / EvMemoStore / EvOkTrace /
+EvErrTrace / EvErr while threading the in-progress accumulator so the
+map can continue once the suspended computation resolves.
+-}
+mapResumeAfterFx :
+    (Value -> Eval Value)
+    -> List Value
+    -> List Value
+    -> Types.Config
+    -> Types.Env
+    -> EvalResult Value
+    -> EvalResult (List Value)
+mapResumeAfterFx f rest acc cfg env fxResult =
+    case fxResult of
+        EvOk mapped ->
+            mapHelp f rest (mapped :: acc) cfg env
+
+        EvErr e ->
+            EvErr e
+
+        EvOkTrace mapped calls logs ->
+            attachTraceList calls logs (mapHelp f rest (mapped :: acc) cfg env)
+
+        EvErrTrace e calls logs ->
+            EvErrTrace e calls logs
+
+        EvYield tag payload resume ->
+            EvYield tag payload
+                (\v -> mapResumeAfterFx f rest acc cfg env (resume v))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload
+                (\v -> mapResumeAfterFx f rest acc cfg env (resume v))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload
+                (mapResumeAfterFx f rest acc cfg env next)
+
+        EvOkCoverage mapped _ ->
+            mapHelp f rest (mapped :: acc) cfg env
+
+        EvErrCoverage e _ ->
+            EvErr e
+
+
+{-| Like `attachTrace` but for `EvalResult (List Value)` — used inside
+`mapResumeAfterFx` where the result type is a list, not a single value.
+-}
+attachTraceList : Rope.Rope Types.CallTree -> Rope.Rope String -> EvalResult (List Value) -> EvalResult (List Value)
+attachTraceList prevCalls prevLogs result =
+    case result of
+        EvOk vs ->
+            EvOkTrace vs prevCalls prevLogs
+
+        EvErr e ->
+            EvErrTrace e prevCalls prevLogs
+
+        EvOkTrace vs calls logs ->
+            EvOkTrace vs (Rope.appendTo prevCalls calls) (Rope.appendTo prevLogs logs)
+
+        EvErrTrace e calls logs ->
+            EvErrTrace e (Rope.appendTo prevCalls calls) (Rope.appendTo prevLogs logs)
+
+        EvYield tag payload resume ->
+            EvYield tag payload (\v -> attachTraceList prevCalls prevLogs (resume v))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\v -> attachTraceList prevCalls prevLogs (resume v))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (attachTraceList prevCalls prevLogs next)
+
+        EvOkCoverage vs _ ->
+            EvOkTrace vs prevCalls prevLogs
+
+        EvErrCoverage e _ ->
+            EvErrTrace e prevCalls prevLogs
 
 
 {-| Kernel List.foldl: reduces a list from the left.
@@ -90,85 +136,194 @@ foldl f init xs cfg env =
 
 foldlHelp : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
 foldlHelp f acc remaining cfg env =
-    if Dict.isEmpty cfg.intercepts then
-        foldlHelpFast f acc remaining { cfg | tcoTarget = Nothing } env
-
-    else
-        foldlHelpWithYield f acc remaining cfg env
-
-
-foldlHelpFast : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
-foldlHelpFast f acc remaining cfg env =
-    case remaining of
-        [] ->
-            EvalResult.succeed acc
-
-        x :: rest ->
-            case EvalResult.toResult (f x cfg env) of
-                Err e ->
-                    EvErr e
-
-                Ok g ->
-                    case EvalResult.toResult (g acc cfg env) of
-                        Err e ->
-                            EvErr e
-
-                        Ok newAcc ->
-                            foldlHelpFast f newAcc rest cfg env
-
-
-foldlHelpWithYield : (Value -> Eval (Value -> Eval Value)) -> Value -> List Value -> Eval Value
-foldlHelpWithYield f acc remaining cfg env =
-    let
-        innerCfg =
-            { cfg | tcoTarget = Nothing }
-    in
     case remaining of
         [] ->
             EvalResult.succeed acc
 
         x :: rest ->
             let
-                applyStep g =
-                    case g acc innerCfg env of
-                        EvYield tag2 payload2 resume2 ->
-                            EvYield tag2 payload2
-                                (\v2 ->
-                                    case EvalResult.toResult (resume2 v2) of
-                                        Ok newAcc ->
-                                            foldlHelpWithYield f newAcc rest cfg env
-
-                                        Err e ->
-                                            EvErr e
-                                )
-
-                        gResult ->
-                            case EvalResult.toResult gResult of
-                                Err e ->
-                                    EvErr e
-
-                                Ok newAcc ->
-                                    foldlHelpWithYield f newAcc rest cfg env
+                -- Clear tcoTarget to prevent TailCall signals from escaping
+                -- the kernel loop. Without this, a function matching tcoTarget
+                -- called inside the fold would fire TailCall, which toResult
+                -- would catch as an error and propagate up incorrectly.
+                innerCfg : Types.Config
+                innerCfg =
+                    { cfg | tcoTarget = Nothing }
             in
+            -- Fast path: both `f x` and `g acc` produce EvOk, so we can stay
+            -- in the same tail-recursive while loop for the whole fold. Elm
+            -- TCO only applies when the recursive call is in direct tail
+            -- position in a single branch — anything else (yields, traces,
+            -- memo operations, errors) is handed off to a helper that
+            -- rebuilds the fold via a fresh call to `foldlHelp`, which
+            -- preserves yield/memo propagation semantics.
             case f x innerCfg env of
-                EvYield tag payload resume ->
-                    EvYield tag payload
-                        (\v ->
-                            case EvalResult.toResult (resume v) of
-                                Ok g ->
-                                    applyStep g
+                EvOk g ->
+                    case g acc innerCfg env of
+                        EvOk newAcc ->
+                            foldlHelp f newAcc rest cfg env
 
-                                Err e ->
-                                    EvErr e
-                        )
+                        otherAccResult ->
+                            foldlResumeAfterAcc f rest cfg env otherAccResult
 
-                fxResult ->
-                    case EvalResult.toResult fxResult of
-                        Err e ->
-                            EvErr e
+                otherFxResult ->
+                    foldlResumeAfterFx f acc rest cfg env otherFxResult
 
-                        Ok g ->
-                            applyStep g
+
+{-| Continuation used after `f x` returns something other than `EvOk`.
+Handles EvYield, EvOkTrace, EvErrTrace, EvMemoLookup, EvMemoStore and
+EvErr by propagating them appropriately; on eventual success, threads the
+resulting `g` back into applying it to `acc` and then resuming the fold.
+-}
+foldlResumeAfterFx :
+    (Value -> Eval (Value -> Eval Value))
+    -> Value
+    -> List Value
+    -> Types.Config
+    -> Types.Env
+    -> EvalResult (Value -> Eval Value)
+    -> EvalResult Value
+foldlResumeAfterFx f acc rest cfg env fxResult =
+    case fxResult of
+        EvOk g ->
+            let
+                innerCfg : Types.Config
+                innerCfg =
+                    { cfg | tcoTarget = Nothing }
+            in
+            case g acc innerCfg env of
+                EvOk newAcc ->
+                    foldlHelp f newAcc rest cfg env
+
+                otherAccResult ->
+                    foldlResumeAfterAcc f rest cfg env otherAccResult
+
+        EvErr e ->
+            EvErr e
+
+        EvOkTrace g calls logs ->
+            let
+                innerCfg : Types.Config
+                innerCfg =
+                    { cfg | tcoTarget = Nothing }
+            in
+            case g acc innerCfg env of
+                EvOk newAcc ->
+                    attachTrace calls logs (foldlHelp f newAcc rest cfg env)
+
+                otherAccResult ->
+                    attachTrace calls logs (foldlResumeAfterAcc f rest cfg env otherAccResult)
+
+        EvErrTrace e calls logs ->
+            EvErrTrace e calls logs
+
+        EvYield tag payload resume ->
+            EvYield tag payload
+                (\v -> foldlResumeAfterFx f acc rest cfg env (resume v))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload
+                (\v -> foldlResumeAfterFx f acc rest cfg env (resume v))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload
+                (foldlResumeAfterFx f acc rest cfg env next)
+
+        EvOkCoverage g _ ->
+            let
+                innerCfg : Types.Config
+                innerCfg =
+                    { cfg | tcoTarget = Nothing }
+            in
+            case g acc innerCfg env of
+                EvOk newAcc ->
+                    foldlHelp f newAcc rest cfg env
+
+                otherAccResult ->
+                    foldlResumeAfterAcc f rest cfg env otherAccResult
+
+        EvErrCoverage e _ ->
+            EvErr e
+
+
+{-| Continuation used after `g acc` returns something other than `EvOk`.
+On success we rejoin the TCO'd main loop at `foldlHelp`; otherwise we
+propagate yields / memo ops / traces with the continuation needed to
+continue folding `rest` once the suspended computation resolves.
+-}
+foldlResumeAfterAcc :
+    (Value -> Eval (Value -> Eval Value))
+    -> List Value
+    -> Types.Config
+    -> Types.Env
+    -> EvalResult Value
+    -> EvalResult Value
+foldlResumeAfterAcc f rest cfg env accResult =
+    case accResult of
+        EvOk newAcc ->
+            foldlHelp f newAcc rest cfg env
+
+        EvErr e ->
+            EvErr e
+
+        EvOkTrace newAcc calls logs ->
+            attachTrace calls logs (foldlHelp f newAcc rest cfg env)
+
+        EvErrTrace e calls logs ->
+            EvErrTrace e calls logs
+
+        EvYield tag payload resume ->
+            EvYield tag payload
+                (\v -> foldlResumeAfterAcc f rest cfg env (resume v))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload
+                (\v -> foldlResumeAfterAcc f rest cfg env (resume v))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload
+                (foldlResumeAfterAcc f rest cfg env next)
+
+        EvOkCoverage newAcc _ ->
+            foldlHelp f newAcc rest cfg env
+
+        EvErrCoverage e _ ->
+            EvErr e
+
+
+{-| Prepend accumulated calls/logs to an `EvalResult`, preserving the
+outer variant. Used to keep trace information flowing through fold
+steps when an intermediate iteration emits a trace.
+-}
+attachTrace : Rope.Rope Types.CallTree -> Rope.Rope String -> EvalResult Value -> EvalResult Value
+attachTrace prevCalls prevLogs result =
+    case result of
+        EvOk v ->
+            EvOkTrace v prevCalls prevLogs
+
+        EvErr e ->
+            EvErrTrace e prevCalls prevLogs
+
+        EvOkTrace v calls logs ->
+            EvOkTrace v (Rope.appendTo prevCalls calls) (Rope.appendTo prevLogs logs)
+
+        EvErrTrace e calls logs ->
+            EvErrTrace e (Rope.appendTo prevCalls calls) (Rope.appendTo prevLogs logs)
+
+        EvYield tag payload resume ->
+            EvYield tag payload (\v -> attachTrace prevCalls prevLogs (resume v))
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (\v -> attachTrace prevCalls prevLogs (resume v))
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (attachTrace prevCalls prevLogs next)
+
+        EvOkCoverage v _ ->
+            EvOkTrace v prevCalls prevLogs
+
+        EvErrCoverage e _ ->
+            EvErrTrace e prevCalls prevLogs
 
 
 {-| Kernel List.filter: keeps elements where the predicate returns True.
@@ -323,30 +478,6 @@ concatMap f xs cfg env =
 
 concatMapHelp : (Value -> Eval (List Value)) -> List Value -> List Value -> Eval (List Value)
 concatMapHelp f remaining acc cfg env =
-    if Dict.isEmpty cfg.intercepts then
-        concatMapHelpFast f remaining acc { cfg | tcoTarget = Nothing } env
-
-    else
-        concatMapHelpWithYield f remaining acc cfg env
-
-
-concatMapHelpFast : (Value -> Eval (List Value)) -> List Value -> List Value -> Eval (List Value)
-concatMapHelpFast f remaining acc cfg env =
-    case remaining of
-        [] ->
-            EvalResult.succeed (List.reverse acc)
-
-        x :: rest ->
-            case EvalResult.toResult (f x cfg env) of
-                Ok mapped ->
-                    concatMapHelpFast f rest (List.foldl (::) acc mapped) cfg env
-
-                Err e ->
-                    EvErr e
-
-
-concatMapHelpWithYield : (Value -> Eval (List Value)) -> List Value -> List Value -> Eval (List Value)
-concatMapHelpWithYield f remaining acc cfg env =
     let
         innerCfg =
             { cfg | tcoTarget = Nothing }
@@ -362,7 +493,7 @@ concatMapHelpWithYield f remaining acc cfg env =
                         (\v ->
                             case EvalResult.toResult (resume v) of
                                 Ok mapped ->
-                                    concatMapHelpWithYield f rest (List.foldl (::) acc mapped) cfg env
+                                    concatMapHelp f rest (List.foldl (::) acc mapped) cfg env
 
                                 Err e ->
                                     EvErr e
@@ -371,7 +502,7 @@ concatMapHelpWithYield f remaining acc cfg env =
                 fxResult ->
                     case EvalResult.toResult fxResult of
                         Ok mapped ->
-                            concatMapHelpWithYield f rest (List.foldl (::) acc mapped) cfg env
+                            concatMapHelp f rest (List.foldl (::) acc mapped) cfg env
 
                         Err e ->
                             EvErr e

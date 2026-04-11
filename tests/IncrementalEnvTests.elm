@@ -12,11 +12,13 @@ import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Pattern exposing (QualifiedNameRef)
 import Eval.Expression
 import Eval.Module
-import ValueCodec
 import Expect
-import Test exposing (Test, describe, test)
 import FastDict
+import MemoRuntime
+import Set
+import Test exposing (Test, describe, test)
 import Types exposing (EvalResult(..), Intercept(..), Value(..))
+import ValueCodec
 
 
 suite : Test
@@ -39,11 +41,27 @@ suite =
             , interceptReceivesArgs
             , interceptMissPassesThrough
             ]
+        , describe "combined function eval"
+            [ combinedListConcatMap
+            , combinedFilterMapApply
+            , combinedSelectedByIndex
+            , combinedFilterMapDropLargeIndices
+            ]
         , describe "EvYield"
             [ interceptCanYield
             , yieldInLetBindingPropagates
             , yieldFromCalledFunctionInLet
             , multipleYieldsFromSequentialCalls
+            , yieldsAcrossNestedOperatorChain
+            , yieldsAcrossImportedZeroArgOperatorChain
+            , yieldsAcrossAnnotatedImportedZeroArgOperatorChain
+            , multipleYieldsFromLetBindings
+            , yieldInsideListFoldl
+            , yieldInsideManualFold
+            , yieldInsideListMap
+            ]
+        , describe "runtime memoization"
+            [ runtimeMemoReusesCacheAcrossInvocations
             ]
         , describe "deepHashValue"
             [ deepHashSameValue
@@ -62,6 +80,178 @@ suite =
             , codecContextHashListOrderIndependent
             ]
         ]
+
+
+{-| Test: List.concatMap over a list of functions produces results from ALL functions.
+This simulates Rule.review's pattern of running multiple rules.
+-}
+combinedListConcatMap : Test
+combinedListConcatMap =
+    test "List.concatMap over function list includes all results" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nruleA items = List.map (\\x -> x + 10) items\n\nruleB items = List.map (\\x -> x + 20) items\n\nresults = List.concatMap (\\f -> f [1, 2]) [ruleA, ruleB]\n"
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Err e ->
+                    Expect.fail ("Build error: " ++ Debug.toString e)
+
+                Ok env ->
+                    case Eval.Module.evalWithEnv env [] (Expression.FunctionOrValue [] "results") of
+                        Ok (List values) ->
+                            -- Should be [11, 12, 21, 22] (ruleA results ++ ruleB results)
+                            Expect.equal 4 (List.length values)
+
+                        Ok other ->
+                            Expect.fail ("Expected List, got: " ++ Debug.toString other)
+
+                        Err e ->
+                            Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Test: List.filterMap selecting from a config list, then concatMap.
+Simulates: selectedRules = indices |> List.filterMap (\i -> List.head (List.drop i config))
+-}
+combinedFilterMapApply : Test
+combinedFilterMapApply =
+    test "filterMap + concatMap over selected rules" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nconfig = [ (\\x -> x + 1), (\\x -> x + 2), (\\x -> x + 3) ]\n\nselected = [0, 2] |> List.filterMap (\\i -> List.head (List.drop i config))\n\nresults = List.concatMap (\\f -> [f 10]) selected\n"
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Err e ->
+                    Expect.fail ("Build error: " ++ Debug.toString e)
+
+                Ok env ->
+                    case Eval.Module.evalWithEnv env [] (Expression.FunctionOrValue [] "results") of
+                        Ok (List [ Int a, Int b ]) ->
+                            -- selected = [config[0], config[2]] = [(+1), (+3)]
+                            -- results = [11, 13]
+                            Expect.equal [ 11, 13 ] [ a, b ]
+
+                        Ok other ->
+                            Expect.fail ("Expected [11, 13], got: " ++ Debug.toString other)
+
+                        Err e ->
+                            Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Test: the exact pattern used by runReviewCachingWithProject.
+Select rules by index from a config list, apply them, concat results.
+-}
+combinedSelectedByIndex : Test
+combinedSelectedByIndex =
+    test "select rules by index and run all - results from ALL rules present" <|
+        \_ ->
+            let
+                source =
+                    String.join "\n"
+                        [ "module Main exposing (..)"
+                        , ""
+                        , "type alias Rule = List Int -> List String"
+                        , ""
+                        , "ruleA : Rule"
+                        , "ruleA items = List.map (\\x -> \"A:\" ++ String.fromInt x) items"
+                        , ""
+                        , "ruleB : Rule"
+                        , "ruleB items = List.map (\\x -> \"B:\" ++ String.fromInt x) items"
+                        , ""
+                        , "ruleC : Rule"
+                        , "ruleC items = List.map (\\x -> \"C:\" ++ String.fromInt x) items"
+                        , ""
+                        , "config : List Rule"
+                        , "config = [ ruleA, ruleB, ruleC ]"
+                        , ""
+                        , "runSelected : List Int -> List Int -> List String"
+                        , "runSelected indices items ="
+                        , "    let"
+                        , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i config))"
+                        , "    in"
+                        , "    List.concatMap (\\rule -> rule items) selectedRules"
+                        , ""
+                        , "results = runSelected [2, 0] [1, 2, 3]"
+                        ]
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Err e ->
+                    Expect.fail ("Build error: " ++ Debug.toString e)
+
+                Ok env ->
+                    case Eval.Module.evalWithEnv env [] (Expression.FunctionOrValue [] "results") of
+                        Ok (List values) ->
+                            let
+                                strings =
+                                    values
+                                        |> List.filterMap
+                                            (\v ->
+                                                case v of
+                                                    String s ->
+                                                        Just s
+
+                                                    _ ->
+                                                        Nothing
+                                            )
+
+                                hasA =
+                                    List.any (String.startsWith "A:") strings
+
+                                hasC =
+                                    List.any (String.startsWith "C:") strings
+                            in
+                            Expect.all
+                                [ \_ -> Expect.equal 6 (List.length strings)
+                                , \_ ->
+                                    if hasC && hasA then
+                                        Expect.pass
+
+                                    else
+                                        Expect.fail ("Expected both A: and C: results, got: " ++ Debug.toString strings)
+                                ]
+                                ()
+
+                        Ok other ->
+                            Expect.fail ("Expected List, got: " ++ Debug.toString other)
+
+                        Err e ->
+                            Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Test: List.filterMap with List.drop on large indices (8, 7) from 9-element list.
+This is the EXACT pattern used by runReviewCachingWithProject.
+-}
+combinedFilterMapDropLargeIndices : Test
+combinedFilterMapDropLargeIndices =
+    test "List.filterMap + List.drop with indices [8, 7] from 9-element config" <|
+        \_ ->
+            let
+                source =
+                    String.join "\n"
+                        [ "module Main exposing (..)"
+                        , ""
+                        , "config = [ \"r0\", \"r1\", \"r2\", \"r3\", \"r4\", \"r5\", \"r6\", \"r7\", \"r8\" ]"
+                        , ""
+                        , "selected = [8, 7] |> List.filterMap (\\i -> List.head (List.drop i config))"
+                        , ""
+                        , "results = String.join \",\" selected"
+                        ]
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Err e ->
+                    Expect.fail ("Build error: " ++ Debug.toString e)
+
+                Ok env ->
+                    case Eval.Module.evalWithEnv env [] (Expression.FunctionOrValue [] "results") of
+                        Ok (String s) ->
+                            Expect.equal "r8,r7" s
+
+                        Ok other ->
+                            Expect.fail ("Expected String, got: " ++ Debug.toString other)
+
+                        Err e ->
+                            Expect.fail ("Eval error: " ++ Debug.toString e)
 
 
 {-| Test: injecting an Int value makes it available in the expression.
@@ -176,7 +366,7 @@ interceptReplacesResult =
                 intercepts =
                     FastDict.singleton "Helpers.greet"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 -- Always return "INTERCEPTED" regardless of args
                                 EvOk (String "INTERCEPTED")
                             )
@@ -209,7 +399,7 @@ interceptReceivesArgs =
                 intercepts =
                     FastDict.singleton "Helpers.add"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 -- Return the sum (proving we got the args)
                                 case args of
                                     [ Int a, Int b ] ->
@@ -248,7 +438,7 @@ interceptMissPassesThrough =
                 -- Intercept a DIFFERENT function
                 intercepts =
                     FastDict.singleton "Helpers.greet"
-                        (Intercept (\_ _ _ -> EvOk (String "INTERCEPTED")))
+                        (Intercept (\_ _ _ _ -> EvOk (String "INTERCEPTED")))
             in
             case evalWithIntercepts [ helperSource, source ] intercepts "results" of
                 Ok (Int 42) ->
@@ -522,7 +712,7 @@ interceptCanYield =
                 intercepts =
                     FastDict.singleton "Helpers.fetch"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ String key ] ->
                                         -- Yield to framework: "please look up this key"
@@ -592,7 +782,7 @@ yieldInLetBindingPropagates =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 100)))
@@ -660,7 +850,7 @@ yieldFromCalledFunctionInLet =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 100)))
@@ -725,7 +915,7 @@ multipleYieldsFromSequentialCalls =
                 intercepts =
                     FastDict.singleton "Helpers.marker"
                         (Intercept
-                            (\args _ _ ->
+                            (\_ args _ _ ->
                                 case args of
                                     [ Int n ] ->
                                         EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
@@ -770,6 +960,562 @@ multipleYieldsFromSequentialCalls =
                                             Expect.fail "Unexpected final result"
                                 ]
                                 ()
+
+
+{-| Test: yields continue correctly across a nested left-associated operator chain.
+This matches the benchmark shape `a + b + c + d`, where the outer continuation
+must remain attached after each nested resume.
+-}
+yieldsAcrossNestedOperatorChain : Test
+yieldsAcrossNestedOperatorChain =
+    test "multiple yields across nested operator chain" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = Helpers.marker 1 + Helpers.marker 2 + Helpers.marker 3 + Helpers.marker 4\n"
+
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        driveResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                                |> (\rawResult -> driveYieldsSync rawResult [])
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ -> Expect.equal 4 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 100) ->
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 100, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
+                                ]
+                                ()
+
+
+{-| Test: yields continue correctly when the repeated operator chain lives inside
+an imported zero-argument value. This matches the benchmark shape
+`Wrapper.results = MemoBench.probeResults`.
+-}
+yieldsAcrossImportedZeroArgOperatorChain : Test
+yieldsAcrossImportedZeroArgOperatorChain =
+    test "multiple yields across imported zero-arg operator chain" <|
+        \_ ->
+            let
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                memoBenchSource =
+                    "module MemoBench exposing (probeResults)\n\nimport Helpers\n\nprobeResults = Helpers.marker 1 + Helpers.marker 2 + Helpers.marker 3 + Helpers.marker 4\n"
+
+                source =
+                    "module Main exposing (results)\n\nimport MemoBench\n\nresults = MemoBench.probeResults\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, memoBenchSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        driveResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                                |> (\rawResult -> driveYieldsSync rawResult [])
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ -> Expect.equal 4 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 100) ->
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 100, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
+                                ]
+                                ()
+
+
+{-| Test: yields continue correctly through the benchmark's annotated module shape.
+-}
+yieldsAcrossAnnotatedImportedZeroArgOperatorChain : Test
+yieldsAcrossAnnotatedImportedZeroArgOperatorChain =
+    test "multiple yields across annotated imported zero-arg operator chain" <|
+        \_ ->
+            let
+                helperSource =
+                    "module ExpensiveHelper exposing (probe)\n\nprobe : Int -> Int\nprobe n =\n    n + 1\n"
+
+                memoBenchSource =
+                    "module MemoBench exposing (probeResults)\n\nimport ExpensiveHelper\n\nprobeResults : Int\nprobeResults =\n    ExpensiveHelper.probe 1\n        + ExpensiveHelper.probe 2\n        + ExpensiveHelper.probe 3\n        + ExpensiveHelper.probe 4\n        + ExpensiveHelper.probe 5\n        + ExpensiveHelper.probe 6\n        + ExpensiveHelper.probe 7\n        + ExpensiveHelper.probe 8\n"
+
+                source =
+                    "module Main exposing (results)\n\nimport MemoBench\n\nresults : String\nresults =\n    MemoBench.probeResults\n"
+
+                intercepts =
+                    FastDict.singleton "ExpensiveHelper.probe"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n + 1)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, memoBenchSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        driveResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                                |> (\rawResult -> driveYieldsSync rawResult [])
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ -> Expect.equal 8 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 44) ->
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 44, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
+                                ]
+                                ()
+
+
+runtimeMemoReusesCacheAcrossInvocations : Test
+runtimeMemoReusesCacheAcrossInvocations =
+    test "runtime memo reuses cache across invocations" <|
+        \_ ->
+            let
+                helperSource =
+                    """module ExpensiveHelper exposing (expensive)
+
+expensive : Int -> Int
+expensive n =
+    let
+        doubled =
+            List.map (\\i -> i * 2) (List.range 1 n)
+    in
+    List.foldl (+) 0 doubled
+"""
+
+                memoBenchSource =
+                    """module MemoBench exposing (results)
+
+import ExpensiveHelper
+
+results : Int
+results =
+    ExpensiveHelper.expensive 20
+        + ExpensiveHelper.expensive 20
+        + ExpensiveHelper.expensive 20
+        + ExpensiveHelper.expensive 20
+"""
+            in
+            case Eval.Module.buildProjectEnv [ helperSource ] of
+                Err e ->
+                    Expect.fail ("Build error: " ++ Debug.toString e)
+
+                Ok env ->
+                    case
+                        Eval.Module.evalWithMemoizedFunctions
+                            env
+                            [ memoBenchSource ]
+                            (Set.singleton "ExpensiveHelper.expensive")
+                            MemoRuntime.emptyMemoCache
+                            True
+                            (Expression.FunctionOrValue [] "results")
+                    of
+                        Err e ->
+                            Expect.fail ("Cold memo eval error: " ++ Debug.toString e)
+
+                        Ok coldResult ->
+                            case
+                                Eval.Module.evalWithMemoizedFunctions
+                                    env
+                                    [ memoBenchSource ]
+                                    (Set.singleton "ExpensiveHelper.expensive")
+                                    coldResult.memoCache
+                                    True
+                                    (Expression.FunctionOrValue [] "results")
+                            of
+                                Err e ->
+                                    Expect.fail ("Warm memo eval error: " ++ Debug.toString e)
+
+                                Ok warmResult ->
+                                    Expect.all
+                                        [ \_ -> Expect.equal (Int 1680) coldResult.value
+                                        , \_ -> Expect.equal coldResult.value warmResult.value
+                                        , \_ -> Expect.equal 4 coldResult.memoStats.lookups
+                                        , \_ -> Expect.equal 3 coldResult.memoStats.hits
+                                        , \_ -> Expect.equal 1 coldResult.memoStats.misses
+                                        , \_ -> Expect.equal 1 coldResult.memoStats.stores
+                                        , \_ -> Expect.equal 4 warmResult.memoStats.lookups
+                                        , \_ -> Expect.equal 4 warmResult.memoStats.hits
+                                        , \_ -> Expect.equal 0 warmResult.memoStats.misses
+                                        , \_ -> Expect.equal 0 warmResult.memoStats.stores
+                                        ]
+                                        ()
+
+
+{-| Test: multiple yields from sequential let bindings.
+    let x = marker 1
+        y = marker 2
+    in x + y
+-}
+multipleYieldsFromLetBindings : Test
+multipleYieldsFromLetBindings =
+    test "multiple yields from sequential let bindings" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults =\n    let\n        x = Helpers.marker 1\n        y = Helpers.marker 2\n    in\n    x + y\n"
+
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        rawResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+
+                        driveResult =
+                            driveYieldsSync rawResult []
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ ->
+                                    -- Should yield 2 times
+                                    Expect.equal 2 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 30) ->
+                                            -- 1*10 + 2*10 = 30
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 30, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
+                                ]
+                                ()
+
+
+{-| Test: yields from within List.foldl — the elm-review pattern.
+Each fold iteration calls a yielding function.
+-}
+yieldInsideListFoldl : Test
+yieldInsideListFoldl =
+    test "multiple yields from List.foldl iterations" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = List.foldl (\\n acc -> acc + Helpers.marker n) 0 [1, 2, 3]\n"
+
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        rawResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+                    in
+                    -- Manually drive yields to see what happens at each step
+                    case rawResult of
+                        EvYield tag1 (Int n1) resume1 ->
+                            let
+                                step2 =
+                                    resume1 Unit
+                            in
+                            case step2 of
+                                EvYield tag2 (Int n2) resume2 ->
+                                    -- Great, second yield! Continue...
+                                    let
+                                        step3 =
+                                            resume2 Unit
+                                    in
+                                    case step3 of
+                                        EvYield _ (Int n3) resume3 ->
+                                            case resume3 Unit of
+                                                EvOk (Int total) ->
+                                                    Expect.equal 60 total
+
+                                                other ->
+                                                    Expect.fail ("After 3 yields, got: " ++ Debug.toString other)
+
+                                        EvOk (Int total) ->
+                                            -- Only 2 yields, check value
+                                            Expect.fail ("Only 2 yields (expected 3), final value: " ++ String.fromInt total ++ ", payloads: " ++ String.fromInt n1 ++ ", " ++ String.fromInt n2)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error after 2 yields: " ++ Types.evalErrorKindToString e.error)
+
+                                        other ->
+                                            Expect.fail ("After yield 2, unexpected: " ++ Debug.toString other)
+
+                                EvOk val ->
+                                    Expect.fail ("Only 1 yield (payload=" ++ String.fromInt n1 ++ "), resume gave EvOk: " ++ Debug.toString val)
+
+                                EvErr e ->
+                                    Expect.fail ("Only 1 yield (payload=" ++ String.fromInt n1 ++ "), resume gave error: " ++ Types.evalErrorKindToString e.error)
+
+                                _ ->
+                                    Expect.fail ("Only 1 yield (payload=" ++ String.fromInt n1 ++ "), resume gave: " ++ Debug.toString step2)
+
+                        EvOk val ->
+                            Expect.fail ("No yields at all, got EvOk: " ++ Debug.toString val)
+
+                        EvErr e ->
+                            Expect.fail ("No yields, got error: " ++ Types.evalErrorKindToString e.error)
+
+                        _ ->
+                            Expect.fail ("Unexpected initial result: " ++ Debug.toString rawResult)
+
+
+{-| Test: yields from within a manual fold (no kernel) to isolate kernel vs trampoline issue.
+-}
+yieldInsideManualFold : Test
+yieldInsideManualFold =
+    test "multiple yields from manual fold (no kernel)" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nmyFold f acc list =\n    case list of\n        [] -> acc\n        x :: rest -> myFold f (f x acc) rest\n\nresults = myFold (\\n acc -> acc + Helpers.marker n) 0 [1, 2, 3]\n"
+
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                intercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        rawResult =
+                            Eval.Module.evalWithInterceptsRaw env [] intercepts (Expression.FunctionOrValue [] "results")
+
+                        driveResult =
+                            driveYieldsSync rawResult []
+                    in
+                    case driveResult of
+                        { finalResult, yields } ->
+                            Expect.all
+                                [ \_ ->
+                                    -- Should yield 3 times
+                                    Expect.equal 3 (List.length yields)
+                                , \_ ->
+                                    case finalResult of
+                                        EvOk (Int 60) ->
+                                            Expect.pass
+
+                                        EvOk other ->
+                                            Expect.fail ("Expected Int 60, got: " ++ Debug.toString other)
+
+                                        EvErr e ->
+                                            Expect.fail ("Error: " ++ Types.evalErrorKindToString e.error)
+
+                                        _ ->
+                                            Expect.fail ("Unexpected: " ++ Debug.toString finalResult)
+                                ]
+                                ()
+
+
+{-| Test: yields from within List.map iterations.
+-}
+yieldInsideListMap : Test
+yieldInsideListMap =
+    test "multiple yields from List.map iterations" <|
+        \_ ->
+            let
+                -- Test with 3 elements via custom map (no kernel)
+                source =
+                    "module Main exposing (..)\n\nimport Helpers\n\nmyMap f list =\n    case list of\n        [] -> []\n        x :: rest -> f x :: myMap f rest\n\nresults = myMap (\\n -> Helpers.marker n) [1, 2, 3]\n"
+
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                -- Use a different intercept: return Int (n * 10) directly (no yield).
+                -- This tests if the intercept fires for ALL elements.
+                interceptsNoYield =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvOk (Int (n * 10))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+
+                interceptsWithYield =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, source ] of
+                Err _ ->
+                    Expect.fail "Failed to build env"
+
+                Ok env ->
+                    let
+                        -- First check: do intercepts fire at all (no yield)?
+                        noYieldResult =
+                            Eval.Module.evalWithInterceptsRaw env [] interceptsNoYield (Expression.FunctionOrValue [] "results")
+
+                        -- Then check with yields
+                        yieldResult =
+                            Eval.Module.evalWithInterceptsRaw env [] interceptsWithYield (Expression.FunctionOrValue [] "results")
+
+                        countYields result n pacc =
+                            case result of
+                                EvYield _ payload resume ->
+                                    countYields (resume Unit) (n + 1) (payload :: pacc)
+
+                                _ ->
+                                    ( n, result, List.reverse pacc )
+
+                        ( yieldCount, final, payloads ) =
+                            countYields yieldResult 0 []
+                    in
+                    Expect.all
+                        [ \_ ->
+                            -- Non-yield intercept: should give [10, 20, 30]
+                            case noYieldResult of
+                                EvOk (List [ Int 10, Int 20, Int 30 ]) ->
+                                    Expect.pass
+
+                                _ ->
+                                    Expect.fail ("Non-yield intercept gave: " ++ Debug.toString noYieldResult)
+                        , \_ ->
+                            if yieldCount /= 3 then
+                                Expect.fail ("Expected 3 yields, got " ++ String.fromInt yieldCount ++ ". Payloads: " ++ Debug.toString payloads ++ ". Final: " ++ Debug.toString final)
+                            else
+                                Expect.pass
+                        ]
+                        ()
 
 
 {-| Synchronous yield driver for tests: drives yields until EvOk/EvErr,

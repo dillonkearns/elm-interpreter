@@ -1,4 +1,4 @@
-module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction)
+module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs)
 
 import Array
 import Bitwise
@@ -16,13 +16,14 @@ import FastDict as Dict exposing (Dict)
 import Kernel
 import Kernel.Utils
 import List.Extra
+import MemoSpec
 import Recursion
 import Result.MyExtra
 import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
-import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), PartialEval, PartialResult, Value(..))
+import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, Value(..))
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -59,7 +60,7 @@ fingerprintValue value =
             7
 
         List items ->
-            List.length items * 53 + 8
+            shallowListBucket items * 53 + 8
 
         Tuple a _ ->
             fingerprintValue a * 59 + 9
@@ -67,8 +68,13 @@ fingerprintValue value =
         Triple a _ _ ->
             fingerprintValue a * 61 + 10
 
-        Custom ref args ->
-            List.length args * 67 + 11
+        Custom _ args ->
+            -- List.length on args allocates an F2 wrapper and runs a fold
+            -- every single call, which is burned hard by the TCO cycle
+            -- check walking env.values. The constructor arity alone isn't
+            -- a useful growth signal anyway, so bucket it the same way
+            -- as `sizeOfValue`.
+            shallowListBucket args * 67 + 11
 
         Record dict ->
             -- Include fingerprints of values, not just size, so records with
@@ -94,7 +100,7 @@ fingerprintValue value =
                         Nothing ->
                             0
             in
-            arity * 83 + List.length args * 89 + nameHash + Dict.size closureEnv.values * 97 + 14
+            arity * 83 + shallowListBucket args * 89 + nameHash + Dict.size closureEnv.values * 97 + 14
 
         _ ->
             0
@@ -109,14 +115,26 @@ sizeOfArgs args =
     List.foldl (\v acc -> acc + sizeOfValue v) 0 args
 
 
+{-| Cheap size proxy used only by the TCO cycle check. The old version
+called `List.length` on the `Custom`/`List` args lists — for `Custom`
+that's always the fixed constructor arity so it provided no growth
+signal at all, and for `List` it was O(n) in the accumulator size.
+
+We only need a crude "empty / small / big" bucket for cycle growth
+detection. Pattern-match the first few cons cells to bucket lists
+and treat `Custom` as a constant since its arity can't grow.
+-}
 sizeOfValue : Value -> Int
 sizeOfValue value =
     case value of
         List items ->
-            List.length items
+            shallowListBucket items
 
-        String s ->
-            String.length s
+        String _ ->
+            -- String.length is O(n) in Elm; the cycle check only needs
+            -- to know the value is "there", and fingerprintValue already
+            -- factors string length into its hash, so a constant is fine.
+            1
 
         Tuple _ _ ->
             2
@@ -124,17 +142,41 @@ sizeOfValue value =
         Triple _ _ _ ->
             3
 
-        Custom _ args ->
-            List.length args
+        Custom _ _ ->
+            -- Constructor arity is fixed, so this was useless for
+            -- growth detection and the old List.length call was pure
+            -- overhead (per-iteration inside the TCO loop, even after
+            -- the sampled check landed). Constant `1` is enough: the
+            -- fingerprint already distinguishes different Custom shapes.
+            1
 
-        Record dict ->
-            Dict.size dict
+        Record _ ->
+            1
 
-        JsArray arr ->
-            Array.length arr
+        JsArray _ ->
+            1
 
         _ ->
             1
+
+
+shallowListBucket : List a -> Int
+shallowListBucket items =
+    case items of
+        [] ->
+            0
+
+        _ :: [] ->
+            1
+
+        _ :: _ :: [] ->
+            2
+
+        _ :: _ :: _ :: [] ->
+            3
+
+        _ ->
+            4
 
 
 {-| Deep hash of a Value — traverses the full structure for content-based
@@ -258,6 +300,212 @@ deepHashJsonValue jv =
 hashString : String -> Int
 hashString s =
     String.foldl (\c acc -> Bitwise.xor (acc * 16777619) (Char.toCode c)) 2166136261 s
+
+
+memoLookupPayload : Bool -> MemoSpec.MemoSpec -> String -> List Value -> MemoLookupPayload
+memoLookupPayload collectMemoStats memoSpec qualifiedName args =
+    let
+        maybeQualifiedName =
+            if collectMemoStats then
+                Just qualifiedName
+
+            else
+                Nothing
+    in
+    case memoFingerprintsForSpec memoSpec args of
+        Just { shallowFingerprint, deepFingerprint } ->
+            { specId = memoSpec.id
+            , qualifiedName = maybeQualifiedName
+            , compactFingerprint = compactFingerprintForSpec memoSpec shallowFingerprint
+            , args = Nothing
+            , shallowFingerprint = Just shallowFingerprint
+            , deepFingerprint = Just deepFingerprint
+            }
+
+        Nothing ->
+            { specId = memoSpec.id
+            , qualifiedName = maybeQualifiedName
+            , compactFingerprint = Nothing
+            , args = Just args
+            , shallowFingerprint = Nothing
+            , deepFingerprint = Nothing
+            }
+
+
+memoStorePayload : Bool -> MemoSpec.MemoSpec -> String -> List Value -> Value -> MemoStorePayload
+memoStorePayload collectMemoStats memoSpec qualifiedName args value =
+    let
+        maybeQualifiedName =
+            if collectMemoStats then
+                Just qualifiedName
+
+            else
+                Nothing
+    in
+    case memoFingerprintsForSpec memoSpec args of
+        Just { shallowFingerprint, deepFingerprint } ->
+            { specId = memoSpec.id
+            , qualifiedName = maybeQualifiedName
+            , compactFingerprint = compactFingerprintForSpec memoSpec shallowFingerprint
+            , args = Nothing
+            , shallowFingerprint = Just shallowFingerprint
+            , deepFingerprint = Just deepFingerprint
+            , value = value
+            }
+
+        Nothing ->
+            { specId = memoSpec.id
+            , qualifiedName = maybeQualifiedName
+            , compactFingerprint = Nothing
+            , args = Just args
+            , shallowFingerprint = Nothing
+            , deepFingerprint = Nothing
+            , value = value
+            }
+
+
+memoFingerprintsForSpec : MemoSpec.MemoSpec -> List Value -> Maybe { shallowFingerprint : Int, deepFingerprint : Int }
+memoFingerprintsForSpec memoSpec args =
+    case memoSpec.keyStrategy of
+        MemoSpec.ModuleLookupByRange ->
+            moduleLookupRangeFingerprints args
+
+        MemoSpec.ModuleLookupByNode ->
+            moduleLookupNodeFingerprints args
+
+        MemoSpec.StructuralArgs ->
+            Nothing
+
+
+compactFingerprintForSpec : MemoSpec.MemoSpec -> Int -> Maybe Int
+compactFingerprintForSpec memoSpec combinedFingerprint =
+    case memoSpec.keyStrategy of
+        MemoSpec.ModuleLookupByRange ->
+            Just combinedFingerprint
+
+        MemoSpec.ModuleLookupByNode ->
+            Just combinedFingerprint
+
+        MemoSpec.StructuralArgs ->
+            Nothing
+
+
+moduleLookupRangeFingerprints : List Value -> Maybe { shallowFingerprint : Int, deepFingerprint : Int }
+moduleLookupRangeFingerprints args =
+    case args of
+        [ lookupTable, rangeValue ] ->
+            Maybe.map2 combineMemoFingerprints
+                (lookupTableNamespaceHash lookupTable)
+                (rangeHashValue rangeValue)
+
+        _ ->
+            Nothing
+
+
+moduleLookupNodeFingerprints : List Value -> Maybe { shallowFingerprint : Int, deepFingerprint : Int }
+moduleLookupNodeFingerprints args =
+    case args of
+        [ lookupTable, nodeValue ] ->
+            Maybe.map2 combineMemoFingerprints
+                (lookupTableNamespaceHash lookupTable)
+                (nodeRangeHashValue nodeValue)
+
+        _ ->
+            Nothing
+
+
+combineMemoFingerprints : Int -> Int -> { shallowFingerprint : Int, deepFingerprint : Int }
+combineMemoFingerprints namespaceHash localHash =
+    let
+        combined =
+            Bitwise.xor (namespaceHash * 16777619) localHash
+    in
+    { shallowFingerprint = combined
+    , deepFingerprint = combined
+    }
+
+
+lookupTableNamespaceHash : Value -> Maybe Int
+lookupTableNamespaceHash value =
+    case value of
+        Custom ref [ currentModuleNameValue, _ ] ->
+            if ref.moduleName == [ "Review", "ModuleNameLookupTable", "Internal" ] && ref.name == "ModuleNameLookupTable" then
+                moduleNameValueHash currentModuleNameValue
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+moduleNameValueHash : Value -> Maybe Int
+moduleNameValueHash value =
+    case value of
+        List moduleParts ->
+            moduleParts
+                |> List.foldl
+                    (\part maybeAcc ->
+                        case ( maybeAcc, part ) of
+                            ( Just acc, String namePart ) ->
+                                Just (Bitwise.xor (acc * 16777619) (hashString namePart))
+
+                            _ ->
+                                Nothing
+                    )
+                    (Just 2166136261)
+
+        _ ->
+            Nothing
+
+
+nodeRangeHashValue : Value -> Maybe Int
+nodeRangeHashValue value =
+    case value of
+        Custom ref [ rangeValue, _ ] ->
+            if ref.moduleName == [ "Elm", "Syntax", "Node" ] && ref.name == "Node" then
+                rangeHashValue rangeValue
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+rangeHashValue : Value -> Maybe Int
+rangeHashValue value =
+    case value of
+        Record fields ->
+            case ( Dict.get "start" fields, Dict.get "end" fields ) of
+                ( Just startValue, Just endValue ) ->
+                    Maybe.map2
+                        (\startHash endHash ->
+                            Bitwise.xor (startHash * 16777619) endHash
+                        )
+                        (positionHashValue startValue)
+                        (positionHashValue endValue)
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+positionHashValue : Value -> Maybe Int
+positionHashValue value =
+    case value of
+        Record fields ->
+            case ( Dict.get "row" fields, Dict.get "column" fields ) of
+                ( Just (Int row), Just (Int column) ) ->
+                    Just (Bitwise.xor (row * 16777619) column)
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
 
 
 {-| Combined check + update for cycle detection. Returns either:
@@ -530,7 +778,47 @@ evalExpression initExpression initCfg initEnv =
                                 Expression.GLSLExpression _ ->
                                     Types.failPartial <| unsupported env "GLSL not supported"
                     in
-                    if cfg.trace then
+                    if cfg.coverage then
+                        let
+                            isProbe : Bool
+                            isProbe =
+                                Set.isEmpty cfg.coverageProbeLines
+                                    || Set.member range.start.row cfg.coverageProbeLines
+                                    || Set.member range.end.row cfg.coverageProbeLines
+                        in
+                        if isProbe then
+                            result
+                                |> Recursion.map
+                                    (\evalResult ->
+                                        let
+                                            packedRange : Int
+                                            packedRange =
+                                                Types.packRange range
+
+                                            ( value, childSet ) =
+                                                EvalResult.toCoverageSet evalResult
+                                        in
+                                        if Set.member packedRange childSet then
+                                            evalResult
+
+                                        else
+                                            let
+                                                mergedSet : Set.Set Int
+                                                mergedSet =
+                                                    Set.insert packedRange childSet
+                                            in
+                                            case value of
+                                                Ok v ->
+                                                    EvOkCoverage v mergedSet
+
+                                                Err e ->
+                                                    EvErrCoverage e mergedSet
+                                    )
+
+                        else
+                            result
+
+                    else if cfg.trace then
                         result
                             |> Recursion.map
                                 (\evalResult ->
@@ -596,7 +884,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
             case (if Dict.isEmpty env.letFunctions then Nothing else Dict.get name env.letFunctions) of
                 Just function ->
                     if List.isEmpty function.arguments then
-                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     else
                         continuation
@@ -618,36 +906,48 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                     -- Then check values (local bindings, parameters, record destructuring)
                     case Dict.get name env.values of
                         Just (PartiallyApplied _ [] [] _ _ _) ->
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                         Just value ->
                             continuation value
 
                         Nothing ->
-                            -- Then check currentModuleFunctions (module-level functions)
+                            -- Then check currentModuleFunctions (module-level functions).
+                            -- Top-level module functions never close over caller locals,
+                            -- so use the `callModuleFn` variants that zero out `values` and
+                            -- `letFunctions` on the stored env — keeps the PA's captured
+                            -- dict tiny and saves downstream Dict work on every call.
                             case Dict.get name env.currentModuleFunctions of
                                 Just function ->
-                                    if List.isEmpty function.arguments then
-                                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                    -- Kernel fast path: if a user-level kernel is registered
+                                    -- for (currentModule, name), route through the slow path
+                                    -- so the kernel fires instead of the AST body.
+                                    case Dict.get env.currentModuleKey kernelFunctions |> Maybe.andThen (Dict.get name) of
+                                        Just _ ->
+                                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
-                                    else
-                                        continuation
-                                            (PartiallyApplied
-                                                (if cfg.trace then
-                                                    Environment.call env.currentModule name env
+                                        Nothing ->
+                                            if List.isEmpty function.arguments then
+                                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
-                                                 else
-                                                    Environment.callNoStack env.currentModule name env
-                                                )
-                                                []
-                                                function.arguments
-                                                (Just { moduleName = env.currentModule, name = name })
-                                                (AstImpl function.expression)
-                                                (List.length function.arguments)
-                                            )
+                                            else
+                                                continuation
+                                                    (PartiallyApplied
+                                                        (if cfg.trace then
+                                                            Environment.callModuleFn env.currentModule name env
+
+                                                         else
+                                                            Environment.callModuleFnNoStack env.currentModule name env
+                                                        )
+                                                        []
+                                                        function.arguments
+                                                        (Just { moduleName = env.currentModule, name = name })
+                                                        (AstImpl function.expression)
+                                                        (List.length function.arguments)
+                                                    )
 
                                 Nothing ->
-                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.ParenthesizedExpression inner ->
             evalOrRecurse ( inner, cfg, env ) continuation
@@ -672,19 +972,19 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             Types.failPartial <| typeError env "Trying to negate a non-number"
 
                 Nothing ->
-                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.OperatorApplication opName _ l r ->
             if cfg.trace then
-                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
             else
                 case opName of
                     "<|" ->
-                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     "|>" ->
-                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     "||" ->
                         case evalSimple l env of
@@ -692,21 +992,21 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                 continuation (Bool True)
 
                             Just (Bool False) ->
-                                Types.recurseThen ( r, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( r, cfg, env ) continuation
 
                             Just v ->
                                 Types.failPartial <| typeError env <| "|| applied to non-Bool " ++ Value.toString v
 
                             Nothing ->
                                 -- Left complex: trampoline left, then short-circuit
-                                Types.recurseThen ( l, cfg, env )
+                                Types.recurseThenWithEval evalExpression ( l, cfg, env )
                                     (\lValue ->
                                         case lValue of
                                             Bool True ->
                                                 continuation (Bool True)
 
                                             Bool False ->
-                                                Types.recurseThen ( r, cfg, env ) continuation
+                                                Types.recurseThenWithEval evalExpression ( r, cfg, env ) continuation
 
                                             v ->
                                                 Types.failPartial <| typeError env <| "|| applied to non-Bool " ++ Value.toString v
@@ -718,21 +1018,21 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                 continuation (Bool False)
 
                             Just (Bool True) ->
-                                Types.recurseThen ( r, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( r, cfg, env ) continuation
 
                             Just v ->
                                 Types.failPartial <| typeError env <| "&& applied to non-Bool " ++ Value.toString v
 
                             Nothing ->
                                 -- Left complex: trampoline left, then short-circuit
-                                Types.recurseThen ( l, cfg, env )
+                                Types.recurseThenWithEval evalExpression ( l, cfg, env )
                                     (\lValue ->
                                         case lValue of
                                             Bool False ->
                                                 continuation (Bool False)
 
                                             Bool True ->
-                                                Types.recurseThen ( r, cfg, env ) continuation
+                                                Types.recurseThenWithEval evalExpression ( r, cfg, env ) continuation
 
                                             v ->
                                                 Types.failPartial <| typeError env <| "&& applied to non-Bool " ++ Value.toString v
@@ -755,7 +1055,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                                 Recursion.base (EvErr e)
 
                                     Nothing ->
-                                        Types.recurseThen ( r, cfg, env )
+                                        Types.recurseThenWithEval evalExpression ( r, cfg, env )
                                             (\rValue ->
                                                 case Kernel.Utils.equal lValue rValue env of
                                                     Ok True ->
@@ -769,7 +1069,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                             )
 
                             Nothing ->
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     "/=" ->
                         case evalSimple l env of
@@ -787,10 +1087,10 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                                 Recursion.base (EvErr e)
 
                                     Nothing ->
-                                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                             Nothing ->
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                     _ ->
                         case resolveOperator opName of
@@ -809,7 +1109,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
 
                                             Nothing ->
                                                 -- Left simple, right complex: trampoline right only
-                                                Types.recurseThen ( r, cfg, env )
+                                                Types.recurseThenWithEval evalExpression ( r, cfg, env )
                                                     (\rValue ->
                                                         case kernelFn [ lValue, rValue ] cfg env of
                                                             EvOk v ->
@@ -823,7 +1123,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                         case evalSimple r env of
                                             Just rValue ->
                                                 -- Left complex, right simple: trampoline left only
-                                                Types.recurseThen ( l, cfg, env )
+                                                Types.recurseThenWithEval evalExpression ( l, cfg, env )
                                                     (\lValue ->
                                                         case kernelFn [ lValue, rValue ] cfg env of
                                                             EvOk v ->
@@ -835,10 +1135,10 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
 
                                             Nothing ->
                                                 -- Both complex: full trampoline
-                                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                             Nothing ->
-                                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.RecordAccess recordExpr (Node _ field) ->
             case evalSimple recordExpr env of
@@ -854,7 +1154,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                     Types.failPartial <| typeError env "Trying to access a field on a non-record value"
 
                 Nothing ->
-                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.TupledExpression exprs ->
             case exprs of
@@ -867,7 +1167,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             continuation v
 
                         Nothing ->
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                 [ l, r ] ->
                     case evalSimple l env of
@@ -877,10 +1177,10 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                     continuation (Tuple lValue rValue)
 
                                 Nothing ->
-                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                         Nothing ->
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                 [ l, m, r ] ->
                     case evalSimple l env of
@@ -892,40 +1192,40 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                             continuation (Triple lValue mValue rValue)
 
                                         Nothing ->
-                                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                                 Nothing ->
-                                    Types.recurseThen ( fullExpr, cfg, env ) continuation
+                                    Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                         Nothing ->
-                            Types.recurseThen ( fullExpr, cfg, env ) continuation
+                            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
                 _ ->
                     Types.failPartial <| typeError env "Tuples with more than three elements are not supported"
 
         Expression.IfBlock cond true false ->
             if cfg.trace then
-                Types.recurseThen ( fullExpr, cfg, env ) continuation
+                Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
             else
                 case evalSimple cond env of
                     Just (Bool True) ->
-                        Types.recurseThen ( true, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( true, cfg, env ) continuation
 
                     Just (Bool False) ->
-                        Types.recurseThen ( false, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( false, cfg, env ) continuation
 
                     Just _ ->
                         Types.failPartial <| typeError env "ifThenElse condition was not a boolean"
 
                     Nothing ->
-                        Types.recurseThen ( fullExpr, cfg, env ) continuation
+                        Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
         Expression.ListExpr [] ->
             continuation (List [])
 
         _ ->
-            Types.recurseThen ( fullExpr, cfg, env ) continuation
+            Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
 
 
 {-| Try to evaluate a simple expression without recursion.
@@ -1315,8 +1615,8 @@ kernelAppend args cfg env =
 evalApplication : Node Expression -> List (Node Expression) -> PartialEval Value
 evalApplication first rest cfg env =
     let
-        inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialResult Value
-        inner localEnv oldArgs patterns maybeQualifiedName implementation =
+        inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> Int -> PartialResult Value
+        inner localEnv oldArgs patterns maybeQualifiedName implementation patternsLength =
             case ( oldArgs, rest ) of
                 ( [], [ singleArg ] ) ->
                     -- Fast path: single argument, no oldArgs, exactly 1 new arg
@@ -1338,7 +1638,7 @@ evalApplication first rest cfg env =
 
                         [] ->
                             -- 0 patterns with 1 arg: need general path (splitting)
-                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
+                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
                 ( [], [ arg1, arg2 ] ) ->
                     -- Fast path: two arguments, no oldArgs
@@ -1365,20 +1665,20 @@ evalApplication first rest cfg env =
 
                         _ ->
                             -- 0 or 1 pattern with 2 args: need general path (splitting)
-                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
+                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
                 _ ->
-                    evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env
+                    evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
     in
     evalOrRecurse ( first, cfg, env )
         (\firstValue ->
             case firstValue of
                 Custom name customArgs ->
-                    Types.recurseMapThen ( rest, cfg, env )
+                    Types.recurseMapThenWithEval evalExpression ( rest, cfg, env )
                         (\values -> Types.succeedPartial <| Custom name (customArgs ++ values))
 
-                PartiallyApplied localEnv oldArgs patterns maybeQualifiedName implementation _ ->
-                    inner localEnv oldArgs patterns maybeQualifiedName implementation
+                PartiallyApplied localEnv oldArgs patterns maybeQualifiedName implementation patternsLength ->
+                    inner localEnv oldArgs patterns maybeQualifiedName implementation patternsLength
 
                 other ->
                     Types.failPartial <|
@@ -1389,9 +1689,13 @@ evalApplication first rest cfg env =
         )
 
 
-evalApplicationGeneralCompute : Node Expression -> List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
-evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation cfg env =
-    evalApplicationGeneral first rest oldArgs (List.length oldArgs) (List.length patterns) localEnv patterns maybeQualifiedName implementation cfg env
+evalApplicationGeneralCompute : Node Expression -> List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> Int -> PartialEval Value
+evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env =
+    -- patternsLength comes from the cached arity on PartiallyApplied.
+    -- oldArgs length is still recomputed here because it grows through
+    -- curried application; it's usually a short list and only matters on
+    -- the general (slow) path.
+    evalApplicationGeneral first rest oldArgs (List.length oldArgs) patternsLength localEnv patterns maybeQualifiedName implementation cfg env
 
 
 evalApplicationGeneral : Node Expression -> List (Node Expression) -> List Value -> Int -> Int -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
@@ -1423,7 +1727,7 @@ evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv 
             restLength =
                 List.length rest
         in
-        Types.recurseMapThen ( rest, cfg, env )
+        Types.recurseMapThenWithEval evalExpression ( rest, cfg, env )
             (\values ->
                 let
                     args : List Value
@@ -1602,15 +1906,14 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
         _ ->
             case maybeQualifiedName of
                 Just qualifiedName ->
-                    -- Check function intercepts before normal evaluation.
-                    -- This is the hook point for framework callbacks and memoization.
-                    case Dict.get (Syntax.qualifiedNameToString qualifiedName) cfg.intercepts of
-                        Just (Types.Intercept interceptFn) ->
-                            Recursion.base (interceptFn args cfg boundEnv)
+                    let
+                        qualifiedNameString =
+                            Syntax.qualifiedNameToString qualifiedName
 
-                        Nothing ->
+                        evaluateOriginal : () -> EvalResult Value
+                        evaluateOriginal () =
                             if env.callDepth < 200 then
-                                call maybeQualifiedName implementation cfg boundEnv
+                                Types.resolveRecWithStep evalExpression (call maybeQualifiedName implementation cfg boundEnv)
 
                             else
                                 let
@@ -1619,15 +1922,62 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                                 in
                                 case checkAndUpdateCycle qualifiedName args env.callDepth currentCheck of
                                     CycleDetected ->
-                                        Types.failPartial <|
-                                            typeError env
-                                                ("Infinite recursion detected: "
-                                                    ++ Syntax.qualifiedNameToString qualifiedName
-                                                    ++ " called with identical arguments"
-                                                )
+                                        Types.resolveRecWithStep evalExpression
+                                            (Types.failPartial <|
+                                                typeError env
+                                                    ("Infinite recursion detected: "
+                                                        ++ qualifiedNameString
+                                                        ++ " called with identical arguments"
+                                                    )
+                                            )
 
                                     Continue updatedCheck ->
-                                        call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = Just updatedCheck }
+                                        Types.resolveRecWithStep evalExpression
+                                            (call maybeQualifiedName implementation cfg { boundEnv | recursionCheck = Just updatedCheck })
+                    in
+                    -- Check function intercepts before normal evaluation.
+                    -- This is the hook point for framework callbacks and host-driven memoization.
+                    case Dict.get qualifiedNameString cfg.intercepts of
+                        Just (Types.Intercept interceptFn) ->
+                            Recursion.base
+                                (interceptFn
+                                    { qualifiedName = qualifiedNameString
+                                    , evaluateOriginal = evaluateOriginal
+                                    }
+                                    args
+                                    cfg
+                                    boundEnv
+                                )
+
+                        Nothing ->
+                            case MemoSpec.lookup qualifiedNameString cfg.memoizedFunctions of
+                                Just memoSpec ->
+                                    let
+                                        evaluateAndStoreMemoized : () -> EvalResult Value
+                                        evaluateAndStoreMemoized () =
+                                            evaluateOriginal ()
+                                                |> EvalResult.andThen
+                                                    (\value ->
+                                                        EvMemoStore
+                                                            (memoStorePayload cfg.collectMemoStats memoSpec qualifiedNameString args value)
+                                                            (EvOk value)
+                                                    )
+                                    in
+                                    Recursion.base
+                                        (EvMemoLookup
+                                            (memoLookupPayload cfg.collectMemoStats memoSpec qualifiedNameString args)
+                                            (\lookupResult ->
+                                                case lookupResult of
+                                                    Just cachedValue ->
+                                                        EvOk cachedValue
+
+                                                    Nothing ->
+                                                        evaluateAndStoreMemoized ()
+                                            )
+                                        )
+
+                                Nothing ->
+                                    Recursion.base (evaluateOriginal ())
 
                 Nothing ->
                     call maybeQualifiedName implementation cfg boundEnv
@@ -1673,11 +2023,11 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
 
                             else
                                 -- Not tail-recursive: clear tcoTarget
-                                Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, newEnv )
+                                Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, newEnv )
 
                         Nothing ->
                             -- No tcoTarget: skip qualifiedNameToString for tcoKey
@@ -1691,7 +2041,7 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
 
                             else
                                 -- Common case: not TCO, no tcoTarget — pass cfg as-is
@@ -1703,7 +2053,7 @@ call maybeQualifiedName implementation cfg env =
                         Recursion.recurse ( expr, cfg, env )
 
                     else
-                        Recursion.recurse ( expr, { trace = cfg.trace, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts }, env )
+                        Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, env )
 
         KernelImpl moduleName name f ->
             if cfg.trace then
@@ -1936,11 +2286,42 @@ This is tail-recursive in Elm, compiled to a while loop by the host compiler.
 -}
 tcoLoop : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
 tcoLoop funcName body remaining cfg env =
-    tcoLoopHelp funcName body remaining 0 0 (fingerprintValues env.values) cfg env
+    -- Build the per-iteration innerCfg ONCE, outside the loop. The loop
+    -- body only differs from cfg in `maxSteps = Nothing` (the TCO loop
+    -- manages its own step budget via `remaining`), and that difference
+    -- is constant across iterations. Previously this record was rebuilt
+    -- on every single iteration, allocating a fresh 7-field Config
+    -- record per interpreted step inside a tail-recursive function.
+    let
+        innerCfg : Config
+        innerCfg =
+            { trace = cfg.trace
+            , coverage = cfg.coverage
+            , coverageProbeLines = cfg.coverageProbeLines
+            , maxSteps = Nothing
+            , tcoTarget = cfg.tcoTarget
+            , callCounts = cfg.callCounts
+            , intercepts = cfg.intercepts
+            , memoizedFunctions = cfg.memoizedFunctions
+            , collectMemoStats = cfg.collectMemoStats
+            }
+    in
+    tcoLoopHelp funcName body remaining 0 0 0 0 innerCfg cfg env
 
 
-tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Config -> Env -> EvalResult Value
-tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
+{-| Only run the expensive cycle-detection fingerprinting once per
+`tcoCycleCheckInterval` iterations. Infinite recursion will still be
+caught, just `interval` steps later than it would otherwise — a tradeoff
+that's well worth it when the loop body does lots of interpreted work
+per iteration (e.g. List.foldl building up a Dict/Set).
+-}
+tcoCycleCheckInterval : Int
+tcoCycleCheckInterval =
+    16
+
+
+tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value
+tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env =
     if remaining <= 0 then
         EvErr
             { currentModule = env.currentModule
@@ -1950,93 +2331,172 @@ tcoLoopHelp funcName body remaining lastSize growCount lastFingerprint cfg env =
 
     else
         let
-            innerCfg =
-                { trace = cfg.trace, maxSteps = Nothing, tcoTarget = cfg.tcoTarget, callCounts = cfg.callCounts, intercepts = cfg.intercepts }
-
             result =
                 evalExpression body innerCfg env
         in
-        case tcoExtractTailCall result of
-            Just newValues ->
-                -- Got a TailCall signal
-                let
-                    newSize =
-                        valuesSize newValues
+        case result of
+            EvYield tag payload resume ->
+                EvYield tag payload
+                    (\resumeValue ->
+                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
+                    )
 
-                    newFingerprint =
-                        fingerprintValues newValues
+            EvMemoLookup payload resume ->
+                EvMemoLookup payload
+                    (\maybeValue ->
+                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
+                    )
 
-                    -- Category A: check if fingerprint is identical (NOT using ==
-                    -- on the values dict, which is unreliable for PartiallyApplied).
-                    identicalFingerprint =
-                        newFingerprint == lastFingerprint && newSize == lastSize
+            EvMemoStore payload next ->
+                EvMemoStore payload
+                    (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env next)
 
-                    -- "Bounded progress": at least one value has constant size
-                    -- but changing fingerprint.
-                    boundedProgress =
-                        hasBoundedProgressInValues env.values newValues
-
-                    newGrowCount =
-                        if boundedProgress then
-                            0
-
-                        else if newSize > lastSize && lastSize > 0 then
-                            growCount + 1
-
-                        else if identicalFingerprint then
-                            -- Fingerprint didn't change — count toward Category A
-                            growCount + 1
-
-                        else
-                            0
-
-                    -- Use same threshold as checkAndUpdateCycle: 500 for closures
-                    hasClosures =
-                        Dict.foldl
-                            (\_ v found ->
-                                found
-                                    || (case v of
-                                            PartiallyApplied _ _ _ _ _ _ ->
-                                                True
-
-                                            _ ->
-                                                False
-                                       )
-                            )
-                            False
-                            newValues
-
-                    threshold =
-                        if hasClosures then
-                            500
+            _ ->
+                case tcoExtractTailCall result of
+                    Just newValues ->
+                        -- Got a TailCall signal. Cheap per-iteration bookkeeping:
+                        -- increment iterationsSinceCheck. Only run full fingerprinting
+                        -- every tcoCycleCheckInterval iterations.
+                        if iterationsSinceCheck + 1 < tcoCycleCheckInterval then
+                            tcoLoopHelp funcName
+                                body
+                                (remaining - 1)
+                                (iterationsSinceCheck + 1)
+                                lastSize
+                                growCount
+                                lastFingerprint
+                                innerCfg
+                                cfg
+                                (Environment.replaceValues newValues env)
 
                         else
-                            50
-                in
-                if newGrowCount >= threshold then
-                    EvErr
-                        { currentModule = env.currentModule
-                        , callStack = env.callStack
-                        , error =
-                            TypeError
-                                ("Infinite recursion detected: "
-                                    ++ funcName
-                                    ++ (if identicalFingerprint then
-                                            " called with identical arguments"
+                            let
+                                newSize =
+                                    valuesSize newValues
 
-                                        else
-                                            " arguments growing without bound"
-                                       )
-                                )
-                        }
+                                newFingerprint =
+                                    fingerprintValues newValues
 
-                else
-                    -- Continue loop
-                    tcoLoopHelp funcName body (remaining - 1) newSize newGrowCount newFingerprint cfg (Environment.replaceValues newValues env)
+                                -- Category A: check if fingerprint is identical (NOT using ==
+                                -- on the values dict, which is unreliable for PartiallyApplied).
+                                identicalFingerprint =
+                                    newFingerprint == lastFingerprint && newSize == lastSize
 
-            Nothing ->
-                -- Not a TailCall: return the result as-is
-                result
+                                -- "Bounded progress": at least one value has constant size
+                                -- but changing fingerprint.
+                                boundedProgress =
+                                    hasBoundedProgressInValues env.values newValues
+
+                                newGrowCount =
+                                    if boundedProgress then
+                                        0
+
+                                    else if newSize > lastSize && lastSize > 0 then
+                                        growCount + 1
+
+                                    else if identicalFingerprint then
+                                        -- Fingerprint didn't change — count toward Category A
+                                        growCount + 1
+
+                                    else
+                                        0
+
+                                -- Use same threshold as checkAndUpdateCycle: 500 for closures
+                                hasClosures =
+                                    Dict.foldl
+                                        (\_ v found ->
+                                            found
+                                                || (case v of
+                                                        PartiallyApplied _ _ _ _ _ _ ->
+                                                            True
+
+                                                        _ ->
+                                                            False
+                                                   )
+                                        )
+                                        False
+                                        newValues
+
+                                threshold =
+                                    if hasClosures then
+                                        500
+
+                                    else
+                                        50
+                            in
+                            if newGrowCount >= threshold then
+                                EvErr
+                                    { currentModule = env.currentModule
+                                    , callStack = env.callStack
+                                    , error =
+                                        TypeError
+                                            ("Infinite recursion detected: "
+                                                ++ funcName
+                                                ++ (if identicalFingerprint then
+                                                        " called with identical arguments"
+
+                                                    else
+                                                        " arguments growing without bound"
+                                                   )
+                                            )
+                                    }
+
+                            else
+                                -- Continue loop, reset iterationsSinceCheck
+                                tcoLoopHelp funcName
+                                    body
+                                    (remaining - 1)
+                                    0
+                                    newSize
+                                    newGrowCount
+                                    newFingerprint
+                                    innerCfg
+                                    cfg
+                                    (Environment.replaceValues newValues env)
+
+                    Nothing ->
+                        -- Not a TailCall: return the result as-is
+                        result
+
+
+tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value -> EvalResult Value
+tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env result =
+    case result of
+        EvYield tag payload resume ->
+            EvYield tag payload
+                (\resumeValue ->
+                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
+                )
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload
+                (\maybeValue ->
+                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
+                )
+
+        EvMemoStore payload next ->
+            EvMemoStore payload
+                (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env next)
+
+        _ ->
+            case tcoExtractTailCall result of
+                Just newValues ->
+                    -- Force a full cycle check on the iteration following a
+                    -- resume from yield/memo, so suspended state still gets
+                    -- validated periodically.
+                    tcoLoopHelp funcName
+                        body
+                        (remaining - 1)
+                        tcoCycleCheckInterval
+                        lastSize
+                        growCount
+                        lastFingerprint
+                        innerCfg
+                        cfg
+                        (Environment.replaceValues newValues env)
+
+                Nothing ->
+                    result
 
 
 {-| Extract TailCall values from an EvalResult, or Nothing if not a TailCall.
@@ -2139,10 +2599,63 @@ evalFunctionOrValue moduleName name cfg env =
                             Types.succeedPartial value
 
                         Nothing ->
-                            evalQualifiedOrVariant [] name cfg env
+                            -- letFunctions and values already missed; skip the
+                            -- redundant letFunctions check inside
+                            -- evalQualifiedOrVariant and go directly to the
+                            -- currentModuleFunctions path.
+                            evalUnqualifiedAfterLocalMiss name cfg env
 
         _ ->
             evalQualifiedOrVariant moduleName name cfg env
+
+
+{-| Continuation of `evalFunctionOrValue` for the unqualified case after
+`env.letFunctions` and `env.values` have both been checked and missed.
+Skips the redundant `letFunctions` lookup that the old path did via
+`evalQualifiedOrVariant`.
+-}
+evalUnqualifiedAfterLocalMiss : String -> PartialEval Value
+evalUnqualifiedAfterLocalMiss name cfg env =
+    -- Check for a kernel fast path first. Unqualified references to top-level
+    -- module functions (e.g. `reorderExponent` inside `wellShrinkingFloat`)
+    -- otherwise skip `userModuleKernelFastPath` entirely, and any kernel
+    -- registered against the user-level module name never fires.
+    case userModuleKernelFastPath env.currentModule name cfg env of
+        Just result ->
+            result
+
+        Nothing ->
+            case Dict.get name env.currentModuleFunctions of
+                Just function ->
+                    let
+                        qualifiedNameRef : QualifiedNameRef
+                        qualifiedNameRef =
+                            { moduleName = env.currentModule, name = name }
+
+                        -- Top-level module function: zero out caller locals in the PA's
+                        -- captured env (see `Environment.callModuleFn` docs).
+                        callFn =
+                            if cfg.trace then
+                                Environment.callModuleFn
+
+                            else
+                                Environment.callModuleFnNoStack
+                    in
+                    if List.isEmpty function.arguments then
+                        call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+
+                    else
+                        PartiallyApplied
+                            (callFn env.currentModule name env)
+                            []
+                            function.arguments
+                            (Just qualifiedNameRef)
+                            (AstImpl function.expression)
+                            (List.length function.arguments)
+                            |> Types.succeedPartial
+
+                Nothing ->
+                    evalQualifiedOrVariantSlow [] name cfg env
 
 
 evalQualifiedOrVariant : ModuleName -> String -> PartialEval Value
@@ -2186,12 +2699,14 @@ evalQualifiedOrVariant moduleName name cfg env =
                                 qualifiedNameRef =
                                     { moduleName = env.currentModule, name = name }
 
+                                -- Top-level module function: trim caller locals
+                                -- out of the PA's captured env.
                                 callFn =
                                     if cfg.trace then
-                                        Environment.call
+                                        Environment.callModuleFn
 
                                     else
-                                        Environment.callNoStack
+                                        Environment.callModuleFnNoStack
                             in
                             if List.isEmpty function.arguments then
                                 call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
@@ -2222,8 +2737,11 @@ evalQualifiedOrVariantSlow moduleName name cfg env =
                     call (Just { moduleName = resolvedModule, name = name }) (AstImpl function.expression) cfg env
 
                 else
+                    -- Record alias constructor — its body is a RecordExpr that
+                    -- only references its own parameters, so it's safe to trim
+                    -- caller locals out of the PA's stored env.
                     PartiallyApplied
-                        (Environment.call resolvedModule name env)
+                        (Environment.callModuleFn resolvedModule name env)
                         []
                         function.arguments
                         (Just { moduleName = resolvedModule, name = name })
@@ -2367,7 +2885,16 @@ evalNonVariant moduleName name cfg env =
         _ ->
             -- Note: env.values lookup for moduleName=[] is already done in
             -- evalFunctionOrValue before calling this function, so skip it here.
-            let
+            --
+            -- Fast path: some user-level modules (Dict, Set, ...) have native
+            -- kernel implementations that bypass the interpreted RBTree walk.
+            -- Check kernelFunctions first before the AST lookup.
+            case userModuleKernelFastPath moduleName name cfg env of
+                Just result ->
+                    result
+
+                Nothing ->
+                    let
                         maybeFunction : Maybe ( ModuleName, String, Expression.FunctionImplementation )
                         maybeFunction =
                             if List.isEmpty moduleName then
@@ -2426,7 +2953,10 @@ evalNonVariant moduleName name cfg env =
                                     { moduleName = resolvedModule, name = name }
                             in
                             if resolvedModuleKey == env.currentModuleKey then
-                                -- Same module: keep local values, use existing caches
+                                -- Same module: trim caller locals out of the stored
+                                -- env for the same reason the cross-module branch
+                                -- below does — a top-level module function's body
+                                -- never references caller-site locals.
                                 if List.isEmpty function.arguments then
                                     call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
 
@@ -2434,10 +2964,10 @@ evalNonVariant moduleName name cfg env =
                                     let
                                         callFn =
                                             if cfg.trace then
-                                                Environment.call
+                                                Environment.callModuleFn
 
                                             else
-                                                Environment.callNoStack
+                                                Environment.callModuleFnNoStack
                                     in
                                     PartiallyApplied
                                         (callFn resolvedModule name env)
@@ -2518,7 +3048,7 @@ evalIfBlock cond true false cfg env =
 
 evalList : List (Node Expression) -> PartialEval Value
 evalList elements cfg env =
-    Types.recurseMapThen ( elements, cfg, env )
+    Types.recurseMapThenWithEval evalExpression ( elements, cfg, env )
         (\values -> Types.succeedPartial <| List values)
 
 
@@ -2530,7 +3060,7 @@ evalRecord fields cfg env =
                 |> List.map (\(Node _ ( Node _ name, expression )) -> ( name, expression ))
                 |> List.unzip
     in
-    Types.recurseMapThen ( expressions, cfg, env )
+    Types.recurseMapThenWithEval evalExpression ( expressions, cfg, env )
         (\tuples ->
             tuples
                 |> List.map2 Tuple.pair fieldNames
@@ -2552,15 +3082,11 @@ kernelFunctions =
 
 
 evalFunction : Kernel.EvalFunction
-evalFunction oldArgs patterns functionName implementation cfg localEnv =
+evalFunction oldArgs patterns patternsLength functionName implementation cfg localEnv =
     let
         oldArgsLength : Int
         oldArgsLength =
             List.length oldArgs
-
-        patternsLength : Int
-        patternsLength =
-            List.length patterns
     in
     if oldArgsLength < patternsLength then
         -- Still not enough
@@ -2614,6 +3140,88 @@ evalFunction oldArgs patterns functionName implementation cfg localEnv =
                                 evalExpression expr
                                     cfg
                                     (localEnv |> Environment.withBindings newBindings)
+
+
+{-| Check for native-kernel overrides registered against user-level modules
+like `Dict`, `Set`, etc. Returns `Nothing` if the module/name doesn't have a
+kernel override, so the caller can fall through to the normal AST lookup.
+
+Builds the result inline from the `(argCount, f)` tuple it already found,
+avoiding a second round of FastDict.get that `evalKernelFunctionWithKey`
+would otherwise perform.
+-}
+userModuleKernelFastPath : ModuleName -> String -> Config -> Env -> Maybe (PartialResult Value)
+userModuleKernelFastPath moduleName name cfg env =
+    if List.isEmpty moduleName then
+        Nothing
+
+    else
+        let
+            moduleNameKey : String
+            moduleNameKey =
+                Environment.moduleKey moduleName
+        in
+        case Dict.get moduleNameKey kernelFunctions of
+            Nothing ->
+                Nothing
+
+            Just kernelModule ->
+                case Dict.get name kernelModule of
+                    Nothing ->
+                        Nothing
+
+                    Just ( argCount, f ) ->
+                        Just (runKernelTuple moduleName name argCount f cfg env)
+
+
+{-| Run a resolved kernel function tuple directly, without doing a second
+kernelFunctions lookup. Shared between `userModuleKernelFastPath` and
+`evalKernelFunctionWithKey` for the hot `argCount > 0` wrap-as-PartiallyApplied
+case.
+-}
+runKernelTuple : ModuleName -> String -> Int -> (List Value -> Eval Value) -> Config -> Env -> PartialResult Value
+runKernelTuple moduleName name argCount f cfg env =
+    if argCount == 0 then
+        if cfg.trace then
+            let
+                kernelEvalResult : EvalResult Value
+                kernelEvalResult =
+                    f [] cfg (Environment.callKernel moduleName name env)
+
+                ( result, callTrees, logLines ) =
+                    EvalResult.toTriple kernelEvalResult
+
+                callTreeRope : Rope CallTree
+                callTreeRope =
+                    Rope.singleton
+                        (CallNode
+                            { env = env
+                            , expression = fakeNode <| FunctionOrValue moduleName name
+                            , result = result
+                            , children = callTrees
+                            }
+                        )
+            in
+            Recursion.base
+                (case result of
+                    Ok v ->
+                        EvOkTrace v callTreeRope logLines
+
+                    Err e ->
+                        EvErrTrace e callTreeRope logLines
+                )
+
+        else
+            Recursion.base (f [] cfg env)
+
+    else
+        PartiallyApplied (Environment.empty moduleName)
+            []
+            (List.repeat argCount (fakeNode AllPattern))
+            (Just { moduleName = moduleName, name = name })
+            (KernelImpl moduleName name f)
+            argCount
+            |> Types.succeedPartial
 
 
 evalKernelFunction : ModuleName -> String -> PartialEval Value
@@ -2755,7 +3363,7 @@ evalLetBlockSingle declaration body cfg env =
             Recursion.base (EvErr e)
 
         EvOkTrace ne trees logs ->
-            Types.recurseThen ( body, cfg, ne )
+            Types.recurseThenWithEval evalExpression ( body, cfg, ne )
                 (\res ->
                     Recursion.base (EvOkTrace res trees logs)
                 )
@@ -2771,25 +3379,29 @@ evalLetBlockSingle declaration body cfg env =
             Recursion.base
                 (EvYield tag
                     payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvOk ne ->
-                                evalExpression body cfg ne
-
-                            EvOkTrace ne _ _ ->
-                                evalExpression body cfg ne
-
-                            EvErr e ->
-                                EvErr e
-
-                            EvErrTrace e _ _ ->
-                                EvErr e
-
-                            EvYield t2 p2 r2 ->
-                                -- Nested yield from resume — wrap to continue with body
-                                EvYield t2 p2 (nestedLetResume r2 body cfg)
-                    )
+                    (\resumeValue -> continueLetResumeResult (resume resumeValue) body cfg)
                 )
+
+        EvMemoLookup payload resume ->
+            Recursion.base
+                (EvMemoLookup payload
+                    (nestedLetResumeMaybe resume body cfg)
+                )
+
+        EvMemoStore payload next ->
+            Recursion.base
+                (EvMemoStore payload
+                    (continueLetResumeResult next body cfg)
+                )
+
+        EvOkCoverage ne s ->
+            Types.recurseThen ( body, cfg, ne )
+                (\res ->
+                    Recursion.base (EvOkCoverage res s)
+                )
+
+        EvErrCoverage e s ->
+            Recursion.base (EvErrCoverage e s)
 
 
 {-| Handle nested yields from let-binding resume. Each yield peels off
@@ -2798,21 +3410,44 @@ one layer, then continues evaluating the body when we finally get an Env.
 nestedLetResume : (Value -> EvalResult Env) -> Node Expression -> Config -> (Value -> EvalResult Value)
 nestedLetResume innerResume body cfg =
     \resumeValue ->
-        case innerResume resumeValue of
-            EvOk ne ->
-                evalExpression body cfg ne
+        continueLetResumeResult (innerResume resumeValue) body cfg
 
-            EvOkTrace ne _ _ ->
-                evalExpression body cfg ne
 
-            EvErr e ->
-                EvErr e
+nestedLetResumeMaybe : (Maybe Value -> EvalResult Env) -> Node Expression -> Config -> (Maybe Value -> EvalResult Value)
+nestedLetResumeMaybe innerResume body cfg =
+    \maybeResumeValue ->
+        continueLetResumeResult (innerResume maybeResumeValue) body cfg
 
-            EvErrTrace e _ _ ->
-                EvErr e
 
-            EvYield t p r ->
-                EvYield t p (nestedLetResume r body cfg)
+continueLetResumeResult : EvalResult Env -> Node Expression -> Config -> EvalResult Value
+continueLetResumeResult envResult body cfg =
+    case envResult of
+        EvOk ne ->
+            evalExpression body cfg ne
+
+        EvOkTrace ne _ _ ->
+            evalExpression body cfg ne
+
+        EvErr e ->
+            EvErr e
+
+        EvErrTrace e _ _ ->
+            EvErr e
+
+        EvYield t p r ->
+            EvYield t p (nestedLetResume r body cfg)
+
+        EvMemoLookup payload resume ->
+            EvMemoLookup payload (nestedLetResumeMaybe resume body cfg)
+
+        EvMemoStore payload next ->
+            EvMemoStore payload (continueLetResumeResult next body cfg)
+
+        EvOkCoverage ne _ ->
+            evalExpression body cfg ne
+
+        EvErrCoverage e _ ->
+            EvErr e
 
 
 evalLetBlockFull : Expression.LetBlock -> PartialEval Value
@@ -2905,7 +3540,7 @@ evalLetBlockFull letBlock cfg env =
             Recursion.base (EvErr e)
 
         EvOkTrace ne trees logs ->
-            Types.recurseThen ( letBlock.expression, cfg, ne )
+            Types.recurseThenWithEval evalExpression ( letBlock.expression, cfg, ne )
                 (\res -> Recursion.base (EvOkTrace res trees logs))
 
         EvErrTrace e trees logs ->
@@ -2915,24 +3550,27 @@ evalLetBlockFull letBlock cfg env =
             Recursion.base
                 (EvYield tag
                     payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvOk ne ->
-                                evalExpression letBlock.expression cfg ne
-
-                            EvOkTrace ne _ _ ->
-                                evalExpression letBlock.expression cfg ne
-
-                            EvErr e ->
-                                EvErr e
-
-                            EvErrTrace e _ _ ->
-                                EvErr e
-
-                            EvYield t2 p2 r2 ->
-                                EvYield t2 p2 (nestedLetResume r2 letBlock.expression cfg)
-                    )
+                    (\resumeValue -> continueLetResumeResult (resume resumeValue) letBlock.expression cfg)
                 )
+
+        EvMemoLookup payload resume ->
+            Recursion.base
+                (EvMemoLookup payload
+                    (nestedLetResumeMaybe resume letBlock.expression cfg)
+                )
+
+        EvMemoStore payload next ->
+            Recursion.base
+                (EvMemoStore payload
+                    (continueLetResumeResult next letBlock.expression cfg)
+                )
+
+        EvOkCoverage ne s ->
+            Types.recurseThen ( letBlock.expression, cfg, ne )
+                (\res -> Recursion.base (EvOkCoverage res s))
+
+        EvErrCoverage e s ->
+            Recursion.base (EvErrCoverage e s)
 
 
 isLetDeclarationFunction : Node LetDeclaration -> Bool
@@ -3180,7 +3818,7 @@ evalRecordUpdate (Node range name) setters cfg env =
                                     )
                                 |> List.unzip
                     in
-                    Types.recurseMapThen ( fieldExpressions, cfg, env )
+                    Types.recurseMapThenWithEval evalExpression ( fieldExpressions, cfg, env )
                         (\fieldValues ->
                             let
                                 updates : Dict String Value

@@ -1,15 +1,18 @@
-module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), JsonDecoder(..), JsonVal(..), PartialEval, PartialResult, Value(..), evalErrorKindToString)
+module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), InterceptContext, JsonDecoder(..), JsonVal(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, Value(..), evalErrorKindToString, packRange, unpackRange)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
+import Elm.Syntax.Range exposing (Range)
 import Regex
 import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (Pattern, QualifiedNameRef)
 import FastDict exposing (Dict)
+import MemoSpec
 import Parser exposing (DeadEnd)
 import Recursion exposing (Rec)
 import Rope exposing (Rope)
+import Set
 
 
 type alias PartialEval out =
@@ -33,14 +36,22 @@ type EvalResult out
     | EvOkTrace out (Rope CallTree) (Rope String)
     | EvErrTrace EvalErrorData (Rope CallTree) (Rope String)
     | EvYield String Value (Value -> EvalResult out)
+    | EvMemoLookup MemoLookupPayload (Maybe Value -> EvalResult out)
+    | EvMemoStore MemoStorePayload (EvalResult out)
+    | EvOkCoverage out (Set.Set Int)
+    | EvErrCoverage EvalErrorData (Set.Set Int)
 
 
 type alias Config =
     { trace : Bool
+    , coverage : Bool
+    , coverageProbeLines : Set.Set Int
     , maxSteps : Maybe Int
     , tcoTarget : Maybe String
     , callCounts : Maybe CallCounts
     , intercepts : Dict String Intercept
+    , memoizedFunctions : MemoSpec.Registry
+    , collectMemoStats : Bool
     }
 
 
@@ -51,8 +62,14 @@ Receives the fully-applied arguments and the current eval context.
 Framework authors use this for callbacks (BackendTask, Test, Cmd)
 and for memoization/caching hooks.
 -}
+type alias InterceptContext =
+    { qualifiedName : String
+    , evaluateOriginal : () -> EvalResult Value
+    }
+
+
 type Intercept
-    = Intercept (List Value -> Config -> Env -> EvalResult Value)
+    = Intercept (InterceptContext -> List Value -> Config -> Env -> EvalResult Value)
 
 
 {-| Lightweight call counting for profiling. Tracks how many times each
@@ -71,6 +88,8 @@ type CallTree
         , children : Rope CallTree
         , env : Env
         }
+    | CoverageRange Range
+    | CoverageSet (Set.Set Int)
 
 
 type Error
@@ -96,6 +115,27 @@ type Value
     | JsonDecoderValue JsonDecoder
     | RegexValue Regex.Regex
     | BytesValue (Array Int)
+
+
+type alias MemoLookupPayload =
+    { specId : Int
+    , qualifiedName : Maybe String
+    , compactFingerprint : Maybe Int
+    , args : Maybe (List Value)
+    , shallowFingerprint : Maybe Int
+    , deepFingerprint : Maybe Int
+    }
+
+
+type alias MemoStorePayload =
+    { specId : Int
+    , qualifiedName : Maybe String
+    , compactFingerprint : Maybe Int
+    , args : Maybe (List Value)
+    , shallowFingerprint : Maybe Int
+    , deepFingerprint : Maybe Int
+    , value : Value
+    }
 
 
 {-| JSON value representation for Json.Encode.Value / Json.Decode.Value.
@@ -202,4 +242,55 @@ evalErrorKindToString kind =
 
         TailCall _ ->
             "TailCall (internal TCO signal)"
+
+
+{-| Pack a Range into a single Int for use in Set Int.
+Uses arithmetic (not bitwise, which is 32-bit in Elm/JS).
+Supports rows 0-9999 and columns 0-999 (offset by 2 for negatives).
+Max packed value: ~1.006 × 10^14, well within JS safe integer range.
+-}
+packRange : Range -> Int
+packRange r =
+    let
+        sr =
+            r.start.row + 2
+
+        sc =
+            r.start.column + 2
+
+        er =
+            r.end.row + 2
+
+        ec =
+            r.end.column + 2
+    in
+    sr * 10063102027 + sc * 10033009 + er * 1003 + ec
+
+
+{-| Unpack a packed Int back into a Range.
+-}
+unpackRange : Int -> Range
+unpackRange packed =
+    let
+        sr =
+            packed // 10063102027
+
+        rem1 =
+            packed - sr * 10063102027
+
+        sc =
+            rem1 // 10033009
+
+        rem2 =
+            rem1 - sc * 10033009
+
+        er =
+            rem2 // 1003
+
+        ec =
+            rem2 - er * 1003
+    in
+    { start = { row = sr - 2, column = sc - 2 }
+    , end = { row = er - 2, column = ec - 2 }
+    }
 

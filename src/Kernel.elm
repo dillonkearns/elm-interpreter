@@ -17,6 +17,7 @@ import Core.Elm.Kernel.Parser
 import Core.Regex
 import Core.Dict
 import Core.List
+import Core.Set
 import Core.String
 import Elm.Syntax.Expression as Expression exposing (Expression(..), FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -34,6 +35,7 @@ import Kernel.Json
 import Kernel.List
 import Kernel.Parser
 import Kernel.Regex
+import Kernel.Set
 import Kernel.String
 import Kernel.Utils
 import Maybe.Extra
@@ -45,6 +47,7 @@ import Value exposing (typeError)
 type alias EvalFunction =
     List Value
     -> List (Node Pattern)
+    -> Int
     -> Maybe QualifiedNameRef
     -> Implementation
     -> Eval Value
@@ -126,6 +129,38 @@ functions evalFunction =
         ]
       )
 
+    -- Native Dict.* fast paths. These short-circuit the interpreted RBTree
+    -- walk for the hottest user-level Dict operations.
+    , ( [ "Dict" ]
+      , [ ( "empty", constant anything Kernel.Dict.emptyValue )
+        , ( "isEmpty", oneWithError anything to anything Kernel.Dict.isEmpty Core.Dict.isEmpty )
+        , ( "size", oneWithError anything to anything Kernel.Dict.size Core.Dict.size )
+        , ( "get", twoWithError anything anything to anything Kernel.Dict.get Core.Dict.get )
+        , ( "member", twoWithError anything anything to anything Kernel.Dict.member Core.Dict.member )
+        , ( "insert", threeWithError anything anything anything to anything Kernel.Dict.insert Core.Dict.insert )
+        , ( "remove", twoWithError anything anything to anything Kernel.Dict.remove Core.Dict.remove )
+        , ( "union", twoWithError anything anything to anything Kernel.Dict.union Core.Dict.union )
+        , ( "fromList", oneWithError anything to anything Kernel.Dict.fromList Core.Dict.fromList )
+        , ( "toList", oneWithError anything to anything Kernel.Dict.toList Core.Dict.toList )
+        ]
+      )
+
+    -- Native Set.* fast paths. Same idea as Dict: unwrap the
+    -- Set_elm_builtin wrapper and delegate to the host-native Dict
+    -- kernel, avoiding the interpreted pattern-match step chain.
+    , ( [ "Set" ]
+      , [ ( "empty", constant anything Kernel.Set.emptyValue )
+        , ( "isEmpty", oneWithError anything to anything Kernel.Set.isEmpty Core.Set.isEmpty )
+        , ( "size", oneWithError anything to anything Kernel.Set.size Core.Set.size )
+        , ( "member", twoWithError anything anything to anything Kernel.Set.member Core.Set.member )
+        , ( "insert", twoWithError anything anything to anything Kernel.Set.insert Core.Set.insert )
+        , ( "remove", twoWithError anything anything to anything Kernel.Set.remove Core.Set.remove )
+        , ( "union", twoWithError anything anything to anything Kernel.Set.union Core.Set.union )
+        , ( "fromList", oneWithError anything to anything Kernel.Set.fromList Core.Set.fromList )
+        , ( "toList", oneWithError anything to anything Kernel.Set.toList Core.Set.toList )
+        ]
+      )
+
     -- Elm.Kernel.JsArray
     , ( [ "Elm", "Kernel", "JsArray" ]
       , [ ( "appendN", three int (jsArray anything) (jsArray anything) to (jsArray anything) Kernel.JsArray.appendN Core.Elm.JsArray.appendN )
@@ -163,6 +198,57 @@ functions evalFunction =
         , ( "indexedMap", twoWithError (function2 evalFunction anything anything to anything) anyList to anyList Kernel.List.indexedMap Core.List.indexedMap )
         , ( "any", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.any Core.List.any )
         , ( "all", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.all Core.List.all )
+        ]
+      )
+
+    -- Native List.* thin-wrapper short circuits. The Elm stdlib's
+    -- `List.foldl func acc list = Elm.Kernel.List.foldl func acc list`
+    -- et al. bounce through an extra interpreted wrapper on every
+    -- call. Register the kernel implementations directly against
+    -- the user-level `["List"]` module so `userModuleKernelFastPath`
+    -- catches them and skips the wrapper.
+    --
+    -- Note: the higher-order entries rely on `Kernel/List.elm`
+    -- foldlHelp/mapHelp propagating EvYield/EvMemo* results instead
+    -- of collapsing them through `EvalResult.toResult`, otherwise
+    -- intercept-driven yields (from e.g. elm-review's Review.Rule
+    -- cache markers) silently turn into `"Unhandled EvYield"` errors
+    -- and rules quietly report zero findings.
+    -- Native List.* thin-wrapper short circuits. The Elm stdlib's
+    -- `List.foldl func acc list = Elm.Kernel.List.foldl func acc list`
+    -- et al. bounce through an extra interpreted wrapper on every
+    -- call; registering kernel implementations directly against the
+    -- user-level `["List"]` module lets `userModuleKernelFastPath`
+    -- catch them and skip the wrapper.
+    --
+    -- `List.map` is intentionally excluded. With `map` in the
+    -- shortcut, `elm-review`'s `Review.Rule` visitor machinery
+    -- silently reports zero errors on real rules. Binary-search
+    -- narrowed the bug to specifically `List.map` routed through
+    -- this fast path — every other higher-order List helper in the
+    -- set (`foldl`, `foldr`, `filter`, `filterMap`, `concatMap`,
+    -- `indexedMap`, `any`, `all`, `sortBy`, `sortWith`) produces
+    -- correct results. Both the yield-aware and the
+    -- `EvalResult.toResult`-based `mapHelp` implementations fail the
+    -- same way, so the issue isn't in `Kernel.List.map` itself — it
+    -- has to be in how the resulting `PartiallyApplied (KernelImpl)`
+    -- value flows into `Review.Rule`'s rule-construction machinery.
+    -- Root cause still unknown, but the other shortcuts are a clean
+    -- win and the `map` exclusion limits the hit to one function.
+    , ( [ "List" ]
+      , [ ( "range", two int int to anyList Kernel.List.range Core.List.range )
+        , ( "append", two anyList anyList to anyList Kernel.List.append Core.List.append )
+        , ( "map", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.map Core.List.map )
+        , ( "foldl", threeWithError (function2 evalFunction anything anything to anything) anything anyList to anything Kernel.List.foldl Core.List.foldl )
+        , ( "foldr", threeWithError (function2 evalFunction anything anything to anything) anything anyList to anything Kernel.List.foldr Core.List.foldr )
+        , ( "filter", twoWithError (function evalFunction anything to bool) anyList to anyList Kernel.List.filter Core.List.filter )
+        , ( "filterMap", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.filterMap Core.List.filterMap )
+        , ( "concatMap", twoWithError (function evalFunction anything to anyList) anyList to anyList Kernel.List.concatMap Core.List.concatMap )
+        , ( "indexedMap", twoWithError (function2 evalFunction anything anything to anything) anyList to anyList Kernel.List.indexedMap Core.List.indexedMap )
+        , ( "any", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.any Core.List.any )
+        , ( "all", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.all Core.List.all )
+        , ( "sortBy", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.sortBy Core.List.sortBy )
+        , ( "sortWith", twoWithError (function2 evalFunction anything anything to order) anyList to anyList Kernel.List.sortWith Core.List.sortWith )
         ]
       )
 
@@ -308,6 +394,32 @@ functions evalFunction =
         , ( "findSubString", parserFindSubString )
         ]
       )
+
+    -- Native Random.next / Random.peel / Random.int / Random.float fast paths.
+    -- elm/random is a tight bit-math module but each primitive goes through
+    -- the AST evaluator per call, which dominates fuzz-test throughput.
+    -- Random.int and Random.float construct a Generator wrapping a native
+    -- KernelImpl closure — when Random.step (still in user source) unwraps
+    -- and applies it, the kernel runs host-Elm bit math directly with lo/hi
+    -- captured as oldArgs on the PartiallyApplied.
+    , ( [ "Random" ]
+      , [ ( "next", randomNextKernel )
+        , ( "peel", randomPeelKernel )
+        , ( "int", randomIntKernel )
+        , ( "float", randomFloatKernel )
+        ]
+      )
+
+    -- Native Fuzz.Float.reorderExponent. The user-source version builds a
+    -- 2048-element sorted Array every call (because top-level constants are
+    -- re-evaluated on every reference in the interpreter). At ~1.4s per build
+    -- that turns Fuzz.niceFloat into a ~1.3s-per-value operation. The kernel
+    -- uses a true host-Elm module-level constant, so the sort runs once at
+    -- load time and every call is just `Array.get`.
+    , ( [ "Fuzz", "Float" ]
+      , [ ( "reorderExponent", fuzzFloatReorderExponentKernel )
+        ]
+      )
     ]
         |> List.map
             (\( moduleName, moduleFunctions ) ->
@@ -332,6 +444,427 @@ log =
                 , fakeNode <| FunctionOrValue [] "$x"
                 ]
     }
+
+
+{-| Native Random.next. Unwraps a Random.Seed Int Int custom value,
+runs the PCG transition, and rewraps. Matches elm/random's source exactly:
+
+    next (Seed state0 incr) =
+        Seed (Bitwise.shiftRightZfBy 0 ((state0 * 1664525) + incr)) incr
+
+-}
+randomNextKernel : ModuleName -> ( Int, List Value -> Eval Value )
+randomNextKernel _ =
+    ( 1
+    , \args _ env ->
+        case args of
+            [ seedValue ] ->
+                case seedValue of
+                    Custom ref [ Int state0, Int incr ] ->
+                        if ref.moduleName == [ "Random" ] && ref.name == "Seed" then
+                            EvalResult.succeed
+                                (Custom ref
+                                    [ Int (Bitwise.shiftRightZfBy 0 ((state0 * 1664525) + incr))
+                                    , Int incr
+                                    ]
+                                )
+
+                        else
+                            EvalResult.fail <|
+                                typeError env <|
+                                    "Random.next (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+                    _ ->
+                        EvalResult.fail <|
+                            typeError env <|
+                                "Random.next (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Random.next (kernel): expected exactly one arg"
+    )
+
+
+{-| Precomputed exponent mapping for Fuzz.Float.reorderExponent.
+
+The user-source `exponentMapping` in elm-explorations/test is a top-level
+`Array Int` produced by sorting `List.range 0 2047` by `exponentKey`. Because
+the interpreter re-evaluates every reference to a top-level constant, each
+call into `Fuzz.niceFloat` was rebuilding this 2048-element sorted array —
+roughly 1.4 seconds of interpreted work per value.
+
+Defining it here makes it a real host-Elm module-level constant: computed
+once at Kernel module load time, then looked up in O(log n) via `Array.get`.
+-}
+fuzzFloatExponentMapping : Array Int
+fuzzFloatExponentMapping =
+    List.range 0 fuzzFloatMaxExponent
+        |> List.sortBy fuzzFloatExponentKey
+        |> Array.fromList
+
+
+fuzzFloatMaxExponent : Int
+fuzzFloatMaxExponent =
+    0x07FF
+
+
+{-| Matches Fuzz.Float.exponentKey exactly.
+-}
+fuzzFloatExponentKey : Int -> Int
+fuzzFloatExponentKey e =
+    if e == fuzzFloatMaxExponent then
+        round (1 / 0)
+
+    else
+        let
+            unbiased : Int
+            unbiased =
+                e - 1023
+        in
+        if unbiased < 0 then
+            10000 - unbiased
+
+        else
+            unbiased
+
+
+fuzzFloatReorderExponentKernel : ModuleName -> ( Int, List Value -> Eval Value )
+fuzzFloatReorderExponentKernel _ =
+    ( 1
+    , \args _ env ->
+        case args of
+            [ Int e ] ->
+                case Array.get e fuzzFloatExponentMapping of
+                    Just v ->
+                        EvalResult.succeed (Int v)
+
+                    Nothing ->
+                        EvalResult.succeed (Int 0)
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Fuzz.Float.reorderExponent (kernel): expected one Int"
+    )
+
+
+{-| Native Random.peel. Matches elm/random's source exactly:
+
+    peel (Seed state _) =
+        let
+            word =
+                (Bitwise.xor state (Bitwise.shiftRightZfBy ((Bitwise.shiftRightZfBy 28 state) + 4) state)) * 277803737
+        in
+            Bitwise.shiftRightZfBy 0 (Bitwise.xor (Bitwise.shiftRightZfBy 22 word) word)
+
+-}
+randomPeelKernel : ModuleName -> ( Int, List Value -> Eval Value )
+randomPeelKernel _ =
+    ( 1
+    , \args _ env ->
+        case args of
+            [ seedValue ] ->
+                case seedValue of
+                    Custom ref [ Int state, _ ] ->
+                        if ref.moduleName == [ "Random" ] && ref.name == "Seed" then
+                            EvalResult.succeed (Int (peelStateRaw state))
+
+                        else
+                            EvalResult.fail <|
+                                typeError env <|
+                                    "Random.peel (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+                    _ ->
+                        EvalResult.fail <|
+                            typeError env <|
+                                "Random.peel (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Random.peel (kernel): expected exactly one arg"
+    )
+
+
+{-| Host-Elm peel: extracts a pseudo-random Int from the state. Shared by
+`randomPeelKernel`, `randomIntStepKernel`, and `randomFloatStepKernel`.
+-}
+peelStateRaw : Int -> Int
+peelStateRaw state =
+    let
+        shiftAmount : Int
+        shiftAmount =
+            Bitwise.shiftRightZfBy 28 state + 4
+
+        word : Int
+        word =
+            Bitwise.xor state (Bitwise.shiftRightZfBy shiftAmount state) * 277803737
+    in
+    Bitwise.shiftRightZfBy 0 (Bitwise.xor (Bitwise.shiftRightZfBy 22 word) word)
+
+
+{-| Host-Elm next: advances the PCG state.
+-}
+nextStateRaw : Int -> Int -> Int
+nextStateRaw state0 incr =
+    Bitwise.shiftRightZfBy 0 ((state0 * 1664525) + incr)
+
+
+seedRef : QualifiedNameRef
+seedRef =
+    { moduleName = [ "Random" ], name = "Seed" }
+
+
+generatorRef : QualifiedNameRef
+generatorRef =
+    { moduleName = [ "Random" ], name = "Generator" }
+
+
+{-| Native Random.int a b.
+
+Returns `Generator (lo, hi, seed -> (Int, Seed))` — wraps a `PartiallyApplied`
+whose body is `KernelImpl "Random" "intStep" intStepKernel`. The lo/hi are
+stored as `oldArgs` so when `Random.step` (pure Elm source) unwraps the
+Generator and applies the closure to the seed, the interpreter concatenates
+oldArgs ++ [seed] and hands all three to `intStepKernel` in one shot.
+-}
+randomIntKernel : ModuleName -> ( Int, List Value -> Eval Value )
+randomIntKernel _ =
+    ( 2
+    , \args _ env ->
+        case args of
+            [ Int a, Int b ] ->
+                EvalResult.succeed (makeNativeGenerator (Int a) (Int b) intStepKernelImpl)
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Random.int (kernel): expected two Ints"
+    )
+
+
+randomFloatKernel : ModuleName -> ( Int, List Value -> Eval Value )
+randomFloatKernel _ =
+    ( 2
+    , \args _ env ->
+        case args of
+            [ firstArg, secondArg ] ->
+                let
+                    a : Maybe Float
+                    a =
+                        case firstArg of
+                            Float f ->
+                                Just f
+
+                            Int i ->
+                                Just (toFloat i)
+
+                            _ ->
+                                Nothing
+
+                    b : Maybe Float
+                    b =
+                        case secondArg of
+                            Float f ->
+                                Just f
+
+                            Int i ->
+                                Just (toFloat i)
+
+                            _ ->
+                                Nothing
+                in
+                case ( a, b ) of
+                    ( Just fa, Just fb ) ->
+                        EvalResult.succeed (makeNativeGenerator (Float fa) (Float fb) floatStepKernelImpl)
+
+                    _ ->
+                        EvalResult.fail <|
+                            typeError env "Random.float (kernel): expected two Floats"
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Random.float (kernel): expected two Floats"
+    )
+
+
+{-| Wrap (a, b, seed -> result) as a Generator Custom containing a
+PartiallyApplied with KernelImpl.
+-}
+makeNativeGenerator : Value -> Value -> (List Value -> Eval Value) -> Value
+makeNativeGenerator a b stepKernelFn =
+    Custom generatorRef
+        [ PartiallyApplied
+            (Environment.empty [ "Random" ])
+            [ a, b ]
+            [ fakeNode (VarPattern "$a"), fakeNode (VarPattern "$b"), fakeNode (VarPattern "$seed") ]
+            (Just { moduleName = [ "Random" ], name = "nativeGenerator" })
+            (KernelImpl [ "Random" ] "nativeGeneratorStep" stepKernelFn)
+            3
+        ]
+
+
+{-| Native Random.int's step. Given [lo, hi, seed] returns `(Int, Seed)`.
+Implements exactly what elm/random's `int` closure body does.
+-}
+intStepKernelImpl : List Value -> Eval Value
+intStepKernelImpl args _ env =
+    case args of
+        [ Int ra, Int rb, seedValue ] ->
+            case seedValue of
+                Custom _ [ Int state0, Int incr ] ->
+                    let
+                        ( lo, hi ) =
+                            if ra < rb then
+                                ( ra, rb )
+
+                            else
+                                ( rb, ra )
+
+                        range : Int
+                        range =
+                            hi - lo + 1
+
+                        nextSeed : Value
+                        nextSeed =
+                            Custom seedRef [ Int (nextStateRaw state0 incr), Int incr ]
+                    in
+                    if Bitwise.and (range - 1) range == 0 then
+                        -- Power-of-2 fast path
+                        EvalResult.succeed
+                            (Tuple
+                                (Int (Bitwise.shiftRightZfBy 0 (Bitwise.and (range - 1) (peelStateRaw state0)) + lo))
+                                nextSeed
+                            )
+
+                    else
+                        -- Rejection sampling path
+                        let
+                            threshhold : Int
+                            threshhold =
+                                Bitwise.shiftRightZfBy 0 (remainderBy range (Bitwise.shiftRightZfBy 0 -range))
+
+                            ( value, finalState, finalIncr ) =
+                                accountForBiasLoop threshhold range lo state0 incr
+                        in
+                        EvalResult.succeed
+                            (Tuple
+                                (Int value)
+                                (Custom seedRef [ Int finalState, Int finalIncr ])
+                            )
+
+                _ ->
+                    EvalResult.fail <|
+                        typeError env <|
+                            "Random.int step (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+
+        _ ->
+            EvalResult.fail <|
+                typeError env "Random.int step (kernel): wrong argument count"
+
+
+{-| Rejection sampling loop for the non-power-of-2 case. Recurses in host Elm
+instead of the interpreter trampoline.
+-}
+accountForBiasLoop : Int -> Int -> Int -> Int -> Int -> ( Int, Int, Int )
+accountForBiasLoop threshhold range lo state incr =
+    let
+        x : Int
+        x =
+            peelStateRaw state
+
+        newState : Int
+        newState =
+            nextStateRaw state incr
+    in
+    if x < threshhold then
+        accountForBiasLoop threshhold range lo newState incr
+
+    else
+        ( remainderBy range x + lo, newState, incr )
+
+
+{-| Native Random.float's step. Given [lo, hi, seed] returns `(Float, Seed)`.
+Implements exactly what elm/random's `float` closure body does.
+-}
+floatStepKernelImpl : List Value -> Eval Value
+floatStepKernelImpl args _ env =
+    case args of
+        [ firstBound, secondBound, seedValue ] ->
+            let
+                a : Maybe Float
+                a =
+                    case firstBound of
+                        Float f ->
+                            Just f
+
+                        Int i ->
+                            Just (toFloat i)
+
+                        _ ->
+                            Nothing
+
+                b : Maybe Float
+                b =
+                    case secondBound of
+                        Float f ->
+                            Just f
+
+                        Int i ->
+                            Just (toFloat i)
+
+                        _ ->
+                            Nothing
+            in
+            case ( a, b, seedValue ) of
+                ( Just fa, Just fb, Custom _ [ Int state0, Int incr ] ) ->
+                    let
+                        state1 : Int
+                        state1 =
+                            nextStateRaw state0 incr
+
+                        n0 : Int
+                        n0 =
+                            peelStateRaw state0
+
+                        n1 : Int
+                        n1 =
+                            peelStateRaw state1
+
+                        hi : Float
+                        hi =
+                            toFloat (Bitwise.and 0x03FFFFFF n0) * 1.0
+
+                        loF : Float
+                        loF =
+                            toFloat (Bitwise.and 0x07FFFFFF n1) * 1.0
+
+                        val : Float
+                        val =
+                            (hi * 134217728.0 + loF) / 9007199254740992.0
+
+                        range : Float
+                        range =
+                            abs (fb - fa)
+
+                        scaled : Float
+                        scaled =
+                            val * range + fa
+
+                        finalState : Int
+                        finalState =
+                            nextStateRaw state1 incr
+                    in
+                    EvalResult.succeed
+                        (Tuple
+                            (Float scaled)
+                            (Custom seedRef [ Int finalState, Int incr ])
+                        )
+
+                _ ->
+                    EvalResult.fail <|
+                        typeError env "Random.float step (kernel): expected (Float, Float, Seed)"
+
+        _ ->
+            EvalResult.fail <|
+                typeError env "Random.float step (kernel): wrong argument count"
 
 
 
@@ -567,6 +1100,39 @@ jsArray selector =
     }
 
 
+{-| Selector that extracts a "callable" from any function-typed `Value`
+the interpreter can produce.
+
+**IMPORTANT for anyone adding kernel wrappers or new selectors:** there
+are *two* Value representations a user can legitimately pass as a
+function, and this selector (and anything analogous) MUST handle both:
+
+1.  `PartiallyApplied` — anonymous lambdas, top-level functions, let
+    bindings, any closure produced by `evalFunction` /
+    `mkPartiallyApplied`.
+
+2.  `Custom ref customArgs` — a partially-applied *type constructor*
+    (`Node Range.emptyRange`, `Just`, `Tuple.pair 1`, etc.). These show
+    up whenever user code passes a constructor as a higher-order
+    argument, e.g.
+    `xs |> List.map (Node Range.emptyRange)`. The interpreter stores
+    this the same way a fully-applied constructor is stored — as
+    `Custom ref [Range.emptyRange]` — because `evalApplication` treats
+    Custom application as "just append the new arg to the args list"
+    (see `evalApplication`'s `Custom name customArgs ->` branch in
+    `Eval/Expression.elm`).
+
+Missing the `Custom` branch was the root cause of the `List.map`
+shortcut correctness bug fixed in round 7 — `Review.ModuleNameLookupTable.Compute`
+calls `List.map (Node Range.emptyRange) …`, which silently failed with
+a type error ("Expected first argument to be anything -> anything, got
+Node {…}") before the error was swallowed by
+`runProjectRulesFresh`'s error-to-string path.
+
+When in doubt, cross-reference this selector with
+`Kernel.Json.applyFunction`, which is the other place in the codebase
+that goes "Value → callable" and has always handled both branches.
+-}
 function :
     EvalFunction
     -> OutSelector from xf
@@ -578,10 +1144,10 @@ function evalFunctionWith inSelector _ outSelector =
         fromValue : Value -> Maybe (from -> Eval to)
         fromValue value =
             case value of
-                PartiallyApplied localEnv oldArgs patterns maybeName implementation _ ->
+                PartiallyApplied localEnv oldArgs patterns maybeName implementation cachedArity ->
                     Just
                         (\arg cfg _ ->
-                            evalFunctionWith (oldArgs ++ [ inSelector.toValue arg ]) patterns maybeName implementation cfg localEnv
+                            evalFunctionWith (oldArgs ++ [ inSelector.toValue arg ]) patterns cachedArity maybeName implementation cfg localEnv
                                 |> EvalResult.onValue
                                     (\out ->
                                         case outSelector.fromValue out of
@@ -596,6 +1162,33 @@ function evalFunctionWith inSelector _ outSelector =
                                                             ++ " to "
                                                             ++ outSelector.name
                                     )
+                        )
+
+                Custom ref customArgs ->
+                    -- Constructor partial application: `Node Range.emptyRange`
+                    -- is stored as `Custom { ..., name = "Node" } [Range.emptyRange]`.
+                    -- When used as a higher-order function (e.g. `List.map (Node
+                    -- Range.emptyRange) xs`), applying it to one more argument
+                    -- must produce `Custom ref (customArgs ++ [arg])` — the same
+                    -- behavior `evalApplication`'s Custom branch implements.
+                    Just
+                        (\arg _ env ->
+                            let
+                                newValue : Value
+                                newValue =
+                                    Custom ref (customArgs ++ [ inSelector.toValue arg ])
+                            in
+                            case outSelector.fromValue newValue of
+                                Just ov ->
+                                    EvalResult.succeed ov
+
+                                Nothing ->
+                                    EvalResult.fail <|
+                                        typeError env <|
+                                            "Could not convert constructor output "
+                                                ++ Value.toString newValue
+                                                ++ " to "
+                                                ++ outSelector.name
                         )
 
                 _ ->
@@ -858,6 +1451,7 @@ threeWithError firstSelector secondSelector thirdSelector _ output f implementat
     )
 
 
+
 partiallyApply : ModuleName -> List Value -> FunctionImplementation -> EvalResult Value
 partiallyApply moduleName args implementation =
     EvalResult.fromResult <|
@@ -991,11 +1585,11 @@ regexReplaceAtMost evalFn _ =
         case args of
             [ Int n, regexVal, replacerVal, String str ] ->
                 case replacerVal of
-                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
+                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation cachedArity ->
                         let
                             applyReplacer : Value -> Eval Value
                             applyReplacer matchVal c _ =
-                                evalFn (oldArgs ++ [ matchVal ]) patterns maybeName implementation c closureEnv
+                                evalFn (oldArgs ++ [ matchVal ]) patterns cachedArity maybeName implementation c closureEnv
                         in
                         Kernel.Regex.replaceAtMost n regexVal applyReplacer str cfg env
                             |> EvalResult.map String
@@ -1157,16 +1751,16 @@ bytesDecodeKernel evalFn _ =
         case args of
             [ decoderFn, bsArg ] ->
                 case decoderFn of
-                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
+                    PartiallyApplied closureEnv oldArgs patterns maybeName implementation cachedArity ->
                         let
                             applyDecoder : Value -> Eval (Value -> Eval Value)
                             applyDecoder arg c _ =
-                                evalFn (oldArgs ++ [ arg ]) patterns maybeName implementation c closureEnv
+                                evalFn (oldArgs ++ [ arg ]) patterns cachedArity maybeName implementation c closureEnv
                                     |> EvalResult.onValue
                                         (\result ->
                                             case result of
-                                                PartiallyApplied cEnv oArgs pats mName impl _ ->
-                                                    Ok (\arg2 c2 _ -> evalFn (oArgs ++ [ arg2 ]) pats mName impl c2 cEnv)
+                                                PartiallyApplied cEnv oArgs pats mName impl innerArity ->
+                                                    Ok (\arg2 c2 _ -> evalFn (oArgs ++ [ arg2 ]) pats innerArity mName impl c2 cEnv)
 
                                                 _ ->
                                                     Err (typeError env "Bytes.decode: decoder did not return a function")
@@ -1285,8 +1879,8 @@ writeStub4 _ _ =
 applyPredicate : EvalFunction -> Value -> Value -> Types.Config -> Types.Env -> Types.EvalResult Bool
 applyPredicate evalFn predicate charArg cfg env =
     case predicate of
-        PartiallyApplied closureEnv oldArgs patterns maybeName implementation _ ->
-            evalFn (oldArgs ++ [ charArg ]) patterns maybeName implementation cfg closureEnv
+        PartiallyApplied closureEnv oldArgs patterns maybeName implementation cachedArity ->
+            evalFn (oldArgs ++ [ charArg ]) patterns cachedArity maybeName implementation cfg closureEnv
                 |> EvalResult.onValue
                     (\result ->
                         case result of

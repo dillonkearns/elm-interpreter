@@ -1,15 +1,16 @@
-module Eval.Module exposing (ProjectEnv, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsRaw, extendWithFiles, fileModuleName, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
+import Bitwise
 import Core
 import Dict as ElmDict
 import Elm.Interface exposing (Exposed)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
-import Elm.Syntax.Expression exposing (Expression(..))
+import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation)
 import Elm.Syntax.Import
 import Elm.Syntax.Pattern
-import Elm.Syntax.Range
+import Elm.Syntax.Range exposing (Range)
 import Elm.Syntax.Type
 import Elm.Syntax.TypeAlias exposing (TypeAlias)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
@@ -21,8 +22,11 @@ import Environment
 import Eval.Expression
 import FastDict as Dict
 import List.Extra
+import MemoRuntime
+import MemoSpec
 import Result.MyExtra
 import Rope exposing (Rope)
+import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import EvalResult
 import Types exposing (CallTree, Env, Error(..), EvalResult(..), ImportedNames, Value)
@@ -43,14 +47,14 @@ eval : String -> Expression -> Result Error Value
 eval source expression =
     let
         ( result, _, _ ) =
-            traceOrEvalModule { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty } source expression
+            traceOrEvalModule { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False } source expression
     in
     result
 
 
 trace : String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 trace source expression =
-    traceOrEvalModule { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty } source expression
+    traceOrEvalModule { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False } source expression
 
 
 traceOrEvalModule : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
@@ -121,6 +125,14 @@ type ProjectEnv
         }
 
 
+type alias CachedModuleSummary =
+    { moduleName : ModuleName
+    , interface : List Exposed
+    , importedNames : ImportedNames
+    , functions : List FunctionImplementation
+    }
+
+
 {-| Parse all sources and build an environment from them.
 This is the expensive phase (parse + fold through buildModuleEnv).
 The result can be reused across multiple `evalWithEnv` calls.
@@ -129,6 +141,29 @@ buildProjectEnv : List String -> Result Error ProjectEnv
 buildProjectEnv sources =
     parseProjectSources sources
         |> Result.andThen buildProjectEnvFromParsed
+
+
+buildCachedModuleSummariesFromParsed :
+    List
+        { file : File
+        , moduleName : ModuleName
+        , interface : List Exposed
+        }
+    -> List CachedModuleSummary
+buildCachedModuleSummariesFromParsed parsedModules =
+    let
+        userInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        userInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces : ElmDict.Dict ModuleName (List Exposed)
+        allInterfaces =
+            ElmDict.union userInterfaces Core.dependency.interfaces
+    in
+    parsedModules
+        |> List.map (cachedSummaryFromParsedModule allInterfaces)
 
 
 {-| Phase 1: Parse all source strings into files with module names and interfaces.
@@ -177,10 +212,15 @@ buildProjectEnvFromParsed :
         }
     -> Result Error ProjectEnv
 buildProjectEnvFromParsed parsedModules =
+    buildProjectEnvFromSummaries (buildCachedModuleSummariesFromParsed parsedModules)
+
+
+buildProjectEnvFromSummaries : List CachedModuleSummary -> Result Error ProjectEnv
+buildProjectEnvFromSummaries summaries =
     let
         userInterfaces : ElmDict.Dict ModuleName (List Exposed)
         userInterfaces =
-            parsedModules
+            summaries
                 |> List.map (\m -> ( m.moduleName, m.interface ))
                 |> ElmDict.fromList
 
@@ -188,35 +228,52 @@ buildProjectEnvFromParsed parsedModules =
         allInterfaces =
             ElmDict.union userInterfaces Core.dependency.interfaces
 
-        envResult : Result Error Env
-        envResult =
-            parsedModules
-                |> Result.MyExtra.combineFoldl
-                    (\parsedModule envAcc ->
-                        buildModuleEnv allInterfaces parsedModule envAcc
+        sharedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        sharedFunctions =
+            summaries
+                |> List.foldl
+                    (\summary acc ->
+                        Dict.insert
+                            (Environment.moduleKey summary.moduleName)
+                            (summary.functions
+                                |> List.map (\implementation -> ( Node.value implementation.name, implementation ))
+                                |> Dict.fromList
+                            )
+                            acc
                     )
-                    (Ok
-                        { currentModule = []
-                        , currentModuleKey = ""
-                        , callStack = []
-                        , shared = { functions = coreFunctions, moduleImports = Dict.empty }
-                        , currentModuleFunctions = Dict.empty
-                        , letFunctions = Dict.empty
-                        , values = Dict.empty
-                        , imports = emptyImports
-                        , callDepth = 0
-                        , recursionCheck = Nothing
-                        }
+                    coreFunctions
+
+        sharedModuleImports : Dict.Dict String ImportedNames
+        sharedModuleImports =
+            summaries
+                |> List.map
+                    (\summary ->
+                        ( Environment.moduleKey summary.moduleName
+                        , summary.importedNames
+                        )
                     )
+                |> Dict.fromList
+
+        env : Env
+        env =
+            { currentModule = []
+            , currentModuleKey = ""
+            , callStack = []
+            , shared = { functions = sharedFunctions, moduleImports = sharedModuleImports }
+            , currentModuleFunctions = Dict.empty
+            , letFunctions = Dict.empty
+            , values = Dict.empty
+            , imports = emptyImports
+            , callDepth = 0
+            , recursionCheck = Nothing
+            }
     in
-    envResult
-        |> Result.map
-            (\env ->
-                ProjectEnv
-                    { env = env
-                    , allInterfaces = allInterfaces
-                    }
-            )
+    Ok
+        (ProjectEnv
+            { env = env
+            , allInterfaces = allInterfaces
+            }
+        )
 
 
 {-| Replace a single module's declarations in an existing ProjectEnv.
@@ -407,7 +464,7 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
+                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -491,7 +548,7 @@ evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles ex
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
+                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -505,6 +562,115 @@ mutation testing, or incremental compilation where files are parsed once and reu
 evalWithEnvFromFiles : ProjectEnv -> List File -> Expression -> Result Error Value
 evalWithEnvFromFiles projectEnv additionalFiles expression =
     evalWithEnvFromFilesAndLimit Nothing projectEnv additionalFiles expression
+
+
+{-| Like `evalWithEnvFromFiles`, but memoizes selected fully-applied top-level
+functions in-memory during evaluation and returns the updated memo cache so it
+can be reused across later invocations.
+-}
+evalWithEnvFromFilesAndMemo :
+    ProjectEnv
+    -> List File
+    -> Set String
+    -> MemoRuntime.MemoCache
+    -> Bool
+    -> Expression
+    ->
+        Result Error
+            { value : Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+evalWithEnvFromFilesAndMemo (ProjectEnv projectEnv) additionalFiles memoizedFunctions memoCache collectMemoStats expression =
+    let
+        parsedModules =
+            additionalFiles
+                |> List.map
+                    (\file ->
+                        { file = file
+                        , moduleName = fileModuleName file
+                        , interface = buildInterfaceFromFile file
+                        }
+                    )
+
+        additionalInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces =
+            ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+        envResult =
+            parsedModules
+                |> Result.MyExtra.combineFoldl
+                    (\parsedModule envAcc ->
+                        buildModuleEnv allInterfaces parsedModule envAcc
+                    )
+                    (Ok projectEnv.env)
+    in
+    case envResult of
+        Err e ->
+            Err e
+
+        Ok env ->
+            let
+                lastModule =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .moduleName
+                        |> Maybe.withDefault [ "Main" ]
+
+                lastFile =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .file
+
+                finalImports =
+                    case lastFile of
+                        Just file ->
+                            (defaultImports ++ file.imports)
+                                |> List.foldl (processImport allInterfaces) emptyImports
+
+                        Nothing ->
+                            emptyImports
+
+                lastModuleKey =
+                    Environment.moduleKey lastModule
+
+                finalEnv =
+                    { env
+                        | currentModule = lastModule
+                        , currentModuleKey = lastModuleKey
+                        , currentModuleFunctions =
+                            Dict.get lastModuleKey env.shared.functions
+                                |> Maybe.withDefault Dict.empty
+                        , imports = finalImports
+                    }
+            in
+            Eval.Expression.evalExpression
+                (fakeNode expression)
+                { trace = False
+                , coverage = False
+                , coverageProbeLines = Set.empty
+                , maxSteps = Nothing
+                , tcoTarget = Nothing
+                , callCounts = Nothing
+                , intercepts = Dict.empty
+                , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+                , collectMemoStats = collectMemoStats
+                }
+                finalEnv
+                |> driveInternalMemo
+                    memoCache
+                    (if collectMemoStats then
+                        MemoRuntime.emptyMemoStats
+
+                     else
+                        MemoRuntime.disabledMemoStats
+                    )
 
 
 {-| Like `evalWithEnvFromFiles`, but also injects pre-computed Values into the
@@ -600,11 +766,414 @@ evalWithEnvFromFilesAndValues (ProjectEnv projectEnv) additionalFiles injectedVa
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
+                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                         finalEnv
                         |> EvalResult.toResult
             in
             Result.mapError Types.EvalError result
+
+
+evalWithEnvFromFilesAndValuesAndMemo :
+    ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Set String
+    -> MemoRuntime.MemoCache
+    -> Bool
+    -> Expression
+    ->
+        Result Error
+            { value : Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+evalWithEnvFromFilesAndValuesAndMemo (ProjectEnv projectEnv) additionalFiles injectedValues memoizedFunctions memoCache collectMemoStats expression =
+    let
+        parsedModules =
+            additionalFiles
+                |> List.map
+                    (\file ->
+                        { file = file
+                        , moduleName = fileModuleName file
+                        , interface = buildInterfaceFromFile file
+                        }
+                    )
+
+        additionalInterfaces =
+            parsedModules
+                |> List.map (\m -> ( m.moduleName, m.interface ))
+                |> ElmDict.fromList
+
+        allInterfaces =
+            ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+        envResult =
+            parsedModules
+                |> Result.MyExtra.combineFoldl
+                    (\parsedModule envAcc ->
+                        buildModuleEnv allInterfaces parsedModule envAcc
+                    )
+                    (Ok projectEnv.env)
+    in
+    case envResult of
+        Err e ->
+            Err e
+
+        Ok env ->
+            let
+                lastModule =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .moduleName
+                        |> Maybe.withDefault [ "Main" ]
+
+                lastFile =
+                    parsedModules
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.map .file
+
+                finalImports =
+                    case lastFile of
+                        Just file ->
+                            (defaultImports ++ file.imports)
+                                |> List.foldl (processImport allInterfaces) emptyImports
+
+                        Nothing ->
+                            emptyImports
+
+                lastModuleKey =
+                    Environment.moduleKey lastModule
+
+                finalEnv =
+                    { env
+                        | currentModule = lastModule
+                        , currentModuleKey = lastModuleKey
+                        , currentModuleFunctions =
+                            Dict.get lastModuleKey env.shared.functions
+                                |> Maybe.withDefault Dict.empty
+                        , imports = finalImports
+                        , values =
+                            Dict.foldl
+                                (\name value acc -> Dict.insert name value acc)
+                                env.values
+                                injectedValues
+                    }
+            in
+            Eval.Expression.evalExpression
+                (fakeNode expression)
+                { trace = False
+                , coverage = False
+                , coverageProbeLines = Set.empty
+                , maxSteps = Nothing
+                , tcoTarget = Nothing
+                , callCounts = Nothing
+                , intercepts = Dict.empty
+                , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+                , collectMemoStats = collectMemoStats
+                }
+                finalEnv
+                |> driveInternalMemo
+                    memoCache
+                    (if collectMemoStats then
+                        MemoRuntime.emptyMemoStats
+
+                     else
+                        MemoRuntime.disabledMemoStats
+                    )
+
+
+{-| Like `evalWithIntercepts`, but drives interpreter-local memoization
+internally and returns the updated cache for warm reuse in later runs.
+-}
+evalWithMemoizedFunctions :
+    ProjectEnv
+    -> List String
+    -> Set String
+    -> MemoRuntime.MemoCache
+    -> Bool
+    -> Expression
+    ->
+        Result Error
+            { value : Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+evalWithMemoizedFunctions projectEnv additionalSources memoizedFunctions memoCache collectMemoStats expression =
+    let
+        parseResult =
+            additionalSources
+                |> List.map
+                    (\source ->
+                        Elm.Parser.parseToFile source
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineResults
+    in
+    parseResult
+        |> Result.andThen
+            (\files ->
+                evalWithEnvFromFilesAndMemo projectEnv files memoizedFunctions memoCache collectMemoStats expression
+            )
+
+
+evalWithValuesAndMemoizedFunctions :
+    ProjectEnv
+    -> List String
+    -> Dict.Dict String Value
+    -> Set String
+    -> MemoRuntime.MemoCache
+    -> Bool
+    -> Expression
+    ->
+        Result Error
+            { value : Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+evalWithValuesAndMemoizedFunctions projectEnv additionalSources injectedValues memoizedFunctions memoCache collectMemoStats expression =
+    let
+        parseResult =
+            additionalSources
+                |> List.map
+                    (\source ->
+                        Elm.Parser.parseToFile source
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineResults
+    in
+    parseResult
+        |> Result.andThen
+            (\files ->
+                evalWithEnvFromFilesAndValuesAndMemo projectEnv files injectedValues memoizedFunctions memoCache collectMemoStats expression
+            )
+
+
+driveInternalMemo :
+    MemoRuntime.MemoCache
+    -> MemoRuntime.MemoStats
+    -> Types.EvalResult Value
+    ->
+        Result Error
+            { value : Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+driveInternalMemo memoCache memoStats evalResult =
+    case evalResult of
+        Types.EvOk value ->
+            Ok { value = value, memoCache = memoCache, memoStats = memoStats }
+
+        Types.EvErr evalErr ->
+            Err (Types.EvalError evalErr)
+
+        Types.EvOkTrace value _ _ ->
+            Ok { value = value, memoCache = memoCache, memoStats = memoStats }
+
+        Types.EvErrTrace evalErr _ _ ->
+            Err (Types.EvalError evalErr)
+
+        Types.EvMemoLookup payload resume ->
+            let
+                ( nextCache, nextStats, maybeValue ) =
+                    handleInternalMemoLookup memoCache memoStats payload
+            in
+            driveInternalMemo nextCache nextStats (resume maybeValue)
+
+        Types.EvMemoStore payload next ->
+            let
+                ( nextCache, nextStats ) =
+                    handleInternalMemoStore memoCache memoStats payload
+            in
+            driveInternalMemo nextCache nextStats next
+
+        Types.EvYield tag payload resume ->
+            case handleInternalMemoYield memoCache memoStats tag payload of
+                Just ( nextCache, nextStats, resumeValue ) ->
+                    driveInternalMemo nextCache nextStats (resume resumeValue)
+
+                Nothing ->
+                    Err
+                        (Types.EvalError
+                            { currentModule = []
+                            , callStack = []
+                            , error = Types.Unsupported ("Unhandled non-memo yield in evalWithMemoizedFunctions: " ++ tag)
+                            }
+                        )
+
+        Types.EvOkCoverage value _ ->
+            Ok { value = value, memoCache = memoCache, memoStats = memoStats }
+
+        Types.EvErrCoverage evalErr _ ->
+            Err (Types.EvalError evalErr)
+
+
+handleInternalMemoYield :
+    MemoRuntime.MemoCache
+    -> MemoRuntime.MemoStats
+    -> String
+    -> Value
+    -> Maybe ( MemoRuntime.MemoCache, MemoRuntime.MemoStats, Value )
+handleInternalMemoYield memoCache memoStats tag payload =
+    if tag == MemoRuntime.lookupTag then
+        MemoRuntime.decodeLookupPayload payload
+            |> Maybe.map
+                (\lookupPayload ->
+                    let
+                        ( nextCache, nextStats, maybeValue ) =
+                            handleInternalMemoLookup memoCache memoStats lookupPayload
+                    in
+                    ( nextCache
+                    , nextStats
+                    , Maybe.withDefault MemoRuntime.maybeNothing maybeValue
+                    )
+                )
+
+    else if tag == MemoRuntime.storeTag then
+        MemoRuntime.decodeStorePayload payload
+            |> Maybe.map
+                (\storePayload ->
+                    let
+                        ( nextCache, nextStats ) =
+                            handleInternalMemoStore memoCache memoStats storePayload
+                    in
+                    ( nextCache
+                    , nextStats
+                    , Types.Unit
+                    )
+                )
+
+    else
+        Nothing
+
+
+handleInternalMemoLookup :
+    MemoRuntime.MemoCache
+    -> MemoRuntime.MemoStats
+    -> Types.MemoLookupPayload
+    -> ( MemoRuntime.MemoCache, MemoRuntime.MemoStats, Maybe Value )
+handleInternalMemoLookup memoCache memoStats lookupPayload =
+    let
+        updatedStats =
+            MemoRuntime.recordFunctionLookup lookupPayload.qualifiedName memoStats
+
+        maybeFingerprints =
+            case ( lookupPayload.shallowFingerprint, lookupPayload.deepFingerprint ) of
+                ( Just shallowFingerprint, Just deepFingerprint ) ->
+                    Just ( shallowFingerprint, deepFingerprint )
+
+                _ ->
+                    lookupPayload.args
+                        |> Maybe.map
+                            (\args ->
+                                ( Eval.Expression.fingerprintArgs args
+                                , deepHashArgs args
+                                )
+                            )
+    in
+    case lookupPayload.compactFingerprint of
+        Just compactFingerprint ->
+            case MemoRuntime.lookupCompactValue lookupPayload.specId compactFingerprint memoCache of
+                Just cachedValue ->
+                    ( memoCache
+                    , MemoRuntime.recordFunctionHit lookupPayload.qualifiedName updatedStats
+                    , Just cachedValue
+                    )
+
+                Nothing ->
+                    ( memoCache
+                    , MemoRuntime.recordFunctionMiss lookupPayload.qualifiedName updatedStats
+                    , Nothing
+                    )
+
+        Nothing ->
+            case maybeFingerprints of
+                Just ( shallowFingerprint, deepFingerprint ) ->
+                    case MemoRuntime.lookupEntries lookupPayload.specId shallowFingerprint memoCache of
+                        Just entries ->
+                            case List.Extra.find (\entry -> entry.deepFingerprint == deepFingerprint) entries of
+                                Just entry ->
+                                    ( memoCache
+                                    , MemoRuntime.recordFunctionHit lookupPayload.qualifiedName updatedStats
+                                    , Just entry.value
+                                    )
+
+                                Nothing ->
+                                    ( memoCache
+                                    , MemoRuntime.recordFunctionMiss lookupPayload.qualifiedName updatedStats
+                                    , Nothing
+                                    )
+
+                        Nothing ->
+                            ( memoCache
+                            , MemoRuntime.recordFunctionMiss lookupPayload.qualifiedName updatedStats
+                            , Nothing
+                            )
+
+                Nothing ->
+                    ( memoCache
+                    , MemoRuntime.recordFunctionMiss lookupPayload.qualifiedName updatedStats
+                    , Nothing
+                    )
+
+
+handleInternalMemoStore :
+    MemoRuntime.MemoCache
+    -> MemoRuntime.MemoStats
+    -> Types.MemoStorePayload
+    -> ( MemoRuntime.MemoCache, MemoRuntime.MemoStats )
+handleInternalMemoStore memoCache memoStats storePayload =
+    let
+        maybeFingerprints =
+            case ( storePayload.shallowFingerprint, storePayload.deepFingerprint ) of
+                ( Just shallowFingerprint, Just deepFingerprint ) ->
+                    Just ( shallowFingerprint, deepFingerprint )
+
+                _ ->
+                    storePayload.args
+                        |> Maybe.map
+                            (\args ->
+                                ( Eval.Expression.fingerprintArgs args
+                                , deepHashArgs args
+                                )
+                            )
+    in
+    case storePayload.compactFingerprint of
+        Just compactFingerprint ->
+            ( MemoRuntime.storeCompactValue
+                storePayload.specId
+                compactFingerprint
+                storePayload.value
+                memoCache
+            , MemoRuntime.recordFunctionStore storePayload.qualifiedName memoStats
+            )
+
+        Nothing ->
+            case maybeFingerprints of
+                Just ( shallowFingerprint, deepFingerprint ) ->
+                    ( MemoRuntime.storeEntry
+                        storePayload.specId
+                        shallowFingerprint
+                        { deepFingerprint = deepFingerprint
+                        , value = storePayload.value
+                        }
+                        memoCache
+                    , MemoRuntime.recordFunctionStore storePayload.qualifiedName memoStats
+                    )
+
+                Nothing ->
+                    ( memoCache, memoStats )
+
+
+deepHashArgs : List Value -> Int
+deepHashArgs args =
+    List.foldl
+        (\value acc ->
+            Bitwise.xor (acc * 16777619) (Eval.Expression.deepHashValue value)
+        )
+        2166136261
+        args
 
 
 {-| Combined: injected Values + intercepts + raw EvalResult.
@@ -619,6 +1188,24 @@ evalWithEnvFromFilesAndValuesAndInterceptsRaw :
     -> Expression
     -> Types.EvalResult Value
 evalWithEnvFromFilesAndValuesAndInterceptsRaw (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
+    evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw
+        (ProjectEnv projectEnv)
+        additionalFiles
+        injectedValues
+        intercepts
+        Set.empty
+        expression
+
+
+evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw :
+    ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Dict.Dict String Types.Intercept
+    -> Set String
+    -> Expression
+    -> Types.EvalResult Value
+evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw (ProjectEnv projectEnv) additionalFiles injectedValues intercepts memoizedFunctions expression =
     let
         parsedModules =
             additionalFiles
@@ -700,10 +1287,14 @@ evalWithEnvFromFilesAndValuesAndInterceptsRaw (ProjectEnv projectEnv) additional
             Eval.Expression.evalExpression
                 (fakeNode expression)
                 { trace = False
+                , coverage = False
+                , coverageProbeLines = Set.empty
                 , maxSteps = Nothing
                 , tcoTarget = Nothing
                 , callCounts = Nothing
                 , intercepts = intercepts
+                , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+                , collectMemoStats = False
                 }
                 finalEnv
 
@@ -808,10 +1399,14 @@ evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expressi
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
                                 { trace = False
+                                , coverage = False
+                                , coverageProbeLines = Set.empty
                                 , maxSteps = Nothing
                                 , tcoTarget = Nothing
                                 , callCounts = Nothing
                                 , intercepts = intercepts
+                                , memoizedFunctions = MemoSpec.emptyRegistry
+                                , collectMemoStats = False
                                 }
                                 finalEnv
                                 |> EvalResult.toResult
@@ -831,6 +1426,22 @@ evalWithInterceptsRaw :
     -> Expression
     -> Types.EvalResult Value
 evalWithInterceptsRaw (ProjectEnv projectEnv) additionalSources intercepts expression =
+    evalWithInterceptsAndMemoRaw
+        (ProjectEnv projectEnv)
+        additionalSources
+        intercepts
+        Set.empty
+        expression
+
+
+evalWithInterceptsAndMemoRaw :
+    ProjectEnv
+    -> List String
+    -> Dict.Dict String Types.Intercept
+    -> Set String
+    -> Expression
+    -> Types.EvalResult Value
+evalWithInterceptsAndMemoRaw (ProjectEnv projectEnv) additionalSources intercepts memoizedFunctions expression =
     let
         parseResult =
             additionalSources
@@ -926,10 +1537,14 @@ evalWithInterceptsRaw (ProjectEnv projectEnv) additionalSources intercepts expre
                     Eval.Expression.evalExpression
                         (fakeNode expression)
                         { trace = False
+                        , coverage = False
+                        , coverageProbeLines = Set.empty
                         , maxSteps = Nothing
                         , tcoTarget = Nothing
                         , callCounts = Nothing
                         , intercepts = intercepts
+                        , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+                        , collectMemoStats = False
                         }
                         finalEnv
 
@@ -1067,7 +1682,7 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         evalResult =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = True, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
+                                { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                                 finalEnv
 
                         ( result, callTrees, logLines ) =
@@ -1076,6 +1691,117 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                     ( Result.mapError Types.EvalError result
                     , callTrees
                     , logLines
+                    )
+
+
+{-| Like `traceWithEnv`, but only collects evaluated source ranges (no full
+CallTree). Uses coverage mode in the interpreter to avoid building env/value
+data for each expression — dramatically reducing memory for large test suites.
+-}
+coverageWithEnv : ProjectEnv -> List String -> Expression -> ( Result Error Value, List Range )
+coverageWithEnv projectEnv additionalSources expression =
+    coverageWithEnvAndLimit Nothing Set.empty projectEnv additionalSources expression
+
+
+{-| Like `coverageWithEnv` but with probe line filtering. Only records
+coverage for expressions on the given lines. When probeLines is empty,
+records all expressions (backward compatible).
+-}
+coverageWithEnvAndLimit : Maybe Int -> Set Int -> ProjectEnv -> List String -> Expression -> ( Result Error Value, List Range )
+coverageWithEnvAndLimit maxSteps probeLines (ProjectEnv projectEnv) additionalSources expression =
+    let
+        parseResult =
+            additionalSources
+                |> List.map
+                    (\source ->
+                        source
+                            |> Elm.Parser.parseToFile
+                            |> Result.mapError ParsingError
+                            |> Result.andThen
+                                (\file ->
+                                    Ok
+                                        { file = file
+                                        , moduleName = fileModuleName file
+                                        , interface = buildInterfaceFromFile file
+                                        }
+                                )
+                    )
+                |> combineResults
+    in
+    case parseResult of
+        Err e ->
+            ( Err e, [] )
+
+        Ok parsedModules ->
+            let
+                additionalInterfaces =
+                    parsedModules
+                        |> List.map (\m -> ( m.moduleName, m.interface ))
+                        |> ElmDict.fromList
+
+                allInterfaces =
+                    ElmDict.union additionalInterfaces projectEnv.allInterfaces
+
+                envResult =
+                    parsedModules
+                        |> Result.MyExtra.combineFoldl
+                            (\parsedModule envAcc ->
+                                buildModuleEnv allInterfaces parsedModule envAcc
+                            )
+                            (Ok projectEnv.env)
+            in
+            case envResult of
+                Err e ->
+                    ( Err e, [] )
+
+                Ok env ->
+                    let
+                        lastModule =
+                            parsedModules
+                                |> List.reverse
+                                |> List.head
+                                |> Maybe.map .moduleName
+                                |> Maybe.withDefault [ "Main" ]
+
+                        lastFile =
+                            parsedModules
+                                |> List.reverse
+                                |> List.head
+                                |> Maybe.map .file
+
+                        finalImports =
+                            case lastFile of
+                                Just file ->
+                                    (defaultImports ++ file.imports)
+                                        |> List.foldl (processImport allInterfaces) emptyImports
+
+                                Nothing ->
+                                    emptyImports
+
+                        lastModuleKey =
+                            Environment.moduleKey lastModule
+
+                        finalEnv =
+                            { env
+                                | currentModule = lastModule
+                                , currentModuleKey = lastModuleKey
+                                , currentModuleFunctions =
+                                    Dict.get lastModuleKey env.shared.functions
+                                        |> Maybe.withDefault Dict.empty
+                                , imports = finalImports
+                            }
+
+                        evalResult =
+                            Eval.Expression.evalExpression
+                                (fakeNode expression)
+                                { trace = False, coverage = True, coverageProbeLines = probeLines, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                                finalEnv
+
+                        ( result, coverageSet ) =
+                            EvalResult.toCoverageSet evalResult
+                    in
+                    ( Result.mapError Types.EvalError result
+                    , Set.toList coverageSet |> List.map Types.unpackRange
                     )
 
 
@@ -1442,7 +2168,7 @@ evalProject sources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty }
+                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -1499,6 +2225,52 @@ buildModuleEnv allInterfaces { file, moduleName } env =
         |> Result.MyExtra.combineFoldl addDeclaration (Ok envWithModuleImports)
 
 
+cachedSummaryFromParsedModule :
+    ElmDict.Dict ModuleName (List Exposed)
+    ->
+        { file : File
+        , moduleName : ModuleName
+        , interface : List Exposed
+        }
+    -> CachedModuleSummary
+cachedSummaryFromParsedModule allInterfaces { file, moduleName, interface } =
+    { moduleName = moduleName
+    , interface = interface
+    , importedNames =
+        (defaultImports ++ file.imports)
+            |> List.foldl (processImport allInterfaces) emptyImports
+    , functions = moduleFunctionImplementations moduleName file
+    }
+
+
+moduleFunctionImplementations : ModuleName -> File -> List FunctionImplementation
+moduleFunctionImplementations moduleName file =
+    file.declarations
+        |> List.concatMap
+            (\(Node _ decl) ->
+                case decl of
+                    FunctionDeclaration function ->
+                        [ Node.value function.declaration ]
+
+                    AliasDeclaration alias_ ->
+                        recordAliasConstructorImplementation alias_
+                            |> Maybe.map List.singleton
+                            |> Maybe.withDefault []
+
+                    CustomTypeDeclaration customType ->
+                        constructorImplementations moduleName customType
+
+                    PortDeclaration _ ->
+                        []
+
+                    InfixDeclaration _ ->
+                        []
+
+                    Destructuring _ _ ->
+                        []
+            )
+
+
 {-| If a type alias has a record type annotation, register its name as a
 function that constructs a Record value from positional arguments.
 
@@ -1510,6 +2282,16 @@ registers `Point` as a 2-argument function whose body is
 -}
 registerRecordAliasConstructor : ModuleName -> TypeAlias -> Env -> Env
 registerRecordAliasConstructor moduleName alias_ env =
+    case recordAliasConstructorImplementation alias_ of
+        Just implementation ->
+            Environment.addFunction moduleName implementation env
+
+        Nothing ->
+            env
+
+
+recordAliasConstructorImplementation : TypeAlias -> Maybe Elm.Syntax.Expression.FunctionImplementation
+recordAliasConstructorImplementation alias_ =
     case Node.value alias_.typeAnnotation of
         Record fields ->
             let
@@ -1524,30 +2306,27 @@ registerRecordAliasConstructor moduleName alias_ env =
                 argNames : List String
                 argNames =
                     List.indexedMap (\i _ -> "$alias_arg" ++ String.fromInt i) fieldNames
-
-                implementation : Elm.Syntax.Expression.FunctionImplementation
-                implementation =
-                    { name = fakeNode aliasName
-                    , arguments =
-                        argNames
-                            |> List.map (\n -> fakeNode (Elm.Syntax.Pattern.VarPattern n))
-                    , expression =
-                        fakeNode
-                            (RecordExpr
-                                (List.map2
-                                    (\fieldName argName ->
-                                        fakeNode ( fakeNode fieldName, fakeNode (FunctionOrValue [] argName) )
-                                    )
-                                    fieldNames
-                                    argNames
-                                )
-                            )
-                    }
             in
-            Environment.addFunction moduleName implementation env
+            Just
+                { name = fakeNode aliasName
+                , arguments =
+                    argNames
+                        |> List.map (\n -> fakeNode (Elm.Syntax.Pattern.VarPattern n))
+                , expression =
+                    fakeNode
+                        (RecordExpr
+                            (List.map2
+                                (\fieldName argName ->
+                                    fakeNode ( fakeNode fieldName, fakeNode (FunctionOrValue [] argName) )
+                                )
+                                fieldNames
+                                argNames
+                            )
+                        )
+                }
 
         _ ->
-            env
+            Nothing
 
 
 {-| Register constructors from a custom type declaration as functions in env.
@@ -1559,51 +2338,51 @@ registerConstructors :
     -> Env
     -> Env
 registerConstructors moduleName customType env =
-    let
-        addConstructor : Node Elm.Syntax.Type.ValueConstructor -> Env -> Env
-        addConstructor (Node _ ctor) envAcc =
-            let
-                ctorName : String
-                ctorName =
-                    Node.value ctor.name
+    constructorImplementations moduleName customType
+        |> List.foldl (Environment.addFunction moduleName) env
 
-                arity : Int
-                arity =
-                    List.length ctor.arguments
 
-                -- Generate argument pattern names: $ctor_arg0, $ctor_arg1, ...
-                argNames : List String
-                argNames =
-                    List.range 0 (arity - 1)
-                        |> List.map (\i -> "$ctor_arg" ++ String.fromInt i)
+constructorImplementations :
+    ModuleName
+    -> Elm.Syntax.Type.Type
+    -> List Elm.Syntax.Expression.FunctionImplementation
+constructorImplementations moduleName customType =
+    customType.constructors
+        |> List.map
+            (\(Node _ ctor) ->
+                let
+                    ctorName : String
+                    ctorName =
+                        Node.value ctor.name
 
-                -- Build the function implementation
-                implementation : Elm.Syntax.Expression.FunctionImplementation
-                implementation =
-                    { name = fakeNode ctorName
-                    , arguments =
-                        argNames
-                            |> List.map (\n -> fakeNode (Elm.Syntax.Pattern.VarPattern n))
-                    , expression =
-                        if arity == 0 then
-                            -- Zero-arg constructor: just the constructor itself
-                            fakeNode (FunctionOrValue moduleName ctorName)
+                    arity : Int
+                    arity =
+                        List.length ctor.arguments
 
-                        else
-                            -- N-arg constructor: application of constructor to args
-                            fakeNode
-                                (Application
-                                    (fakeNode (FunctionOrValue moduleName ctorName)
-                                        :: List.map
-                                            (\n -> fakeNode (FunctionOrValue [] n))
-                                            argNames
-                                    )
+                    argNames : List String
+                    argNames =
+                        List.range 0 (arity - 1)
+                            |> List.map (\i -> "$ctor_arg" ++ String.fromInt i)
+                in
+                { name = fakeNode ctorName
+                , arguments =
+                    argNames
+                        |> List.map (\n -> fakeNode (Elm.Syntax.Pattern.VarPattern n))
+                , expression =
+                    if arity == 0 then
+                        fakeNode (FunctionOrValue moduleName ctorName)
+
+                    else
+                        fakeNode
+                            (Application
+                                (fakeNode (FunctionOrValue moduleName ctorName)
+                                    :: List.map
+                                        (\n -> fakeNode (FunctionOrValue [] n))
+                                        argNames
                                 )
-                    }
-            in
-            Environment.addFunction moduleName implementation envAcc
-    in
-    List.foldl addConstructor env customType.constructors
+                            )
+                }
+            )
 
 
 {-| Build an interface from a parsed File by examining its declarations and exposing list.

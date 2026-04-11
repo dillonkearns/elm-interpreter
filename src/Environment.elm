@@ -1,4 +1,4 @@
-module Environment exposing (addFunction, addLetFunction, addLocalFunction, addValue, call, callKernel, callKernelNoStack, callNoStack, empty, moduleKey, replaceValues, with, withBindings)
+module Environment exposing (addFunction, addLetFunction, addLocalFunction, addValue, call, callKernel, callKernelNoStack, callModuleFn, callModuleFnNoStack, callNoStack, empty, moduleKey, replaceValues, with, withBindings)
 
 import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -270,6 +270,108 @@ callKernelNoStack moduleName _ env =
     , callDepth = env.callDepth
     , recursionCheck = env.recursionCheck
     }
+
+
+{-| Flat-closure variant of `call` for **top-level module function** lookups.
+
+A top-level module function's body can only reference:
+  * its own parameters
+  * its own let bindings
+  * module-level names (`currentModuleFunctions` / `shared.functions`)
+  * imports
+
+It *never* legitimately references the caller's local bindings, so the
+caller's `env.values` is dead weight when stored on the `PartiallyApplied`
+that represents the bare function reference. This variant clears `values`
+to `Dict.empty` at the point where we build the closure env, keeping
+subsequent `bindSimplePatterns` inserts (for the function's own
+parameters) and TCO fingerprint walks proportional to the function's
+own argument count instead of the caller's scope size.
+
+**Do not** use this for let-defined functions — those genuinely close
+over their enclosing scope's `values`.
+-}
+callModuleFn : ModuleName -> String -> Env -> Env
+callModuleFn moduleName name env =
+    let
+        key : String
+        key =
+            moduleKey moduleName
+    in
+    if key == env.currentModuleKey then
+        { currentModule = moduleName
+        , currentModuleKey = key
+        , callStack =
+            { moduleName = moduleName, name = name }
+                :: env.callStack
+        , shared = env.shared
+        , currentModuleFunctions = env.currentModuleFunctions
+        , letFunctions = Dict.empty
+        , values = Dict.empty
+        , imports = env.imports
+        , callDepth = env.callDepth + 1
+        , recursionCheck = env.recursionCheck
+        }
+
+    else
+        { currentModule = moduleName
+        , currentModuleKey = key
+        , callStack =
+            { moduleName = moduleName, name = name }
+                :: env.callStack
+        , shared = env.shared
+        , currentModuleFunctions =
+            Dict.get key env.shared.functions
+                |> Maybe.withDefault Dict.empty
+        , letFunctions = Dict.empty
+        , values = Dict.empty
+        , imports =
+            Dict.get key env.shared.moduleImports
+                |> Maybe.withDefault env.imports
+        , callDepth = env.callDepth + 1
+        , recursionCheck = env.recursionCheck
+        }
+
+
+{-| Like `callModuleFn` but skips the `callStack` update — used when trace
+is off. See `callModuleFn` for the flat-closure rationale.
+-}
+callModuleFnNoStack : ModuleName -> String -> Env -> Env
+callModuleFnNoStack moduleName name env =
+    let
+        key : String
+        key =
+            moduleKey moduleName
+    in
+    if key == env.currentModuleKey then
+        { currentModule = env.currentModule
+        , currentModuleKey = env.currentModuleKey
+        , callStack = env.callStack
+        , shared = env.shared
+        , currentModuleFunctions = env.currentModuleFunctions
+        , letFunctions = Dict.empty
+        , values = Dict.empty
+        , imports = env.imports
+        , callDepth = env.callDepth + 1
+        , recursionCheck = env.recursionCheck
+        }
+
+    else
+        { currentModule = moduleName
+        , currentModuleKey = key
+        , callStack = env.callStack
+        , shared = env.shared
+        , currentModuleFunctions =
+            Dict.get key env.shared.functions
+                |> Maybe.withDefault Dict.empty
+        , letFunctions = Dict.empty
+        , values = Dict.empty
+        , imports =
+            Dict.get key env.shared.moduleImports
+                |> Maybe.withDefault env.imports
+        , callDepth = env.callDepth + 1
+        , recursionCheck = env.recursionCheck
+        }
 
 
 {-| Like call but skips callStack update. Used when trace is off.
