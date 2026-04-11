@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, extendWithFilesNormalized, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, replaceModuleFunctionsInEnv, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -2077,6 +2077,177 @@ moduleIsBlocklisted moduleName =
 
         _ ->
             False
+
+
+{-| Read the current normalized function dict for a single module out of a
+`ProjectEnv`. Returns the post-normalization bodies as they stand right now —
+useful for serializing to disk after normalization.
+-}
+getModuleFunctions : ModuleName -> ProjectEnv -> Dict.Dict String FunctionImplementation
+getModuleFunctions moduleName (ProjectEnv projectEnv) =
+    Dict.get (Environment.moduleKey moduleName) projectEnv.env.shared.functions
+        |> Maybe.withDefault Dict.empty
+
+
+{-| Install a pre-computed normalized function dict for a module into an
+existing `ProjectEnv`, replacing whatever was there before. Used to load
+cached normalization results without re-running the pass.
+-}
+replaceModuleFunctionsInEnv :
+    ModuleName
+    -> Dict.Dict String FunctionImplementation
+    -> ProjectEnv
+    -> ProjectEnv
+replaceModuleFunctionsInEnv moduleName newFunctions (ProjectEnv projectEnv) =
+    let
+        env : Env
+        env =
+            projectEnv.env
+
+        moduleKey : String
+        moduleKey =
+            Environment.moduleKey moduleName
+
+        updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        updatedFunctions =
+            Dict.insert moduleKey newFunctions env.shared.functions
+
+        newEnv : Env
+        newEnv =
+            { env
+                | shared =
+                    { functions = updatedFunctions
+                    , moduleImports = env.shared.moduleImports
+                    }
+            }
+    in
+    ProjectEnv { projectEnv | env = newEnv }
+
+
+{-| Normalize a single module in place. Returns the updated `ProjectEnv`
+along with **only the functions whose body was actually rewritten** — not
+the full module function dict. The rewritten-only delta is cheap to
+serialize and overlays cleanly on the original parsed bodies, so cache
+blobs can stay small.
+
+Uses the existing `ProjectEnv` as both the evaluation context (so package
+functions and previously-normalized sibling modules are visible) and the
+place to install the rewritten bodies.
+-}
+normalizeOneModuleInEnv :
+    ModuleName
+    -> ProjectEnv
+    -> ( ProjectEnv, Dict.Dict String FunctionImplementation )
+normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
+    let
+        env : Env
+        env =
+            projectEnv.env
+
+        sharedImports : Dict.Dict String ImportedNames
+        sharedImports =
+            env.shared.moduleImports
+
+        moduleKey : String
+        moduleKey =
+            Environment.moduleKey moduleName
+
+        moduleImports : ImportedNames
+        moduleImports =
+            Dict.get moduleKey sharedImports
+                |> Maybe.withDefault emptyImports
+
+        originalModuleFns : Dict.Dict String FunctionImplementation
+        originalModuleFns =
+            Dict.get moduleKey env.shared.functions
+                |> Maybe.withDefault Dict.empty
+
+        ( normalizedModuleFns, delta ) =
+            originalModuleFns
+                |> Dict.foldl
+                    (\name funcImpl ( fnAcc, deltaAcc ) ->
+                        if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
+                            case
+                                tryNormalizeConstant
+                                    moduleName
+                                    moduleKey
+                                    moduleImports
+                                    funcImpl
+                                    (Dict.insert moduleKey fnAcc env.shared.functions)
+                                    sharedImports
+                            of
+                                Just normalized ->
+                                    ( Dict.insert name normalized fnAcc
+                                    , Dict.insert name normalized deltaAcc
+                                    )
+
+                                Nothing ->
+                                    ( Dict.insert name funcImpl fnAcc, deltaAcc )
+
+                        else
+                            ( Dict.insert name funcImpl fnAcc, deltaAcc )
+                    )
+                    ( Dict.empty, Dict.empty )
+
+        updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        updatedFunctions =
+            Dict.insert moduleKey normalizedModuleFns env.shared.functions
+
+        newEnv : Env
+        newEnv =
+            { env
+                | shared =
+                    { functions = updatedFunctions
+                    , moduleImports = sharedImports
+                    }
+            }
+    in
+    ( ProjectEnv { projectEnv | env = newEnv }, delta )
+
+
+{-| Merge a pre-computed normalization delta into the env, overlaying the
+delta entries on top of whatever bodies the env currently has for that
+module. Used to load a cached normalization delta without re-running the
+pass.
+-}
+mergeModuleFunctionsIntoEnv :
+    ModuleName
+    -> Dict.Dict String FunctionImplementation
+    -> ProjectEnv
+    -> ProjectEnv
+mergeModuleFunctionsIntoEnv moduleName deltaFns (ProjectEnv projectEnv) =
+    let
+        env : Env
+        env =
+            projectEnv.env
+
+        moduleKey : String
+        moduleKey =
+            Environment.moduleKey moduleName
+
+        existingModuleFns : Dict.Dict String FunctionImplementation
+        existingModuleFns =
+            Dict.get moduleKey env.shared.functions
+                |> Maybe.withDefault Dict.empty
+
+        merged : Dict.Dict String FunctionImplementation
+        merged =
+            Dict.union deltaFns existingModuleFns
+
+        updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        updatedFunctions =
+            Dict.insert moduleKey merged env.shared.functions
+
+        newEnv : Env
+        newEnv =
+            { env
+                | shared =
+                    { functions = updatedFunctions
+                    , moduleImports = env.shared.moduleImports
+                    }
+            }
+    in
+    ProjectEnv { projectEnv | env = newEnv }
 
 
 {-| Rewrite the bodies of zero-arg functions in the specified user modules by
