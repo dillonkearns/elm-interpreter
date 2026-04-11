@@ -296,6 +296,69 @@ resolverErrorToString err =
             "unexpected tuple arity: " ++ String.fromInt n
 
 
+{-| Is this FunctionImplementation a Custom type constructor?
+
+Custom type constructors get synthesized by `constructorImplementations`
+at env-build time with a self-referential body: an `Application` whose
+head is `FunctionOrValue moduleName ctorName` matching the impl's own
+name. When the old evaluator hits this at runtime, it detects the
+uppercase name via `evalVariant` and produces a `Custom` value — the
+self-reference never actually loops because the built-in `evalVariant`
+short-circuits before evaluating it.
+
+But when the resolver sees such a FunctionImplementation registered in
+`globalIds`, it emits `RGlobal id` for any reference to the constructor.
+At eval time `dispatchGlobalApply` finds a body for that id in
+`resolvedBodies` and runs it through `evalR`, which resolves the
+self-reference back into `RGlobal id`, and we loop forever (or hit the
+depth budget and get a malformed `Custom` back from the old-eval
+delegate path).
+
+The fix: don't put Custom type constructor entries in `globalIds` at
+all. That way the resolver falls through to `RCtor`, `evalConstructor`
+produces a zero-arg Custom, and `applyClosure`'s Custom branch
+accumulates the args — matching how Custom construction worked before
+resolver coverage widened. Record alias constructors still go through
+`RGlobal` because their synthesized body is a `RecordExpr`, not a
+self-referential application.
+
+-}
+isCustomTypeConstructor : FunctionImplementation -> Bool
+isCustomTypeConstructor impl =
+    let
+        implName : String
+        implName =
+            Node.value impl.name
+
+        startsWithUppercase : Bool
+        startsWithUppercase =
+            case String.uncons implName of
+                Just ( c, _ ) ->
+                    Char.isUpper c
+
+                Nothing ->
+                    False
+
+        bodyIsSelfApplication : Bool
+        bodyIsSelfApplication =
+            case Node.value impl.expression of
+                FunctionOrValue _ refName ->
+                    refName == implName
+
+                Application items ->
+                    case items of
+                        (Node _ (FunctionOrValue _ refName)) :: _ ->
+                            refName == implName
+
+                        _ ->
+                            False
+
+                _ ->
+                    False
+    in
+    startsWithUppercase && bodyIsSelfApplication
+
+
 {-| Walk every declaration — core and user — to assign `GlobalId`s, then
 walk user declarations again to resolve their bodies to `RExpr`. Core
 bodies are deliberately **not** resolved (they reference kernel functions
@@ -331,7 +394,8 @@ resolveProject summaries =
                     )
                     { next = 0, ids = Dict.empty }
 
-        -- Pass 1b: assign ids to every user declaration.
+        -- Pass 1b: assign ids to every user declaration, EXCEPT Custom
+        -- type constructors. See `isCustomTypeConstructor` for why.
         allIdAssignment : { next : Int, ids : Dict.Dict ( ModuleName, String ) IR.GlobalId }
         allIdAssignment =
             summaries
@@ -340,14 +404,18 @@ resolveProject summaries =
                         summary.functions
                             |> List.foldl
                                 (\impl inner ->
-                                    let
-                                        name : String
-                                        name =
-                                            Node.value impl.name
-                                    in
-                                    { next = inner.next + 1
-                                    , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
-                                    }
+                                    if isCustomTypeConstructor impl then
+                                        inner
+
+                                    else
+                                        let
+                                            name : String
+                                            name =
+                                                Node.value impl.name
+                                        in
+                                        { next = inner.next + 1
+                                        , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
+                                        }
                                 )
                                 outer
                     )
@@ -447,36 +515,40 @@ resolveProject summaries =
                 summary.functions
                     |> List.foldl
                         (\impl inner ->
-                            let
-                                name : String
-                                name =
-                                    Node.value impl.name
+                            if isCustomTypeConstructor impl then
+                                inner
 
-                                ctx : Resolver.ResolverContext
-                                ctx =
-                                    Resolver.initContext summary.moduleName globalIds
-                            in
-                            case Resolver.resolveDeclaration ctx impl of
-                                Ok rexpr ->
-                                    case Dict.get ( summary.moduleName, name ) inner.globalIds of
-                                        Just id ->
-                                            { inner
-                                                | bodies = Dict.insert id rexpr inner.bodies
-                                            }
+                            else
+                                let
+                                    name : String
+                                    name =
+                                        Node.value impl.name
 
-                                        Nothing ->
-                                            -- Should be impossible — pass 1 added this entry.
-                                            inner
+                                    ctx : Resolver.ResolverContext
+                                    ctx =
+                                        Resolver.initContext summary.moduleName globalIds
+                                in
+                                case Resolver.resolveDeclaration ctx impl of
+                                    Ok rexpr ->
+                                        case Dict.get ( summary.moduleName, name ) inner.globalIds of
+                                            Just id ->
+                                                { inner
+                                                    | bodies = Dict.insert id rexpr inner.bodies
+                                                }
 
-                                Err err ->
-                                    { inner
-                                        | errors =
-                                            { moduleName = summary.moduleName
-                                            , name = name
-                                            , error = err
-                                            }
-                                                :: inner.errors
-                                    }
+                                            Nothing ->
+                                                -- Should be impossible — pass 1 added this entry.
+                                                inner
+
+                                    Err err ->
+                                        { inner
+                                            | errors =
+                                                { moduleName = summary.moduleName
+                                                , name = name
+                                                , error = err
+                                                }
+                                                    :: inner.errors
+                                        }
                         )
                         outer
             )
@@ -1842,23 +1914,27 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                 summary.functions
                                     |> List.foldl
                                         (\impl inner ->
-                                            let
-                                                name : String
-                                                name =
-                                                    Node.value impl.name
-                                            in
-                                            case Dict.get ( summary.moduleName, name ) inner.ids of
-                                                Just _ ->
-                                                    -- Re-registering an existing decl
-                                                    -- (e.g. same wrapper used twice).
-                                                    -- Reuse the existing id.
-                                                    inner
+                                            if isCustomTypeConstructor impl then
+                                                inner
 
-                                                Nothing ->
-                                                    { next = inner.next + 1
-                                                    , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
-                                                    , reverseIds = Dict.insert inner.next ( summary.moduleName, name ) inner.reverseIds
-                                                    }
+                                            else
+                                                let
+                                                    name : String
+                                                    name =
+                                                        Node.value impl.name
+                                                in
+                                                case Dict.get ( summary.moduleName, name ) inner.ids of
+                                                    Just _ ->
+                                                        -- Re-registering an existing decl
+                                                        -- (e.g. same wrapper used twice).
+                                                        -- Reuse the existing id.
+                                                        inner
+
+                                                    Nothing ->
+                                                        { next = inner.next + 1
+                                                        , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
+                                                        , reverseIds = Dict.insert inner.next ( summary.moduleName, name ) inner.reverseIds
+                                                        }
                                         )
                                         outer
                             )
@@ -1904,28 +1980,32 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                 summary.functions
                                     |> List.foldl
                                         (\impl inner ->
-                                            let
-                                                name : String
-                                                name =
-                                                    Node.value impl.name
+                                            if isCustomTypeConstructor impl then
+                                                inner
 
-                                                ctx : Resolver.ResolverContext
-                                                ctx =
-                                                    Resolver.initContext
-                                                        summary.moduleName
-                                                        mergedGlobalIds
-                                            in
-                                            case Resolver.resolveDeclaration ctx impl of
-                                                Ok rexpr ->
-                                                    case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
-                                                        Just id ->
-                                                            Dict.insert id rexpr inner
+                                            else
+                                                let
+                                                    name : String
+                                                    name =
+                                                        Node.value impl.name
 
-                                                        Nothing ->
-                                                            inner
+                                                    ctx : Resolver.ResolverContext
+                                                    ctx =
+                                                        Resolver.initContext
+                                                            summary.moduleName
+                                                            mergedGlobalIds
+                                                in
+                                                case Resolver.resolveDeclaration ctx impl of
+                                                    Ok rexpr ->
+                                                        case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                            Just id ->
+                                                                Dict.insert id rexpr inner
 
-                                                Err _ ->
-                                                    inner
+                                                            Nothing ->
+                                                                inner
+
+                                                    Err _ ->
+                                                        inner
                                         )
                                         outer
                             )
