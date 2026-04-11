@@ -1,4 +1,4 @@
-module Eval.Expression exposing (containsSelfCall, deepHashValue, evalExpression, evalFunction, fingerprintArgs, isTailRecursive, kernelFunctions)
+module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs, kernelFunctions)
 
 import Array
 import Bitwise

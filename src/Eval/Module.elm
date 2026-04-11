@@ -455,48 +455,27 @@ resolveProject summaries =
                                 ctx =
                                     Resolver.initContext summary.moduleName globalIds
                             in
-                            {- Alias-aware resolution (`initContextWithImports`)
-                               is wired and unit-tested, but still unsafe on
-                               this path: wider resolution successfully
-                               produces bodies that then blow the JS stack
-                               through the new evaluator's direct-style
-                               recursion on real review-runner code paths
-                               (deeply-nested expressions + closure chains
-                               through kernel callbacks). Keep the alias-
-                               free form until Phase 4 r4 lands trampolining
-                               via `Recursion.recurse` in `evalR`.
+                            case Resolver.resolveDeclaration ctx impl of
+                                Ok rexpr ->
+                                    case Dict.get ( summary.moduleName, name ) inner.globalIds of
+                                        Just id ->
+                                            { inner
+                                                | bodies = Dict.insert id rexpr inner.bodies
+                                            }
 
-                               Similarly, `containsSelfCall` skip was a
-                               partial mitigation but the stack overflow
-                               also comes from non-self-recursive
-                               deeply-nested expressions, so it's not
-                               currently in use either.
-                            -}
-                            if False then
-                                inner
+                                        Nothing ->
+                                            -- Should be impossible — pass 1 added this entry.
+                                            inner
 
-                            else
-                                case Resolver.resolveDeclaration ctx impl of
-                                    Ok rexpr ->
-                                        case Dict.get ( summary.moduleName, name ) inner.globalIds of
-                                            Just id ->
-                                                { inner
-                                                    | bodies = Dict.insert id rexpr inner.bodies
-                                                }
-
-                                            Nothing ->
-                                                -- Should be impossible — pass 1 added this entry.
-                                                inner
-
-                                    Err err ->
-                                        { inner
-                                            | errors =
-                                                { moduleName = summary.moduleName
-                                                , name = name
-                                                , error = err
-                                                }
-                                                    :: inner.errors
-                                        }
+                                Err err ->
+                                    { inner
+                                        | errors =
+                                            { moduleName = summary.moduleName
+                                            , name = name
+                                            , error = err
+                                            }
+                                                :: inner.errors
+                                    }
                         )
                         outer
             )
@@ -1935,24 +1914,17 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                                         summary.moduleName
                                                         mergedGlobalIds
                                             in
-                                            if False then
-                                                -- Alias + bridge path dormant
-                                                -- pending Phase 4 r4 trampoline.
-                                                -- See `resolveProject` for why.
-                                                inner
+                                            case Resolver.resolveDeclaration ctx impl of
+                                                Ok rexpr ->
+                                                    case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                        Just id ->
+                                                            Dict.insert id rexpr inner
 
-                                            else
-                                                case Resolver.resolveDeclaration ctx impl of
-                                                    Ok rexpr ->
-                                                        case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
-                                                            Just id ->
-                                                                Dict.insert id rexpr inner
+                                                        Nothing ->
+                                                            inner
 
-                                                            Nothing ->
-                                                                inner
-
-                                                    Err _ ->
-                                                        inner
+                                                Err _ ->
+                                                    inner
                                         )
                                         outer
                             )
