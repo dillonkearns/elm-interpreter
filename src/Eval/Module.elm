@@ -1,5 +1,6 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, normalizeSummaries, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
+import Array
 import Bitwise
 import Core
 import Dict as ElmDict
@@ -274,6 +275,287 @@ buildProjectEnvFromSummaries summaries =
             , allInterfaces = allInterfaces
             }
         )
+
+
+{-| Run the top-level-constant normalization pass on a list of summaries.
+
+This is separated from `buildProjectEnvFromSummaries` so the caller can cache
+the normalized output: elm-build's package summary cache stores the result
+of `normalizeSummaries` to disk, so subsequent project loads skip this step
+entirely (cache hit → no normalization cost, just decoding).
+
+Idempotent: running this twice produces the same result (normalizing an
+already-normalized `Array.fromList [...]` body yields the same expression).
+Safe to call regardless of cache state.
+-}
+normalizeSummaries : List CachedModuleSummary -> List CachedModuleSummary
+normalizeSummaries summaries =
+    let
+        sharedFunctionsBefore : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        sharedFunctionsBefore =
+            summaries
+                |> List.foldl
+                    (\summary acc ->
+                        Dict.insert
+                            (Environment.moduleKey summary.moduleName)
+                            (summary.functions
+                                |> List.map (\implementation -> ( Node.value implementation.name, implementation ))
+                                |> Dict.fromList
+                            )
+                            acc
+                    )
+                    coreFunctions
+
+        sharedModuleImports : Dict.Dict String ImportedNames
+        sharedModuleImports =
+            summaries
+                |> List.map
+                    (\summary ->
+                        ( Environment.moduleKey summary.moduleName
+                        , summary.importedNames
+                        )
+                    )
+                |> Dict.fromList
+
+        normalizedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        normalizedFunctions =
+            normalizeTopLevelConstants summaries sharedFunctionsBefore sharedModuleImports
+    in
+    summaries
+        |> List.map
+            (\summary ->
+                let
+                    moduleKey : String
+                    moduleKey =
+                        Environment.moduleKey summary.moduleName
+
+                    updatedFns : Dict.Dict String FunctionImplementation
+                    updatedFns =
+                        Dict.get moduleKey normalizedFunctions
+                            |> Maybe.withDefault Dict.empty
+                in
+                { summary
+                    | functions =
+                        summary.functions
+                            |> List.map
+                                (\f ->
+                                    Dict.get (Node.value f.name) updatedFns
+                                        |> Maybe.withDefault f
+                                )
+                }
+            )
+
+
+{-| AST normalization pass: eagerly evaluate every zero-arg function whose
+result is a pure, round-trippable `Value`, then rewrite the function body via
+`Value.toExpression` so subsequent references produce the value in one step.
+
+This fixes a big interpreter cliff: without this pass, top-level constants
+are re-evaluated on every reference. `Fuzz.Float.exponentMapping` (a sorted
+2048-element `Array Int`) took ~1.4 s to rebuild in the interpreter, and any
+function that referenced it paid that cost per call. After normalization, the
+same reference becomes `Array.fromList [3071, 3072, ...]` — a flat list
+literal wrapped in one kernel call.
+
+We iterate modules in the order they appear in `summaries`. As each function
+gets normalized, it lands in the accumulator and subsequent evaluations see
+the fast form. Dependencies that come earlier in the iteration effectively
+get "cascaded" — the first successful normalization makes downstream evals
+cheaper. (A topological sort would let us do this in a single pass with
+guaranteed ordering, but fixed-point iteration is simpler and the common case
+already works well since summaries come out in a sensible order.)
+
+Functions whose values aren't losslessly representable as expressions (Json,
+Regex, Bytes, PartiallyApplied with captured env) are skipped — they stay as
+AST. Same for functions that fail to eval (Debug.todo, circular refs, etc).
+-}
+normalizeTopLevelConstants :
+    List CachedModuleSummary
+    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> Dict.Dict String ImportedNames
+    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+normalizeTopLevelConstants summaries initialFunctions sharedImports =
+    List.foldl
+        (\summary currentFunctions ->
+            let
+                moduleKey : String
+                moduleKey =
+                    Environment.moduleKey summary.moduleName
+
+                originalModuleFns : Dict.Dict String FunctionImplementation
+                originalModuleFns =
+                    Dict.get moduleKey currentFunctions
+                        |> Maybe.withDefault Dict.empty
+
+                -- Walk the module's functions, attempting normalization for
+                -- each zero-arg one. We thread `currentFunctions` through so
+                -- each newly-normalized function is visible to later siblings.
+                normalizedModuleFns : Dict.Dict String FunctionImplementation
+                normalizedModuleFns =
+                    List.foldl
+                        (\funcImpl acc ->
+                            let
+                                name : String
+                                name =
+                                    Node.value funcImpl.name
+
+                                normalized : FunctionImplementation
+                                normalized =
+                                    if List.isEmpty funcImpl.arguments then
+                                        tryNormalizeConstant
+                                            summary.moduleName
+                                            moduleKey
+                                            summary.importedNames
+                                            funcImpl
+                                            -- Use the partially-normalized
+                                            -- module dict so later constants
+                                            -- see earlier ones.
+                                            (Dict.insert moduleKey acc currentFunctions)
+                                            sharedImports
+                                            |> Maybe.withDefault funcImpl
+
+                                    else
+                                        funcImpl
+                            in
+                            Dict.insert name normalized acc
+                        )
+                        originalModuleFns
+                        summary.functions
+            in
+            Dict.insert moduleKey normalizedModuleFns currentFunctions
+        )
+        initialFunctions
+        summaries
+
+
+{-| Try to normalize a single zero-arg function. Returns `Just` the rewritten
+FunctionImplementation if eval succeeded and the result is losslessly
+round-trippable; `Nothing` if we should leave the AST alone.
+-}
+tryNormalizeConstant :
+    ModuleName
+    -> String
+    -> ImportedNames
+    -> FunctionImplementation
+    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> Dict.Dict String ImportedNames
+    -> Maybe FunctionImplementation
+tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions sharedModuleImports =
+    let
+        env : Env
+        env =
+            { currentModule = moduleName
+            , currentModuleKey = moduleKey
+            , callStack = []
+            , shared =
+                { functions = sharedFunctions
+                , moduleImports = sharedModuleImports
+                }
+            , currentModuleFunctions =
+                Dict.get moduleKey sharedFunctions
+                    |> Maybe.withDefault Dict.empty
+            , letFunctions = Dict.empty
+            , values = Dict.empty
+            , imports = moduleImports
+            , callDepth = 0
+            , recursionCheck = Nothing
+            }
+
+        cfg : Types.Config
+        cfg =
+            { trace = False
+            , coverage = False
+            , coverageProbeLines = Set.empty
+            , maxSteps = Just 10000000
+            , tcoTarget = Nothing
+            , callCounts = Nothing
+            , intercepts = Dict.empty
+            , memoizedFunctions = MemoSpec.emptyRegistry
+            , collectMemoStats = False
+            }
+
+        result : EvalResult Value
+        result =
+            Eval.Expression.evalExpression funcImpl.expression cfg env
+    in
+    case EvalResult.toResult result of
+        Ok value ->
+            if isLosslessValue value then
+                Just
+                    { funcImpl
+                        | expression = Value.toExpression value
+                    }
+
+            else
+                Nothing
+
+        Err _ ->
+            Nothing
+
+
+{-| Determine whether a `Value` can be losslessly round-tripped through
+`Value.toExpression`. Opaque kernel types (Json, Regex, Bytes) and closures
+over captured env can't be represented as an Elm expression, so we leave
+those constants in their original AST form.
+-}
+isLosslessValue : Value -> Bool
+isLosslessValue value =
+    case value of
+        Types.String _ ->
+            True
+
+        Types.Int _ ->
+            True
+
+        Types.Float _ ->
+            True
+
+        Types.Char _ ->
+            True
+
+        Types.Bool _ ->
+            True
+
+        Types.Unit ->
+            True
+
+        Types.Tuple l r ->
+            isLosslessValue l && isLosslessValue r
+
+        Types.Triple l m r ->
+            isLosslessValue l && isLosslessValue m && isLosslessValue r
+
+        Types.Record fields ->
+            Dict.values fields |> List.all isLosslessValue
+
+        Types.List items ->
+            List.all isLosslessValue items
+
+        Types.Custom _ args ->
+            List.all isLosslessValue args
+
+        Types.JsArray array ->
+            Array.toList array |> List.all isLosslessValue
+
+        Types.JsonValue _ ->
+            False
+
+        Types.JsonDecoderValue _ ->
+            False
+
+        Types.RegexValue _ ->
+            False
+
+        Types.BytesValue _ ->
+            False
+
+        Types.PartiallyApplied _ _ _ _ _ _ ->
+            -- Function-typed constants are risky to round-trip: Value.toExpression
+            -- can turn a top-level `myFn = other.fn` alias into a
+            -- FunctionOrValue reference, but any PA that captures env values
+            -- or uses a KernelImpl with runtime state would lose information.
+            -- Skip for now; revisit if the pattern is common.
+            False
 
 
 {-| Replace a single module's declarations in an existing ProjectEnv.
