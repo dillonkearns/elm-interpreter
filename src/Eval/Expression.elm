@@ -60,7 +60,16 @@ fingerprintValue value =
             7
 
         List items ->
-            shallowListBucket items * 53 + 8
+            -- Use exact length (not just a size bucket) so successive TCO
+            -- loop iterations over a uniform list — e.g.
+            -- `List.Extra.transpose [ List.repeat 10000 1 ]` where every
+            -- element and the head value are identical, so a head-based
+            -- fingerprint can't distinguish iteration 16 from iteration 32 —
+            -- still produce different fingerprints as elements are peeled
+            -- off. Only runs every `tcoCycleCheckInterval` iterations, so
+            -- the O(n) cost is amortized and worth paying to eliminate the
+            -- false-positive "infinite recursion detected" on long lists.
+            List.length items * 53 + 8
 
         Tuple a _ ->
             fingerprintValue a * 59 + 9
@@ -128,7 +137,11 @@ sizeOfValue : Value -> Int
 sizeOfValue value =
     case value of
         List items ->
-            shallowListBucket items
+            -- Use exact length (not a bucket) so Category B's size-growth
+            -- check can distinguish "accumulator grows by 1 per iteration"
+            -- from "stable size" on long lists. Only called every
+            -- `tcoCycleCheckInterval` iterations, so O(n) is amortized.
+            List.length items
 
         String _ ->
             -- String.length is O(n) in Elm; the cycle check only needs
@@ -3022,10 +3035,18 @@ evalNonVariant moduleName name cfg env =
                                         |> Types.succeedPartial
 
                         Nothing ->
-                            Syntax.qualifiedNameToString
-                                { moduleName = Tuple.first (fixModuleName moduleName env)
-                                , name = name
-                                }
+                            -- Preserve the form the user wrote: unqualified names
+                            -- stay bare in the error, so "a" doesn't get reported as
+                            -- "Main.a" just because evaluation happened inside Main.
+                            (if List.isEmpty moduleName then
+                                name
+
+                             else
+                                Syntax.qualifiedNameToString
+                                    { moduleName = Tuple.first (fixModuleName moduleName env)
+                                    , name = name
+                                    }
+                            )
                                 |> nameError env
                                 |> Types.failPartial
 

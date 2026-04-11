@@ -117,6 +117,26 @@ main =
                     ]
                     (Expression.FunctionOrValue [] "main")
                     |> expectOk
+        , test "List.map2 on 10000-element list does not false-positive as infinite recursion" <|
+            \_ ->
+                -- `transpose` uses `List.map2 (::)`, and `elm-core`'s `List.map2`
+                -- internally loops via `Elm.Kernel.List.go`, which is routed
+                -- through `tcoLoop`. The per-value fingerprint used to bucket
+                -- all lists of 4+ elements into the same hash, so over thousands
+                -- of iterations the TCO cycle detector saw "identical fingerprint
+                -- and size" for ~800 consecutive samples and falsely flagged
+                -- `go` as infinite recursion. Reproduced by running
+                -- `List.Extra.transpose [ List.repeat 10000 1 ]` via the full
+                -- test runner pipeline on elmcraft/core-extra's ListTests.
+                Eval.Module.evalProject
+                    [ """module Main exposing (main)
+
+main =
+    List.length (List.map2 (\\a b -> a + b) (List.range 1 10000) (List.range 1 10000))
+"""
+                    ]
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 10000))
         , test "higher-order fold with function argument over long list" <|
             \_ ->
                 -- List.foldl passes the same function at every step.

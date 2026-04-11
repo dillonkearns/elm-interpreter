@@ -1096,7 +1096,11 @@ jsArray selector =
             array
                 |> Array.map selector.toValue
                 |> JsArray
-    , name = "JsArray " ++ selector.name
+
+    -- User-facing name: Elm users see `List X` in their source (the host
+    -- `JsArray` representation is an internal optimization). Show "List"
+    -- in type-error messages so the text matches what's in their code.
+    , name = "List " ++ selector.name
     }
 
 

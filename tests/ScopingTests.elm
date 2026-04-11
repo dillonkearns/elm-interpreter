@@ -6,7 +6,7 @@ import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
 import TestUtils exposing (evalTest, evalTest_, list)
-import Types exposing (Value(..))
+import Types exposing (Error(..), EvalErrorKind(..), Value(..))
 
 
 suite : Test
@@ -15,6 +15,7 @@ suite =
         [ recordAliasConstructorTests
         , moduleDispatchTests
         , letFunctionScopingTests
+        , nameErrorMessageTests
         , describe "caller's local variables should not leak into callee"
             [ evalProjectTest "local var does not shadow callee's module-level function"
                 [ """module Foo exposing (greet, helper)
@@ -755,5 +756,99 @@ evalProjectTest name sources toValue a =
 
                 Ok value ->
                     Expect.equal (toValue a) value
+
+
+nameErrorMessageTests : Test
+nameErrorMessageTests =
+    describe "NameError messages report the name as written in source"
+        [ test "unqualified unresolved identifier keeps bare name (no module prefix)" <|
+            \_ ->
+                case
+                    Eval.Module.evalProject
+                        [ """module Main exposing (main)
+
+main =
+    case Nothing of
+        Just _ ->
+            0
+
+        Nothing ->
+            a + 1
+"""
+                        ]
+                        (Expression.FunctionOrValue [] "main")
+                of
+                    Err (EvalError e) ->
+                        case e.error of
+                            NameError msg ->
+                                msg
+                                    |> Expect.equal "a"
+
+                            other ->
+                                Expect.fail ("expected NameError, got " ++ Debug.toString other)
+
+                    Err other ->
+                        Expect.fail ("expected NameError, got " ++ Debug.toString other)
+
+                    Ok v ->
+                        Expect.fail ("expected NameError, got Ok " ++ Debug.toString v)
+        , test "type error from wrong list element type reports Elm-facing 'List', not host 'JsArray'" <|
+            \_ ->
+                case
+                    Eval.Module.evalProject
+                        [ """module Main exposing (main)
+
+main =
+    -- String.join expects List String; pass List (List Char) to force a type error.
+    -- The error message should reference "List" (the Elm type), not "JsArray"
+    -- (a host-internal representation Elm users don't know about).
+    String.join ", " [ [ 'a', 'b' ], [ 'c', 'd' ] ]
+"""
+                        ]
+                        (Expression.FunctionOrValue [] "main")
+                of
+                    Err (EvalError e) ->
+                        case e.error of
+                            TypeError msg ->
+                                msg
+                                    |> String.contains "JsArray"
+                                    |> Expect.equal False
+                                    |> Expect.onFail ("error message mentioned host-internal 'JsArray' instead of 'List': " ++ msg)
+
+                            other ->
+                                Expect.fail ("expected TypeError, got " ++ Debug.toString other)
+
+                    Err other ->
+                        Expect.fail ("expected TypeError, got " ++ Debug.toString other)
+
+                    Ok v ->
+                        Expect.fail ("expected TypeError, got Ok " ++ Debug.toString v)
+        , test "qualified unresolved identifier keeps its module prefix" <|
+            \_ ->
+                case
+                    Eval.Module.evalProject
+                        [ """module Main exposing (main)
+
+main =
+    Foo.bar
+"""
+                        ]
+                        (Expression.FunctionOrValue [] "main")
+                of
+                    Err (EvalError e) ->
+                        case e.error of
+                            NameError msg ->
+                                msg
+                                    |> Expect.equal "Foo.bar"
+
+                            other ->
+                                Expect.fail ("expected NameError, got " ++ Debug.toString other)
+
+                    Err other ->
+                        Expect.fail ("expected NameError, got " ++ Debug.toString other)
+
+                    Ok v ->
+                        Expect.fail ("expected NameError, got Ok " ++ Debug.toString v)
+        ]
 
 
