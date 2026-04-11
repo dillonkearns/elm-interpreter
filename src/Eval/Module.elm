@@ -244,16 +244,32 @@ buildProjectEnvFromSummaries summaries =
                     )
                     coreFunctions
 
+        -- Pre-populate core module imports with the default import set
+        -- (see the note in `buildInitialEnv`). Without this, a caller's
+        -- alias like `import Array.Extra as Array` would leak into core
+        -- module bodies via the cross-module-call import fallback and
+        -- rewrite qualified `Array_elm_builtin` references.
+        defaultProcessedImports : ImportedNames
+        defaultProcessedImports =
+            defaultImports
+                |> List.foldl (processImport Core.dependency.interfaces) emptyImports
+
+        coreModuleImports : Dict.Dict String ImportedNames
+        coreModuleImports =
+            coreFunctions
+                |> Dict.foldl (\moduleKey _ acc -> Dict.insert moduleKey defaultProcessedImports acc) Dict.empty
+
         sharedModuleImports : Dict.Dict String ImportedNames
         sharedModuleImports =
             summaries
-                |> List.map
-                    (\summary ->
-                        ( Environment.moduleKey summary.moduleName
-                        , summary.importedNames
-                        )
+                |> List.foldl
+                    (\summary acc ->
+                        Dict.insert
+                            (Environment.moduleKey summary.moduleName)
+                            summary.importedNames
+                            acc
                     )
-                |> Dict.fromList
+                    coreModuleImports
 
         env : Env
         env =
@@ -2713,12 +2729,38 @@ buildInitialEnv file =
             (defaultImports ++ file.imports)
                 |> List.foldl (processImport coreInterfaces) emptyImports
 
+        -- Pre-populate moduleImports for every core module with the
+        -- default import set so cross-module calls INTO elm/core (Array,
+        -- List, Dict, …) don't fall back to the CALLER's imports — which
+        -- would incorrectly leak the caller's aliases (e.g. a
+        -- `import Array.Extra as Array` in the caller would rewrite
+        -- qualified `Array_elm_builtin` references inside Array.elm's own
+        -- code to `Array.Extra.Array_elm_builtin`). The default imports
+        -- (`import Basics exposing (..)`, etc.) are the ones every Elm
+        -- module has implicitly, so a core module's unqualified
+        -- references to `ceiling`, `not`, `identity`, etc. still resolve.
+        defaultProcessedImports : ImportedNames
+        defaultProcessedImports =
+            defaultImports
+                |> List.foldl (processImport coreInterfaces) emptyImports
+
+        coreModuleImports : Dict.Dict String ImportedNames
+        coreModuleImports =
+            coreFunctions
+                |> Dict.foldl (\moduleKey _ acc -> Dict.insert moduleKey defaultProcessedImports acc) Dict.empty
+
         coreEnv : Env
         coreEnv =
             { currentModule = moduleName
             , currentModuleKey = Environment.moduleKey moduleName
             , callStack = []
-            , shared = { functions = coreFunctions, moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports, precomputedValues = Dict.empty }
+            , shared =
+                { functions = coreFunctions
+                , moduleImports =
+                    coreModuleImports
+                        |> Dict.insert (Environment.moduleKey moduleName) imports
+                , precomputedValues = Dict.empty
+                }
             , currentModuleFunctions = Dict.empty
                         , letFunctions = Dict.empty
             , values = Dict.empty

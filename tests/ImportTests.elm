@@ -20,6 +20,70 @@ suite =
         , multiModuleTests
         , userCustomTypeTests
         , moduleAliasCollisionTests
+        , arrayExtraAliasTests
+        ]
+
+
+{-| Regression tests for the `import Array exposing (Array) \n import Array.Extra as Array`
+pattern used by elmcraft/core-extra's `tests/ArrayTests.elm`. Elm allows this
+because both imports register into the same namespace, so `Array.splitAt` goes
+to `Array.Extra.splitAt` and `Array.empty` still goes to `Array.empty` from
+elm/core. Our interpreter was silently producing a differently-shaped
+`Array_elm_builtin` value when the alias was present, breaking 6 tests.
+-}
+arrayExtraAliasTests : Test
+arrayExtraAliasTests =
+    describe "Array.Extra as Array alias"
+        [ test "Array.empty evaluates to the same Value whether aliased or not" <|
+            \_ ->
+                let
+                    withoutAlias =
+                        Eval.Module.eval
+                            """module Main exposing (main)
+
+import Array
+
+main = Array.empty
+"""
+                            (Expression.FunctionOrValue [] "main")
+
+                    withAlias =
+                        Eval.Module.eval
+                            """module Main exposing (main)
+
+import Array exposing (Array)
+import Array.Extra as Array
+
+main = Array.empty
+"""
+                            (Expression.FunctionOrValue [] "main")
+                in
+                Expect.equal withoutAlias withAlias
+        , test "Array.fromList [1,2] produces equal Value with/without alias" <|
+            \_ ->
+                let
+                    withoutAlias =
+                        Eval.Module.eval
+                            """module Main exposing (main)
+
+import Array
+
+main = Array.fromList [1, 2]
+"""
+                            (Expression.FunctionOrValue [] "main")
+
+                    withAlias =
+                        Eval.Module.eval
+                            """module Main exposing (main)
+
+import Array exposing (Array)
+import Array.Extra as Array
+
+main = Array.fromList [1, 2]
+"""
+                            (Expression.FunctionOrValue [] "main")
+                in
+                Expect.equal withoutAlias withAlias
         ]
 
 
