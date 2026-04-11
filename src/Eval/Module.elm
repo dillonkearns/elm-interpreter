@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, normalizeSummaries, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithValuesAndMemoizedFunctions, extendWithFiles, extendWithFilesNormalized, fileModuleName, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, replaceModuleInEnv, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -401,7 +401,7 @@ normalizeTopLevelConstants summaries initialFunctions sharedImports =
 
                                 normalized : FunctionImplementation
                                 normalized =
-                                    if List.isEmpty funcImpl.arguments then
+                                    if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
                                         tryNormalizeConstant
                                             summary.moduleName
                                             moduleKey
@@ -1872,6 +1872,291 @@ extendWithFiles (ProjectEnv projectEnv) additionalFiles =
                     , allInterfaces = allInterfaces
                     }
             )
+
+
+{-| Like `extendWithFiles`, but also runs the top-level-constant normalization
+pass on the newly-added user modules. The existing package functions inside
+the incoming `ProjectEnv` act as fixed context (they're already normalized
+from the package summary cache), so user constants that reference package
+values like `Fuzz.Float.exponentMapping` get to see the fast form during
+their own pre-evaluation.
+
+The implementation does `extendWithFiles` first to get a complete env, then
+post-hoc rewrites the user modules' function bodies in place by walking the
+freshly-added modules and running `tryNormalizeConstant` on each zero-arg
+function. Package bodies are left untouched.
+-}
+extendWithFilesNormalized : ProjectEnv -> List File -> Result Error ProjectEnv
+extendWithFilesNormalized projectEnv additionalFiles =
+    extendWithFiles projectEnv additionalFiles
+        |> Result.map
+            (\extendedProjectEnv ->
+                let
+                    userModuleNames : List ModuleName
+                    userModuleNames =
+                        additionalFiles |> List.map fileModuleName
+                in
+                normalizeUserModulesInEnv userModuleNames extendedProjectEnv
+            )
+
+
+{-| Check whether a function body is worth trying to normalize. Functions that
+obviously produce a `Test`, `Fuzzer`, `Expectation`, or other closure-carrying
+value would only succeed at evaluation to be rejected by `isLosslessValue`,
+which wastes the eval cycles. Detect that statically by looking for any
+reference to a blocklisted module inside the expression.
+
+We don't try to be clever here — the goal is to avoid obviously-wasted eval
+work on test-heavy files, not to perfectly classify every possible expression.
+-}
+isNormalizationCandidate : Node Expression -> Bool
+isNormalizationCandidate (Node.Node _ expr) =
+    not (expressionReferencesBlocklisted expr)
+
+
+expressionReferencesBlocklisted : Expression -> Bool
+expressionReferencesBlocklisted expr =
+    case expr of
+        FunctionOrValue moduleName _ ->
+            moduleIsBlocklisted moduleName
+
+        Application children ->
+            List.any isBlocklistedNode children
+
+        OperatorApplication _ _ l r ->
+            isBlocklistedNode l || isBlocklistedNode r
+
+        IfBlock c t f ->
+            isBlocklistedNode c || isBlocklistedNode t || isBlocklistedNode f
+
+        PrefixOperator _ ->
+            False
+
+        Operator _ ->
+            False
+
+        Integer _ ->
+            False
+
+        Hex _ ->
+            False
+
+        Floatable _ ->
+            False
+
+        Negation inner ->
+            isBlocklistedNode inner
+
+        Literal _ ->
+            False
+
+        CharLiteral _ ->
+            False
+
+        TupledExpression children ->
+            List.any isBlocklistedNode children
+
+        ParenthesizedExpression inner ->
+            isBlocklistedNode inner
+
+        LetExpression { declarations, expression } ->
+            isBlocklistedNode expression
+                || List.any (\(Node.Node _ decl) -> letDeclarationIsBlocklisted decl) declarations
+
+        CaseExpression { expression, cases } ->
+            isBlocklistedNode expression
+                || List.any (\( _, body ) -> isBlocklistedNode body) cases
+
+        LambdaExpression { expression } ->
+            isBlocklistedNode expression
+
+        RecordExpr setters ->
+            List.any (\(Node.Node _ ( _, value )) -> isBlocklistedNode value) setters
+
+        ListExpr children ->
+            List.any isBlocklistedNode children
+
+        RecordAccess record _ ->
+            isBlocklistedNode record
+
+        RecordAccessFunction _ ->
+            False
+
+        RecordUpdateExpression _ setters ->
+            List.any (\(Node.Node _ ( _, value )) -> isBlocklistedNode value) setters
+
+        GLSLExpression _ ->
+            False
+
+        UnitExpr ->
+            False
+
+
+isBlocklistedNode : Node Expression -> Bool
+isBlocklistedNode (Node.Node _ expr) =
+    expressionReferencesBlocklisted expr
+
+
+letDeclarationIsBlocklisted : Elm.Syntax.Expression.LetDeclaration -> Bool
+letDeclarationIsBlocklisted decl =
+    case decl of
+        Elm.Syntax.Expression.LetFunction { declaration } ->
+            let
+                (Node.Node _ funcDecl) =
+                    declaration
+            in
+            isBlocklistedNode funcDecl.expression
+
+        Elm.Syntax.Expression.LetDestructuring _ expression ->
+            isBlocklistedNode expression
+
+
+{-| Modules whose output values can't round-trip through `Value.toExpression`
+(because they contain closures, opaque kernel types, or have runtime identity).
+We skip normalization for any zero-arg function whose body references any of
+them — the eval would only succeed long enough to produce a lossy value that
+`isLosslessValue` rejects.
+
+The list is conservative: over-blocking a pure constant wastes optimization
+potential but is always safe; under-blocking wastes eval cycles during
+normalization.
+-}
+moduleIsBlocklisted : ModuleName -> Bool
+moduleIsBlocklisted moduleName =
+    case moduleName of
+        -- Test framework: Test/Fuzz/Expect values are closures over test bodies
+        "Test" :: _ ->
+            True
+
+        "Fuzz" :: _ ->
+            True
+
+        "Expect" :: _ ->
+            True
+
+        -- JSON: Decoders are opaque closures; Encoder Values are JsonVal which
+        -- is round-trippable but often built from opaque package-level ones
+        "Json" :: "Decode" :: _ ->
+            True
+
+        "Json" :: "Encode" :: _ ->
+            True
+
+        -- Regex: RegexValue wraps a JS regex object with no AST representation
+        "Regex" :: _ ->
+            True
+
+        -- View/rendering: closures and virtual-DOM node chains
+        "Html" :: _ ->
+            True
+
+        "Svg" :: _ ->
+            True
+
+        "Browser" :: _ ->
+            True
+
+        "Url" :: "Parser" :: _ ->
+            True
+
+        -- Ports, cmds, tasks: all closure-typed effect values
+        "Cmd" :: _ ->
+            True
+
+        "Sub" :: _ ->
+            True
+
+        "Task" :: _ ->
+            True
+
+        "Process" :: _ ->
+            True
+
+        "Platform" :: _ ->
+            True
+
+        _ ->
+            False
+
+
+{-| Rewrite the bodies of zero-arg functions in the specified user modules by
+running `tryNormalizeConstant` against the current `ProjectEnv`'s function
+dict. Package modules and modules not listed are left completely unchanged.
+-}
+normalizeUserModulesInEnv : List ModuleName -> ProjectEnv -> ProjectEnv
+normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
+    let
+        env : Env
+        env =
+            projectEnv.env
+
+        sharedImports : Dict.Dict String ImportedNames
+        sharedImports =
+            env.shared.moduleImports
+
+        updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        updatedFunctions =
+            List.foldl
+                (\moduleName currentFunctions ->
+                    let
+                        moduleKey : String
+                        moduleKey =
+                            Environment.moduleKey moduleName
+
+                        moduleImports : ImportedNames
+                        moduleImports =
+                            Dict.get moduleKey sharedImports
+                                |> Maybe.withDefault emptyImports
+
+                        originalModuleFns : Dict.Dict String FunctionImplementation
+                        originalModuleFns =
+                            Dict.get moduleKey currentFunctions
+                                |> Maybe.withDefault Dict.empty
+
+                        normalizedModuleFns : Dict.Dict String FunctionImplementation
+                        normalizedModuleFns =
+                            originalModuleFns
+                                |> Dict.foldl
+                                    (\name funcImpl acc ->
+                                        let
+                                            newFunc : FunctionImplementation
+                                            newFunc =
+                                                if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
+                                                    tryNormalizeConstant
+                                                        moduleName
+                                                        moduleKey
+                                                        moduleImports
+                                                        funcImpl
+                                                        -- In-progress fn dict
+                                                        -- (this module gets
+                                                        -- rebuilt as we go)
+                                                        (Dict.insert moduleKey acc currentFunctions)
+                                                        sharedImports
+                                                        |> Maybe.withDefault funcImpl
+
+                                                else
+                                                    funcImpl
+                                        in
+                                        Dict.insert name newFunc acc
+                                    )
+                                    Dict.empty
+                    in
+                    Dict.insert moduleKey normalizedModuleFns currentFunctions
+                )
+                env.shared.functions
+                moduleNames
+
+        newEnv : Env
+        newEnv =
+            { env
+                | shared =
+                    { functions = updatedFunctions
+                    , moduleImports = env.shared.moduleImports
+                    }
+            }
+    in
+    ProjectEnv
+        { projectEnv | env = newEnv }
 
 
 {-| Like `evalWithEnv`, but returns trace information (call tree + log lines)
