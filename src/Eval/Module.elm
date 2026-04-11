@@ -614,10 +614,11 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
                     loop (remaining - 1) result.fns result.delta result.precomputed
     in
     -- Cap at a small number of passes to bound worst-case time. For any
-    -- realistic module this converges in 1-2 passes (the second pass picks
+    -- realistic module this converges in 1-2 passes: the second pass picks
     -- up constants whose alphabetical order placed them before their own
-    -- dependencies).
-    loop 4 originalModuleFns Dict.empty originalPrecomputedFns
+    -- dependencies. The third pass is an "all done" check that short-circuits
+    -- when no progress was made in the previous one.
+    loop 3 originalModuleFns Dict.empty originalPrecomputedFns
 
 
 {-| Determine whether a `Value` can be losslessly round-tripped through
