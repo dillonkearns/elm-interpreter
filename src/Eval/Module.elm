@@ -774,16 +774,49 @@ buildProjectEnvFromSummaries summaries =
                     )
                     coreFunctions
 
+        {- The default ImportedNames every module implicitly gets
+           via `defaultImports` (Basics exposing (..), Maybe, Result,
+           etc.). We use this as the baseline for core package
+           modules that aren't in `summaries` — otherwise
+           `delegateByName` and `callModuleFn` would fall through
+           to `baseEnv.imports = emptyImports` when dispatching a
+           core-module function like `Parser.Advanced.run`, and the
+           first unqualified reference inside that module's body
+           (e.g. `identity`, `not`) would hit a `NameError`.
+
+           User modules override this via their `summary.importedNames`
+           which already folds `defaultImports` into the full
+           resolution — so for user modules the override is a strict
+           superset of the core-default baseline.
+        -}
+        defaultCoreImportedNames : ImportedNames
+        defaultCoreImportedNames =
+            defaultImports
+                |> List.foldl (processImport allInterfaces) emptyImports
+
+        coreModuleImports : Dict.Dict String ImportedNames
+        coreModuleImports =
+            Core.functions
+                |> Dict.foldl
+                    (\coreModuleName _ acc ->
+                        Dict.insert
+                            (Environment.moduleKey coreModuleName)
+                            defaultCoreImportedNames
+                            acc
+                    )
+                    Dict.empty
+
         sharedModuleImports : Dict.Dict String ImportedNames
         sharedModuleImports =
             summaries
-                |> List.map
-                    (\summary ->
-                        ( Environment.moduleKey summary.moduleName
-                        , summary.importedNames
-                        )
+                |> List.foldl
+                    (\summary acc ->
+                        Dict.insert
+                            (Environment.moduleKey summary.moduleName)
+                            summary.importedNames
+                            acc
                     )
-                |> Dict.fromList
+                    coreModuleImports
 
         env : Env
         env =
