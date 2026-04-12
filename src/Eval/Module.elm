@@ -243,7 +243,6 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                 renv : RE.REnv
                 renv =
                     { locals = []
-                    , globals = Dict.empty
                     , resolvedBodies = projectEnv.resolved.bodies
                     , globalIdToName = projectEnv.resolved.globalIdToName
                     , nativeDispatchers = projectEnv.resolved.nativeDispatchers
@@ -3556,7 +3555,6 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                 bridgeRenv : RE.REnv
                                 bridgeRenv =
                                     { locals = bodyLocals
-                                    , globals = Dict.empty
                                     , resolvedBodies = mergedBodies
                                     , globalIdToName = mergedGlobalIdToName
                                     , nativeDispatchers = baseResolved.nativeDispatchers
@@ -3641,7 +3639,6 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                         renv : RE.REnv
                         renv =
                             { locals = []
-                            , globals = Dict.empty
                             , resolvedBodies = mergedBodies
                             , globalIdToName = mergedGlobalIdToName
                             , nativeDispatchers = baseResolved.nativeDispatchers

@@ -82,7 +82,6 @@ eventual tracing integration, matching the fields on the existing
 -}
 type alias REnv =
     { locals : List Value
-    , globals : FastDict.Dict IR.GlobalId Value
     , resolvedBodies : FastDict.Dict IR.GlobalId RExpr
     , globalIdToName : FastDict.Dict IR.GlobalId ( ModuleName, String )
     , nativeDispatchers : FastDict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
@@ -138,7 +137,6 @@ core dispatch build their own `REnv` with a real project env.
 emptyREnv : REnv
 emptyREnv =
     { locals = []
-    , globals = FastDict.empty
     , resolvedBodies = FastDict.empty
     , globalIdToName = FastDict.empty
     , nativeDispatchers = FastDict.empty
@@ -754,63 +752,58 @@ dispatchGlobalApplyStep staticEnv locals id argValues =
             rBase (dispatchGlobalApply (envWithLocals staticEnv locals) id argValues)
 
         Nothing ->
-            case FastDict.get id staticEnv.globals of
-                Just cached ->
-                    rBase (applyClosure (envWithLocals staticEnv locals) cached argValues)
+            case FastDict.get id staticEnv.resolvedBodies of
+                Just (RLambda lambda) ->
+                    {- Shortcut: the resolved body is an RLambda,
+                       and we have the args in hand. The normal
+                       path would be `evalR body` → PA →
+                       `applyClosure env PA argValues` →
+                       `runRExprClosure` → `evalR inner.body` with
+                       locals = args. That chain has two fresh
+                       `evalR` calls, each starting its own
+                       `runRecursion` and blowing the JS stack on
+                       deep recursion.
+
+                       Instead, when arg count matches arity, we
+                       skip the PA round-trip and `recurse`
+                       directly into `lambda.body` with the args
+                       bound as locals. This keeps the trampoline
+                       iterative across cross-body calls, which
+                       is exactly the point of the refactor.
+                    -}
+                    let
+                        argCount : Int
+                        argCount =
+                            List.length argValues
+                    in
+                    if argCount == lambda.arity then
+                        let
+                            bodyLocals : List Value
+                            bodyLocals =
+                                List.foldl (::) [] argValues
+                        in
+                        rTail ( bodyLocals, lambda.body )
+
+                    else
+                        -- Partial / over-application: fall back
+                        -- to the direct path, which handles both
+                        -- cases correctly via `applyClosure`.
+                        rBase (dispatchGlobalApplyNoIntercept (envWithLocals staticEnv locals) id argValues)
+
+                Just body ->
+                    rRecThen ( [], body )
+                        (\headResult ->
+                            case headResult of
+                                EvOk headValue ->
+                                    rBase
+                                        (applyClosure (envWithLocals staticEnv locals) headValue argValues)
+
+                                _ ->
+                                    rBase headResult
+                        )
 
                 Nothing ->
-                    case FastDict.get id staticEnv.resolvedBodies of
-                        Just (RLambda lambda) ->
-                            {- Shortcut: the resolved body is an RLambda,
-                               and we have the args in hand. The normal
-                               path would be `evalR body` → PA →
-                               `applyClosure env PA argValues` →
-                               `runRExprClosure` → `evalR inner.body` with
-                               locals = args. That chain has two fresh
-                               `evalR` calls, each starting its own
-                               `runRecursion` and blowing the JS stack on
-                               deep recursion.
-
-                               Instead, when arg count matches arity, we
-                               skip the PA round-trip and `recurse`
-                               directly into `lambda.body` with the args
-                               bound as locals. This keeps the trampoline
-                               iterative across cross-body calls, which
-                               is exactly the point of the refactor.
-                            -}
-                            let
-                                argCount : Int
-                                argCount =
-                                    List.length argValues
-                            in
-                            if argCount == lambda.arity then
-                                let
-                                    bodyLocals : List Value
-                                    bodyLocals =
-                                        List.foldl (::) [] argValues
-                                in
-                                rTail ( bodyLocals, lambda.body )
-
-                            else
-                                -- Partial / over-application: fall back
-                                -- to the direct path, which handles both
-                                -- cases correctly via `applyClosure`.
-                                rBase (dispatchGlobalApplyNoIntercept (envWithLocals staticEnv locals) id argValues)
-
-                        Just body ->
-                            rRecThen ( [], body )
-                                (\headResult ->
-                                    case headResult of
-                                        EvOk headValue ->
-                                            rBase
-                                                (applyClosure (envWithLocals staticEnv locals) headValue argValues)
-
-                                        _ ->
-                                            rBase headResult
-                                )
-
-                        Nothing ->
-                            rBase (fallbackDispatch (envWithLocals staticEnv locals) id argValues)
+                    rBase (fallbackDispatch (envWithLocals staticEnv locals) id argValues)
 
 
 {-| Rec-aware `evalGlobal`. Zero-arg top-level references dispatch
@@ -823,17 +816,12 @@ evalGlobalStep :
     -> IR.GlobalId
     -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
 evalGlobalStep staticEnv locals id =
-    case FastDict.get id staticEnv.globals of
-        Just cached ->
-            rBase (EvOk cached)
+    case FastDict.get id staticEnv.resolvedBodies of
+        Just body ->
+            rTail ( [], body )
 
         Nothing ->
-            case FastDict.get id staticEnv.resolvedBodies of
-                Just body ->
-                    rTail ( [], body )
-
-                Nothing ->
-                    rBase (delegateCoreApply (envWithLocals staticEnv locals) id [])
+            rBase (delegateCoreApply (envWithLocals staticEnv locals) id [])
 
 
 {-| Fallback dispatch — native, higher-order, or old-evaluator delegation.
@@ -1434,41 +1422,35 @@ body. This matches how the string-keyed evaluator populates
 `currentModuleFunctions` / `letFunctions` for calls into top-level
 declarations.
 
-Memoized top-levels (`env.globals`) are checked before the body is
-evaluated; a hit returns immediately. Iteration 3b3 does NOT write to
-`env.globals` after a miss — threading cache updates through the
-`EvalResult` stream requires the same plumbing the memoization system
-already uses, and that's deferred until we wire the `useResolvedIR`
-flag into `Eval.Module`'s actual entry points in a later iteration.
+The `globals` memoization cache that earlier iterations checked here
+was never populated — the plumbing to thread cache updates through the
+`EvalResult` stream was deferred and then removed. If memoization of
+resolved-IR top-levels becomes desirable, it needs to be re-added with
+actual write sites, not a dead read.
 
 -}
 evalGlobal : REnv -> IR.GlobalId -> EvalResult Value
 evalGlobal env id =
-    case FastDict.get id env.globals of
-        Just cached ->
-            EvOk cached
+    case FastDict.get id env.resolvedBodies of
+        Just body ->
+            if env.callDepth >= evalRCallDepthBudget then
+                -- See `dispatchGlobalApplyNoIntercept` for why.
+                delegateCoreApply env id []
+
+            else
+                let
+                    topLevelEnv : REnv
+                    topLevelEnv =
+                        { env | locals = [] }
+                in
+                evalR topLevelEnv body
 
         Nothing ->
-            case FastDict.get id env.resolvedBodies of
-                Just body ->
-                    if env.callDepth >= evalRCallDepthBudget then
-                        -- See `dispatchGlobalApplyNoIntercept` for why.
-                        delegateCoreApply env id []
-
-                    else
-                        let
-                            topLevelEnv : REnv
-                            topLevelEnv =
-                                { env | locals = [] }
-                        in
-                        evalR topLevelEnv body
-
-                Nothing ->
-                    -- Core declaration — delegate a zero-arg reference to
-                    -- the old evaluator. Used for things like `Basics.pi`
-                    -- (a value, not a function) and for taking a core
-                    -- function reference without immediately applying it.
-                    delegateCoreApply env id []
+            -- Core declaration — delegate a zero-arg reference to
+            -- the old evaluator. Used for things like `Basics.pi`
+            -- (a value, not a function) and for taking a core
+            -- function reference without immediately applying it.
+            delegateCoreApply env id []
 
 
 {-| Dispatch an RGlobal being called with the given (already-evaluated)
@@ -1477,14 +1459,12 @@ argument Values. Order of precedence:
 1. **Intercepts.** If the GlobalId has a registered intercept, call its
    callback with the args + fallback Config/Env. Matches the old
    evaluator's intercept check in `Eval.Expression` around line 1892.
-2. **Cached globals.** If the global value is memoized in `env.globals`
-   (e.g., a top-level arity-0 value), apply args to that value.
-3. **User declarations.** If the global has an `RExpr` body in
+2. **User declarations.** If the global has an `RExpr` body in
    `env.resolvedBodies`, evaluate it to a Value (which produces a
    closure for arity > 0) and apply args.
-4. **Native dispatch.** Hot operators like `+`, `-`, `==` go directly
+3. **Native dispatch.** Hot operators like `+`, `-`, `==` go directly
    through `NativeDispatch.tryDispatch`.
-5. **Delegation fallback.** Synthesize a Core call and hand it to the
+4. **Delegation fallback.** Synthesize a Core call and hand it to the
    old evaluator.
 
 The intercept check happens **first** because intercepts are how the
@@ -1520,59 +1500,54 @@ intercept-checked.
 -}
 dispatchGlobalApplyNoIntercept : REnv -> IR.GlobalId -> List Value -> EvalResult Value
 dispatchGlobalApplyNoIntercept env id argValues =
-    case FastDict.get id env.globals of
-        Just cached ->
-            applyClosure env cached argValues
+    case FastDict.get id env.resolvedBodies of
+        Just body ->
+            {- Depth-budget fallback: `evalR` is direct-style and
+               blows the JS stack on deeply-nested real Elm code.
+               Before we run a resolved body, check how deep the
+               call chain is; if it's past the budget, hand off
+               to the old evaluator whose trampolined `call`
+               machinery handles arbitrary depth. The old
+               evaluator's `ResolveBridge` closes the loop in
+               the other direction.
+            -}
+            if env.callDepth >= evalRCallDepthBudget then
+                case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
+                    Just result ->
+                        EvOk result
 
-        Nothing ->
-            case FastDict.get id env.resolvedBodies of
-                Just body ->
-                    {- Depth-budget fallback: `evalR` is direct-style and
-                       blows the JS stack on deeply-nested real Elm code.
-                       Before we run a resolved body, check how deep the
-                       call chain is; if it's past the budget, hand off
-                       to the old evaluator whose trampolined `call`
-                       machinery handles arbitrary depth. The old
-                       evaluator's `ResolveBridge` closes the loop in
-                       the other direction.
-                    -}
-                    if env.callDepth >= evalRCallDepthBudget then
-                        case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
+                    Nothing ->
+                        case tryHigherOrderDispatch env id argValues of
                             Just result ->
-                                EvOk result
+                                result
 
                             Nothing ->
-                                case tryHigherOrderDispatch env id argValues of
-                                    Just result ->
-                                        result
+                                delegateCoreApply env id argValues
 
-                                    Nothing ->
-                                        delegateCoreApply env id argValues
+            else
+                let
+                    topLevelEnv : REnv
+                    topLevelEnv =
+                        { env | locals = [] }
+                in
+                evalR topLevelEnv body
+                    |> andThenValue
+                        (\headValue ->
+                            applyClosure env headValue argValues
+                        )
 
-                    else
-                        let
-                            topLevelEnv : REnv
-                            topLevelEnv =
-                                { env | locals = [] }
-                        in
-                        evalR topLevelEnv body
-                            |> andThenValue
-                                (\headValue ->
-                                    applyClosure env headValue argValues
-                                )
+        Nothing ->
+            case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
+                Just result ->
+                    EvOk result
 
                 Nothing ->
-                    case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
+                    case tryHigherOrderDispatch env id argValues of
                         Just result ->
-                            EvOk result
+                            result
 
                         Nothing ->
-                            case tryHigherOrderDispatch env id argValues of
-                                Just result ->
-                                    result
-
-                                Nothing ->
-                                    delegateCoreApply env id argValues
+                            delegateCoreApply env id argValues
 
 
 {-| Soft stack budget for `evalR`'s direct-style recursion. When a
