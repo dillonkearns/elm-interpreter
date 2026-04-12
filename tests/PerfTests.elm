@@ -14,6 +14,50 @@ suite =
         [ listEqualityTests
         , tcoCorrectnessTests
         , tcoProofTests
+        , largeListTailRecursionTests
+        ]
+
+
+{-| Regression: tail-recursive iteration over large lists was O(n²) because
+`sizeOfValue (List items) = List.length items` ran on every cycle-check
+(every 16 iterations). For a 1M-element list shrinking by 1 each iteration,
+total sizeOfValue cost was ~31 billion node traversals.
+
+These tests verify that iterating over large lists completes in bounded time
+(i.e. the cycle-check cost is O(1) per check, not O(listLen)).
+-}
+largeListTailRecursionTests : Test
+largeListTailRecursionTests =
+    describe "large list tail-recursion (sizeOfValue regression)"
+        [ test "walk 100K-element list in bounded time" <|
+            \_ ->
+                Eval.Module.eval
+                    (String.join "\n"
+                        [ "module T exposing (main)"
+                        , "walk xs = case xs of"
+                        , "    [] -> 0"
+                        , "    _ :: rest -> walk rest"
+                        , "main = walk (List.repeat 100000 1)"
+                        ]
+                    )
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 0))
+        , test "isInfixOf-like pattern on 100K list" <|
+            \_ ->
+                Eval.Module.eval
+                    (String.join "\n"
+                        [ "module T exposing (main)"
+                        , "check needle haystack ="
+                        , "    case haystack of"
+                        , "        [] -> False"
+                        , "        x :: xs ->"
+                        , "            if x == needle then True"
+                        , "            else check needle xs"
+                        , "main = check 999 (List.repeat 100000 1)"
+                        ]
+                    )
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Bool False))
         ]
 
 

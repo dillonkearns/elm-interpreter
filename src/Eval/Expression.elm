@@ -60,15 +60,6 @@ fingerprintValue value =
             7
 
         List items ->
-            -- Use exact length (not just a size bucket) so successive TCO
-            -- loop iterations over a uniform list — e.g.
-            -- `List.Extra.transpose [ List.repeat 10000 1 ]` where every
-            -- element and the head value are identical, so a head-based
-            -- fingerprint can't distinguish iteration 16 from iteration 32 —
-            -- still produce different fingerprints as elements are peeled
-            -- off. Only runs every `tcoCycleCheckInterval` iterations, so
-            -- the O(n) cost is amortized and worth paying to eliminate the
-            -- false-positive "infinite recursion detected" on long lists.
             List.length items * 53 + 8
 
         Tuple a _ ->
@@ -137,10 +128,6 @@ sizeOfValue : Value -> Int
 sizeOfValue value =
     case value of
         List items ->
-            -- Use exact length (not a bucket) so Category B's size-growth
-            -- check can distinguish "accumulator grows by 1 per iteration"
-            -- from "stable size" on long lists. Only called every
-            -- `tcoCycleCheckInterval` iterations, so O(n) is amortized.
             List.length items
 
         String _ ->
@@ -171,6 +158,25 @@ sizeOfValue value =
 
         _ ->
             1
+
+
+boundedListLength : Int -> List a -> Int
+boundedListLength cap items =
+    boundedListLengthHelp cap 0 items
+
+
+boundedListLengthHelp : Int -> Int -> List a -> Int
+boundedListLengthHelp cap count items =
+    if count >= cap then
+        cap
+
+    else
+        case items of
+            [] ->
+                count
+
+            _ :: rest ->
+                boundedListLengthHelp cap (count + 1) rest
 
 
 shallowListBucket : List a -> Int
@@ -2405,22 +2411,11 @@ tcoLoop funcName body remaining cfg env =
             , useResolvedIR = cfg.useResolvedIR
             }
     in
-    tcoLoopHelp funcName body remaining 0 0 0 0 innerCfg cfg env
+    tcoLoopHelp funcName body remaining 0 16 0 0 0 innerCfg cfg env
 
 
-{-| Only run the expensive cycle-detection fingerprinting once per
-`tcoCycleCheckInterval` iterations. Infinite recursion will still be
-caught, just `interval` steps later than it would otherwise — a tradeoff
-that's well worth it when the loop body does lots of interpreted work
-per iteration (e.g. List.foldl building up a Dict/Set).
--}
-tcoCycleCheckInterval : Int
-tcoCycleCheckInterval =
-    16
-
-
-tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value
-tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env =
+tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value
+tcoLoopHelp funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env =
     if remaining <= 0 then
         EvErr
             { currentModule = env.currentModule
@@ -2437,30 +2432,28 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
             EvYield tag payload resume ->
                 EvYield tag payload
                     (\resumeValue ->
-                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
+                        tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
                     )
 
             EvMemoLookup payload resume ->
                 EvMemoLookup payload
                     (\maybeValue ->
-                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
+                        tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
                     )
 
             EvMemoStore payload next ->
                 EvMemoStore payload
-                    (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env next)
+                    (tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env next)
 
             _ ->
                 case tcoExtractTailCall result of
                     Just newValues ->
-                        -- Got a TailCall signal. Cheap per-iteration bookkeeping:
-                        -- increment iterationsSinceCheck. Only run full fingerprinting
-                        -- every tcoCycleCheckInterval iterations.
-                        if iterationsSinceCheck + 1 < tcoCycleCheckInterval then
+                        if iterationsSinceCheck + 1 < currentInterval then
                             tcoLoopHelp funcName
                                 body
                                 (remaining - 1)
                                 (iterationsSinceCheck + 1)
+                                currentInterval
                                 lastSize
                                 growCount
                                 lastFingerprint
@@ -2541,11 +2534,19 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
                                     }
 
                             else
-                                -- Continue loop, reset iterationsSinceCheck
+                                let
+                                    nextInterval =
+                                        if newGrowCount == 0 then
+                                            min (currentInterval * 2) 65536
+
+                                        else
+                                            max 16 (currentInterval // 2)
+                                in
                                 tcoLoopHelp funcName
                                     body
                                     (remaining - 1)
                                     0
+                                    nextInterval
                                     newSize
                                     newGrowCount
                                     newFingerprint
@@ -2558,35 +2559,33 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
                         result
 
 
-tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value -> EvalResult Value
-tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env result =
+tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value -> EvalResult Value
+tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env result =
     case result of
         EvYield tag payload resume ->
             EvYield tag payload
                 (\resumeValue ->
-                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
+                    tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
                 )
 
         EvMemoLookup payload resume ->
             EvMemoLookup payload
                 (\maybeValue ->
-                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
+                    tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
                 )
 
         EvMemoStore payload next ->
             EvMemoStore payload
-                (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env next)
+                (tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env next)
 
         _ ->
             case tcoExtractTailCall result of
                 Just newValues ->
-                    -- Force a full cycle check on the iteration following a
-                    -- resume from yield/memo, so suspended state still gets
-                    -- validated periodically.
                     tcoLoopHelp funcName
                         body
                         (remaining - 1)
-                        tcoCycleCheckInterval
+                        currentInterval
+                        currentInterval
                         lastSize
                         growCount
                         lastFingerprint
