@@ -398,12 +398,65 @@ evalRStep staticEnv locals expr =
                     rTail ( newLocals, letBody )
                 )
 
+        -- Trivial cases handled inline to avoid the `envWithLocals`
+        -- record copy that the fallback path would pay. These are
+        -- the most frequent RExpr constructors after RApply/RIf/RCase.
+        RInt i ->
+            rBase (EvOk (Int i))
+
+        RFloat f ->
+            rBase (EvOk (Float f))
+
+        RString s ->
+            rBase (EvOk (String s))
+
+        RChar c ->
+            rBase (EvOk (Char c))
+
+        RUnit ->
+            rBase (EvOk Unit)
+
+        RLocal i ->
+            case List.drop i locals of
+                value :: _ ->
+                    rBase (EvOk value)
+
+                [] ->
+                    rBase
+                        (evErr (envWithLocals staticEnv locals)
+                            (TypeError
+                                ("RLocal "
+                                    ++ String.fromInt i
+                                    ++ " out of bounds (locals has "
+                                    ++ String.fromInt (List.length locals)
+                                    ++ " slots)"
+                                )
+                            )
+                        )
+
+        RLambda lambda ->
+            rBase (EvOk (makeClosure (envWithLocals staticEnv locals) lambda.arity lambda.body 0 Nothing))
+
+        RCtor ref ->
+            rBase (evalConstructor ref)
+
+        RRecordAccessFunction fieldName ->
+            rBase
+                (EvOk
+                    (makeClosure
+                        { staticEnv | locals = [] }
+                        1
+                        (RRecordAccess (RLocal 0) fieldName)
+                        0
+                        Nothing
+                    )
+                )
+
         _ ->
-            -- Fallback: for every case not explicitly trampolined,
-            -- use the direct evaluator. These cases don't typically
-            -- sit on the hot recursion path — literals, RLocal,
-            -- RLambda, RRecord, RCtor, etc. are all bounded by their
-            -- body's structure, not by recursion depth.
+            -- Remaining complex cases: RNegate, RList, RTuple2/3,
+            -- RRecord, RRecordAccess, RRecordUpdate, RAnd, ROr, RGLSL.
+            -- These are bounded by body structure, not recursion
+            -- depth, so the envWithLocals copy is acceptable.
             rBase (evalRDirect (envWithLocals staticEnv locals) expr)
 
 
