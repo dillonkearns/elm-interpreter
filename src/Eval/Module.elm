@@ -10,7 +10,7 @@ import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
 import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation, LetDeclaration(..))
 import Elm.Syntax.Import
-import Elm.Syntax.Pattern
+import Elm.Syntax.Pattern exposing (Pattern(..))
 import Elm.Syntax.Range exposing (Range)
 import Elm.Syntax.Type
 import Elm.Syntax.TypeAlias exposing (TypeAlias)
@@ -29,6 +29,7 @@ import FastDict as Dict
 import List.Extra
 import MemoRuntime
 import MemoSpec
+import NormalizationFlags
 import Result.MyExtra
 import Rope exposing (Rope)
 import Set exposing (Set)
@@ -1373,7 +1374,35 @@ foldConstantSubExpressions :
     -> Config
     -> Node Expression
     -> Node Expression
-foldConstantSubExpressions env cfg ((Node range expr) as node) =
+foldConstantSubExpressions env cfg node =
+    -- Default: none. The AST walk adds ~0.1s normalization cost without
+    -- measurable eval savings on core-extra. Enable via foldWithFlags
+    -- when targeting codebases with heavy constant expressions.
+    foldConstantSubExpressionsHelp 3 NormalizationFlags.none env cfg node
+
+
+foldWithFlags :
+    NormalizationFlags.NormalizationFlags
+    -> Env
+    -> Config
+    -> Node Expression
+    -> Node Expression
+foldWithFlags flags env cfg node =
+    foldConstantSubExpressionsHelp 3 flags env cfg node
+
+
+foldConstantSubExpressionsHelp :
+    Int
+    -> NormalizationFlags.NormalizationFlags
+    -> Env
+    -> Config
+    -> Node Expression
+    -> Node Expression
+foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
+    if depth <= 0 then
+        node
+
+    else
     let
         tryFold : Node Expression -> Node Expression
         tryFold foldedNode =
@@ -1433,17 +1462,17 @@ foldConstantSubExpressions env cfg ((Node range expr) as node) =
     in
     case expr of
         ListExpr items ->
-            Node range (ListExpr (List.map (foldConstantSubExpressions env cfg) items))
+            Node range (ListExpr (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
 
         TupledExpression items ->
-            Node range (TupledExpression (List.map (foldConstantSubExpressions env cfg) items))
+            Node range (TupledExpression (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
 
         RecordExpr fields ->
             Node range
                 (RecordExpr
                     (List.map
                         (\(Node fRange ( name, value )) ->
-                            Node fRange ( name, foldConstantSubExpressions env cfg value )
+                            Node fRange ( name, foldConstantSubExpressionsHelp depth flags env cfg value )
                         )
                         fields
                     )
@@ -1452,32 +1481,44 @@ foldConstantSubExpressions env cfg ((Node range expr) as node) =
         Application ((Node _ (FunctionOrValue moduleName funcName)) :: args) ->
             let
                 foldedArgs =
-                    List.map (foldConstantSubExpressions env cfg) args
+                    List.map (foldConstantSubExpressionsHelp depth flags env cfg) args
+
+                foldedNode =
+                    Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs))
             in
             if
-                List.all (\(Node _ e) -> isConstantLeaf e) foldedArgs
+                flags.foldConstantApplications
+                    && List.all (\(Node _ e) -> isConstantLeaf e) foldedArgs
                     && not (List.isEmpty foldedArgs)
             then
-                tryFold (Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs)))
+                tryFold foldedNode
+
+            else if flags.inlineFunctions then
+                case tryInlineFunction env moduleName funcName foldedArgs of
+                    Just inlinedExpr ->
+                        foldConstantSubExpressionsHelp (depth - 1) flags env cfg inlinedExpr
+
+                    Nothing ->
+                        foldedNode
 
             else
-                Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs))
+                foldedNode
 
         IfBlock cond thenBranch elseBranch ->
             Node range
                 (IfBlock
-                    (foldConstantSubExpressions env cfg cond)
-                    (foldConstantSubExpressions env cfg thenBranch)
-                    (foldConstantSubExpressions env cfg elseBranch)
+                    (foldConstantSubExpressionsHelp depth flags env cfg cond)
+                    (foldConstantSubExpressionsHelp depth flags env cfg thenBranch)
+                    (foldConstantSubExpressionsHelp depth flags env cfg elseBranch)
                 )
 
         CaseExpression { expression, cases } ->
             Node range
                 (CaseExpression
-                    { expression = foldConstantSubExpressions env cfg expression
+                    { expression = foldConstantSubExpressionsHelp depth flags env cfg expression
                     , cases =
                         List.map
-                            (\( pat, body ) -> ( pat, foldConstantSubExpressions env cfg body ))
+                            (\( pat, body ) -> ( pat, foldConstantSubExpressionsHelp depth flags env cfg body ))
                             cases
                     }
                 )
@@ -1500,28 +1541,28 @@ foldConstantSubExpressions env cfg ((Node range expr) as node) =
                                                         in
                                                         Node implRange
                                                             { impl
-                                                                | expression = foldConstantSubExpressions env cfg impl.expression
+                                                                | expression = foldConstantSubExpressionsHelp depth flags env cfg impl.expression
                                                             }
                                                 }
 
                                         LetDestructuring pat val ->
-                                            LetDestructuring pat (foldConstantSubExpressions env cfg val)
+                                            LetDestructuring pat (foldConstantSubExpressionsHelp depth flags env cfg val)
                                     )
                             )
                             declarations
-                    , expression = foldConstantSubExpressions env cfg expression
+                    , expression = foldConstantSubExpressionsHelp depth flags env cfg expression
                     }
                 )
 
         OperatorApplication op dir left right ->
             let
                 foldedLeft =
-                    foldConstantSubExpressions env cfg left
+                    foldConstantSubExpressionsHelp depth flags env cfg left
 
                 foldedRight =
-                    foldConstantSubExpressions env cfg right
+                    foldConstantSubExpressionsHelp depth flags env cfg right
             in
-            if isConstantLeaf ((\(Node _ e) -> e) foldedLeft) && isConstantLeaf ((\(Node _ e) -> e) foldedRight) then
+            if flags.foldConstantApplications && isConstantLeaf ((\(Node _ e) -> e) foldedLeft) && isConstantLeaf ((\(Node _ e) -> e) foldedRight) then
                 tryFold (Node range (OperatorApplication op dir foldedLeft foldedRight))
 
             else
@@ -1530,7 +1571,7 @@ foldConstantSubExpressions env cfg ((Node range expr) as node) =
         Negation inner ->
             let
                 foldedInner =
-                    foldConstantSubExpressions env cfg inner
+                    foldConstantSubExpressionsHelp depth flags env cfg inner
             in
             if isConstantLeaf ((\(Node _ e) -> e) foldedInner) then
                 tryFold (Node range (Negation foldedInner))
@@ -1539,51 +1580,330 @@ foldConstantSubExpressions env cfg ((Node range expr) as node) =
                 Node range (Negation foldedInner)
 
         ParenthesizedExpression inner ->
-            Node range (ParenthesizedExpression (foldConstantSubExpressions env cfg inner))
+            Node range (ParenthesizedExpression (foldConstantSubExpressionsHelp depth flags env cfg inner))
 
         LambdaExpression lambda ->
             Node range
                 (LambdaExpression
-                    { lambda | expression = foldConstantSubExpressions env cfg lambda.expression }
+                    { lambda | expression = foldConstantSubExpressionsHelp depth flags env cfg lambda.expression }
                 )
 
         FunctionOrValue [] name ->
-            case Dict.get env.currentModuleKey env.shared.precomputedValues of
-                Just modulePrecomputed ->
-                    case Dict.get name modulePrecomputed of
-                        Just value ->
-                            if isLosslessValue value then
-                                Value.toExpression value
+            if not flags.inlinePrecomputedRefs then
+                node
 
-                            else
+            else
+                case Dict.get env.currentModuleKey env.shared.precomputedValues of
+                    Just modulePrecomputed ->
+                        case Dict.get name modulePrecomputed of
+                            Just value ->
+                                if isLosslessValue value then
+                                    Value.toExpression value
+
+                                else
+                                    node
+
+                            Nothing ->
                                 node
 
-                        Nothing ->
-                            node
-
-                Nothing ->
-                    node
+                    Nothing ->
+                        node
 
         FunctionOrValue ((_ :: _) as moduleName) name ->
-            let
-                qualifiedKey =
-                    Environment.moduleKey moduleName
-            in
-            case Dict.get qualifiedKey env.shared.precomputedValues of
-                Just modulePrecomputed ->
-                    case Dict.get name modulePrecomputed of
-                        Just value ->
-                            if isLosslessValue value then
-                                Value.toExpression value
+            if not flags.inlinePrecomputedRefs then
+                node
 
-                            else
+            else
+                let
+                    qualifiedKey =
+                        Environment.moduleKey moduleName
+                in
+                case Dict.get qualifiedKey env.shared.precomputedValues of
+                    Just modulePrecomputed ->
+                        case Dict.get name modulePrecomputed of
+                            Just value ->
+                                if isLosslessValue value then
+                                    Value.toExpression value
+
+                                else
+                                    node
+
+                            Nothing ->
                                 node
 
-                        Nothing ->
-                            node
+                    Nothing ->
+                        node
+
+        _ ->
+            node
+
+
+{-| Try to inline a small non-recursive function at a call site.
+For cross-module calls, qualifies unqualified refs in the inlined body
+with the source module name so they resolve correctly in the caller's context.
+-}
+tryInlineFunction : Env -> List String -> String -> List (Node Expression) -> Maybe (Node Expression)
+tryInlineFunction env moduleName funcName args =
+    let
+        sourceModuleKey =
+            if List.isEmpty moduleName then
+                env.currentModuleKey
+
+            else
+                Environment.moduleKey moduleName
+
+        sourceModuleName =
+            if List.isEmpty moduleName then
+                env.currentModule
+
+            else
+                moduleName
+
+        isCrossModule =
+            sourceModuleKey /= env.currentModuleKey
+
+        maybeFuncImpl =
+            Dict.get sourceModuleKey env.shared.functions
+                |> Maybe.andThen (Dict.get funcName)
+    in
+    case maybeFuncImpl of
+        Just funcImpl ->
+            if
+                List.length funcImpl.arguments == List.length args
+                    && not (containsSelfCallInExpr funcName funcImpl.expression)
+                    && expressionSize funcImpl.expression < 30
+            then
+                case extractVarPatternNames funcImpl.arguments of
+                    Just paramNames ->
+                        let
+                            substitution =
+                                List.map2 Tuple.pair paramNames args
+                                    |> Dict.fromList
+
+                            substituted =
+                                substituteVars substitution funcImpl.expression
+
+                            qualified =
+                                if isCrossModule then
+                                    qualifyUnqualifiedRefs sourceModuleName (paramNamesSet paramNames) substituted
+
+                                else
+                                    substituted
+                        in
+                        Just qualified
+
+                    Nothing ->
+                        Nothing
+
+            else
+                Nothing
+
+        Nothing ->
+            Nothing
+
+
+paramNamesSet : List String -> Set.Set String
+paramNamesSet names =
+    Set.fromList names
+
+
+extractVarPatternNames : List (Node Pattern) -> Maybe (List String)
+extractVarPatternNames patterns =
+    patterns
+        |> List.foldr
+            (\(Node _ pat) acc ->
+                case acc of
+                    Nothing ->
+                        Nothing
+
+                    Just names ->
+                        case pat of
+                            VarPattern name ->
+                                Just (name :: names)
+
+                            _ ->
+                                Nothing
+            )
+            (Just [])
+
+
+containsSelfCallInExpr : String -> Node Expression -> Bool
+containsSelfCallInExpr funcName (Node _ expr) =
+    case expr of
+        FunctionOrValue [] name ->
+            name == funcName
+
+        Application items ->
+            List.any (containsSelfCallInExpr funcName) items
+
+        OperatorApplication _ _ l r ->
+            containsSelfCallInExpr funcName l || containsSelfCallInExpr funcName r
+
+        IfBlock c t e ->
+            containsSelfCallInExpr funcName c || containsSelfCallInExpr funcName t || containsSelfCallInExpr funcName e
+
+        CaseExpression { expression, cases } ->
+            containsSelfCallInExpr funcName expression
+                || List.any (\( _, body ) -> containsSelfCallInExpr funcName body) cases
+
+        LetExpression { declarations, expression } ->
+            containsSelfCallInExpr funcName expression
+                || List.any
+                    (\(Node _ decl) ->
+                        case decl of
+                            LetFunction f ->
+                                containsSelfCallInExpr funcName (Node.value f.declaration).expression
+
+                            LetDestructuring _ val ->
+                                containsSelfCallInExpr funcName val
+                    )
+                    declarations
+
+        ListExpr items ->
+            List.any (containsSelfCallInExpr funcName) items
+
+        TupledExpression items ->
+            List.any (containsSelfCallInExpr funcName) items
+
+        ParenthesizedExpression inner ->
+            containsSelfCallInExpr funcName inner
+
+        Negation inner ->
+            containsSelfCallInExpr funcName inner
+
+        LambdaExpression { expression } ->
+            containsSelfCallInExpr funcName expression
+
+        RecordExpr fields ->
+            List.any (\(Node _ ( _, val )) -> containsSelfCallInExpr funcName val) fields
+
+        RecordAccess inner _ ->
+            containsSelfCallInExpr funcName inner
+
+        _ ->
+            False
+
+
+expressionSize : Node Expression -> Int
+expressionSize (Node _ expr) =
+    case expr of
+        Application items ->
+            1 + List.foldl (\item acc -> acc + expressionSize item) 0 items
+
+        OperatorApplication _ _ l r ->
+            1 + expressionSize l + expressionSize r
+
+        IfBlock c t e ->
+            1 + expressionSize c + expressionSize t + expressionSize e
+
+        CaseExpression { expression, cases } ->
+            1 + expressionSize expression + List.foldl (\( _, body ) acc -> acc + expressionSize body) 0 cases
+
+        LetExpression { expression } ->
+            5 + expressionSize expression
+
+        ListExpr items ->
+            1 + List.foldl (\item acc -> acc + expressionSize item) 0 items
+
+        TupledExpression items ->
+            1 + List.foldl (\item acc -> acc + expressionSize item) 0 items
+
+        LambdaExpression { expression } ->
+            2 + expressionSize expression
+
+        ParenthesizedExpression inner ->
+            expressionSize inner
+
+        _ ->
+            1
+
+
+substituteVars : Dict.Dict String (Node Expression) -> Node Expression -> Node Expression
+substituteVars subs ((Node range expr) as node) =
+    case expr of
+        FunctionOrValue [] name ->
+            case Dict.get name subs of
+                Just replacement ->
+                    replacement
 
                 Nothing ->
                     node
+
+        Application items ->
+            Node range (Application (List.map (substituteVars subs) items))
+
+        OperatorApplication op dir l r ->
+            Node range (OperatorApplication op dir (substituteVars subs l) (substituteVars subs r))
+
+        IfBlock c t e ->
+            Node range (IfBlock (substituteVars subs c) (substituteVars subs t) (substituteVars subs e))
+
+        CaseExpression { expression, cases } ->
+            Node range (CaseExpression { expression = substituteVars subs expression, cases = List.map (\( pat, body ) -> ( pat, substituteVars subs body )) cases })
+
+        ListExpr items ->
+            Node range (ListExpr (List.map (substituteVars subs) items))
+
+        TupledExpression items ->
+            Node range (TupledExpression (List.map (substituteVars subs) items))
+
+        ParenthesizedExpression inner ->
+            Node range (ParenthesizedExpression (substituteVars subs inner))
+
+        Negation inner ->
+            Node range (Negation (substituteVars subs inner))
+
+        LambdaExpression lambda ->
+            Node range (LambdaExpression { lambda | expression = substituteVars subs lambda.expression })
+
+        RecordExpr fields ->
+            Node range (RecordExpr (List.map (\(Node fRange ( name, val )) -> Node fRange ( name, substituteVars subs val )) fields))
+
+        RecordAccess inner field ->
+            Node range (RecordAccess (substituteVars subs inner) field)
+
+        _ ->
+            node
+
+
+{-| Qualify unqualified FunctionOrValue references with the source module name.
+Used when inlining cross-module: `helper x` in module A becomes `A.helper x`
+when inlined into module B. Skips parameter names (already substituted) and
+known constructors (uppercase initial).
+-}
+qualifyUnqualifiedRefs : List String -> Set.Set String -> Node Expression -> Node Expression
+qualifyUnqualifiedRefs sourceModule paramNames ((Node range expr) as node) =
+    case expr of
+        FunctionOrValue [] name ->
+            if Set.member name paramNames || Eval.Expression.isUpperName name || name == "True" || name == "False" then
+                node
+
+            else
+                Node range (FunctionOrValue sourceModule name)
+
+        Application items ->
+            Node range (Application (List.map (qualifyUnqualifiedRefs sourceModule paramNames) items))
+
+        OperatorApplication op dir l r ->
+            Node range (OperatorApplication op dir (qualifyUnqualifiedRefs sourceModule paramNames l) (qualifyUnqualifiedRefs sourceModule paramNames r))
+
+        IfBlock c t e ->
+            Node range (IfBlock (qualifyUnqualifiedRefs sourceModule paramNames c) (qualifyUnqualifiedRefs sourceModule paramNames t) (qualifyUnqualifiedRefs sourceModule paramNames e))
+
+        CaseExpression { expression, cases } ->
+            Node range (CaseExpression { expression = qualifyUnqualifiedRefs sourceModule paramNames expression, cases = List.map (\( pat, body ) -> ( pat, qualifyUnqualifiedRefs sourceModule paramNames body )) cases })
+
+        ListExpr items ->
+            Node range (ListExpr (List.map (qualifyUnqualifiedRefs sourceModule paramNames) items))
+
+        TupledExpression items ->
+            Node range (TupledExpression (List.map (qualifyUnqualifiedRefs sourceModule paramNames) items))
+
+        ParenthesizedExpression inner ->
+            Node range (ParenthesizedExpression (qualifyUnqualifiedRefs sourceModule paramNames inner))
+
+        LambdaExpression lambda ->
+            Node range (LambdaExpression { lambda | expression = qualifyUnqualifiedRefs sourceModule paramNames lambda.expression })
 
         _ ->
             node
