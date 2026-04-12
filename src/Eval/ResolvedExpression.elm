@@ -2411,7 +2411,16 @@ buildHigherOrderRegistry lookupId =
 higherOrderDispatcherList : List ( ModuleName, String, HigherOrderDispatcher )
 higherOrderDispatcherList =
     [ ( [ "List" ], "foldl", HigherOrderDispatcher foldlDispatcher )
+    , ( [ "List" ], "foldr", HigherOrderDispatcher foldrDispatcher )
+    , ( [ "List" ], "map", HigherOrderDispatcher listMapDispatcher )
+    , ( [ "List" ], "filter", HigherOrderDispatcher listFilterDispatcher )
+    , ( [ "List" ], "filterMap", HigherOrderDispatcher listFilterMapDispatcher )
+    , ( [ "List" ], "concatMap", HigherOrderDispatcher listConcatMapDispatcher )
+    , ( [ "List" ], "any", HigherOrderDispatcher listAnyDispatcher )
+    , ( [ "List" ], "all", HigherOrderDispatcher listAllDispatcher )
     , ( [ "Dict" ], "foldl", HigherOrderDispatcher dictFoldlDispatcher )
+    , ( [ "Dict" ], "foldr", HigherOrderDispatcher dictFoldrDispatcher )
+    , ( [ "Dict" ], "map", HigherOrderDispatcher dictMapDispatcher )
     ]
 
 
@@ -2525,3 +2534,378 @@ dictFoldlHelper env f acc node =
 
         _ ->
             EvOk acc
+
+
+{-| `List.foldr : (a -> b -> b) -> b -> List a -> b`
+Reverse the list, then foldl.
+-}
+foldrDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+foldrDispatcher env args =
+    case args of
+        [ f, init, List xs ] ->
+            Just (foldlHelper env f init (List.reverse xs))
+
+        _ ->
+            Nothing
+
+
+{-| `List.map : (a -> b) -> List a -> List b` -}
+listMapDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+listMapDispatcher env args =
+    case args of
+        [ f, List xs ] ->
+            Just (listMapHelper env f xs [])
+
+        _ ->
+            Nothing
+
+
+listMapHelper : REnv -> Value -> List Value -> List Value -> EvalResult Value
+listMapHelper env f remaining accRev =
+    case remaining of
+        [] ->
+            EvOk (List (List.reverse accRev))
+
+        x :: rest ->
+            case applyClosure env f [ x ] of
+                EvOk mapped ->
+                    listMapHelper env f rest (mapped :: accRev)
+
+                EvErr e ->
+                    EvErr e
+
+                otherResult ->
+                    andThenValue
+                        (\mapped -> listMapHelper env f rest (mapped :: accRev))
+                        otherResult
+
+
+{-| `List.filter : (a -> Bool) -> List a -> List a` -}
+listFilterDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+listFilterDispatcher env args =
+    case args of
+        [ pred, List xs ] ->
+            Just (listFilterHelper env pred xs [])
+
+        _ ->
+            Nothing
+
+
+listFilterHelper : REnv -> Value -> List Value -> List Value -> EvalResult Value
+listFilterHelper env pred remaining accRev =
+    case remaining of
+        [] ->
+            EvOk (List (List.reverse accRev))
+
+        x :: rest ->
+            case applyClosure env pred [ x ] of
+                EvOk (Bool True) ->
+                    listFilterHelper env pred rest (x :: accRev)
+
+                EvOk (Bool False) ->
+                    listFilterHelper env pred rest accRev
+
+                EvOk _ ->
+                    listFilterHelper env pred rest accRev
+
+                EvErr e ->
+                    EvErr e
+
+                otherResult ->
+                    andThenValue
+                        (\result ->
+                            case result of
+                                Bool True ->
+                                    listFilterHelper env pred rest (x :: accRev)
+
+                                _ ->
+                                    listFilterHelper env pred rest accRev
+                        )
+                        otherResult
+
+
+{-| `List.filterMap : (a -> Maybe b) -> List a -> List b` -}
+listFilterMapDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+listFilterMapDispatcher env args =
+    case args of
+        [ f, List xs ] ->
+            Just (listFilterMapHelper env f xs [])
+
+        _ ->
+            Nothing
+
+
+listFilterMapHelper : REnv -> Value -> List Value -> List Value -> EvalResult Value
+listFilterMapHelper env f remaining accRev =
+    case remaining of
+        [] ->
+            EvOk (List (List.reverse accRev))
+
+        x :: rest ->
+            case applyClosure env f [ x ] of
+                EvOk (Custom { name } [ value ]) ->
+                    if name == "Just" then
+                        listFilterMapHelper env f rest (value :: accRev)
+
+                    else
+                        listFilterMapHelper env f rest accRev
+
+                EvOk _ ->
+                    listFilterMapHelper env f rest accRev
+
+                EvErr e ->
+                    EvErr e
+
+                otherResult ->
+                    andThenValue
+                        (\result ->
+                            case result of
+                                Custom { name } [ value ] ->
+                                    if name == "Just" then
+                                        listFilterMapHelper env f rest (value :: accRev)
+
+                                    else
+                                        listFilterMapHelper env f rest accRev
+
+                                _ ->
+                                    listFilterMapHelper env f rest accRev
+                        )
+                        otherResult
+
+
+{-| `List.concatMap : (a -> List b) -> List a -> List b` -}
+listConcatMapDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+listConcatMapDispatcher env args =
+    case args of
+        [ f, List xs ] ->
+            Just (listConcatMapHelper env f xs [])
+
+        _ ->
+            Nothing
+
+
+listConcatMapHelper : REnv -> Value -> List Value -> List Value -> EvalResult Value
+listConcatMapHelper env f remaining accRev =
+    case remaining of
+        [] ->
+            EvOk (List (List.reverse accRev))
+
+        x :: rest ->
+            case applyClosure env f [ x ] of
+                EvOk (List mapped) ->
+                    listConcatMapHelper env f rest (List.foldl (::) accRev mapped)
+
+                EvOk _ ->
+                    listConcatMapHelper env f rest accRev
+
+                EvErr e ->
+                    EvErr e
+
+                otherResult ->
+                    andThenValue
+                        (\result ->
+                            case result of
+                                List mapped ->
+                                    listConcatMapHelper env f rest (List.foldl (::) accRev mapped)
+
+                                _ ->
+                                    listConcatMapHelper env f rest accRev
+                        )
+                        otherResult
+
+
+{-| `List.any : (a -> Bool) -> List a -> Bool` -}
+listAnyDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+listAnyDispatcher env args =
+    case args of
+        [ pred, List xs ] ->
+            Just (listAnyHelper env pred xs)
+
+        _ ->
+            Nothing
+
+
+listAnyHelper : REnv -> Value -> List Value -> EvalResult Value
+listAnyHelper env pred remaining =
+    case remaining of
+        [] ->
+            EvOk (Bool False)
+
+        x :: rest ->
+            case applyClosure env pred [ x ] of
+                EvOk (Bool True) ->
+                    EvOk (Bool True)
+
+                EvOk _ ->
+                    listAnyHelper env pred rest
+
+                EvErr e ->
+                    EvErr e
+
+                otherResult ->
+                    andThenValue
+                        (\result ->
+                            case result of
+                                Bool True ->
+                                    EvOk (Bool True)
+
+                                _ ->
+                                    listAnyHelper env pred rest
+                        )
+                        otherResult
+
+
+{-| `List.all : (a -> Bool) -> List a -> Bool` -}
+listAllDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+listAllDispatcher env args =
+    case args of
+        [ pred, List xs ] ->
+            Just (listAllHelper env pred xs)
+
+        _ ->
+            Nothing
+
+
+listAllHelper : REnv -> Value -> List Value -> EvalResult Value
+listAllHelper env pred remaining =
+    case remaining of
+        [] ->
+            EvOk (Bool True)
+
+        x :: rest ->
+            case applyClosure env pred [ x ] of
+                EvOk (Bool False) ->
+                    EvOk (Bool False)
+
+                EvOk _ ->
+                    listAllHelper env pred rest
+
+                EvErr e ->
+                    EvErr e
+
+                otherResult ->
+                    andThenValue
+                        (\result ->
+                            case result of
+                                Bool False ->
+                                    EvOk (Bool False)
+
+                                _ ->
+                                    listAllHelper env pred rest
+                        )
+                        otherResult
+
+
+{-| `Dict.foldr : (k -> v -> b -> b) -> b -> Dict k v -> b`
+Same as Dict.foldl but traverses right subtree first.
+-}
+dictFoldrDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+dictFoldrDispatcher env args =
+    case args of
+        [ f, init, dict ] ->
+            Just (dictFoldrHelper env f init dict)
+
+        _ ->
+            Nothing
+
+
+dictFoldrHelper : REnv -> Value -> Value -> Value -> EvalResult Value
+dictFoldrHelper env f acc node =
+    case node of
+        Custom { name } nodeArgs ->
+            if name == "RBEmpty_elm_builtin" then
+                EvOk acc
+
+            else
+                case nodeArgs of
+                    [ _, key, value, left, right ] ->
+                        case dictFoldrHelper env f acc right of
+                            EvOk rightAcc ->
+                                case applyClosure env f [ key, value, rightAcc ] of
+                                    EvOk midAcc ->
+                                        dictFoldrHelper env f midAcc left
+
+                                    EvErr e ->
+                                        EvErr e
+
+                                    otherResult ->
+                                        andThenValue
+                                            (\midAcc -> dictFoldrHelper env f midAcc left)
+                                            otherResult
+
+                            EvErr e ->
+                                EvErr e
+
+                            otherResult ->
+                                andThenValue
+                                    (\rightAcc ->
+                                        case applyClosure env f [ key, value, rightAcc ] of
+                                            EvOk midAcc ->
+                                                dictFoldrHelper env f midAcc left
+
+                                            other ->
+                                                andThenValue
+                                                    (\midAcc -> dictFoldrHelper env f midAcc left)
+                                                    other
+                                    )
+                                    otherResult
+
+                    _ ->
+                        EvOk acc
+
+        _ ->
+            EvOk acc
+
+
+{-| `Dict.map : (k -> v -> v2) -> Dict k v -> Dict k v2`
+Walks the tree, applies callback to each (key, value), rebuilds with mapped values.
+-}
+dictMapDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+dictMapDispatcher env args =
+    case args of
+        [ f, dict ] ->
+            Just (dictMapHelper env f dict)
+
+        _ ->
+            Nothing
+
+
+dictMapHelper : REnv -> Value -> Value -> EvalResult Value
+dictMapHelper env f node =
+    case node of
+        Custom ref nodeArgs ->
+            if ref.name == "RBEmpty_elm_builtin" then
+                EvOk node
+
+            else
+                case nodeArgs of
+                    [ color, key, value, left, right ] ->
+                        case dictMapHelper env f left of
+                            EvOk mappedLeft ->
+                                case dictMapHelper env f right of
+                                    EvOk mappedRight ->
+                                        case applyClosure env f [ key, value ] of
+                                            EvOk mappedValue ->
+                                                EvOk (Custom ref [ color, key, mappedValue, mappedLeft, mappedRight ])
+
+                                            EvErr e ->
+                                                EvErr e
+
+                                            otherResult ->
+                                                andThenValue
+                                                    (\mappedValue -> EvOk (Custom ref [ color, key, mappedValue, mappedLeft, mappedRight ]))
+                                                    otherResult
+
+                                    other ->
+                                        other
+
+                            other ->
+                                other
+
+                    _ ->
+                        EvOk node
+
+        _ ->
+            EvOk node
+
+
