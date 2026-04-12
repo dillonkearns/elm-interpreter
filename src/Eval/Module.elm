@@ -1389,8 +1389,6 @@ foldConstantSubExpressions :
     -> Node Expression
 foldConstantSubExpressions env cfg node =
     -- Default: none. The AST walk adds ~0.1s normalization cost without
-    -- measurable eval savings on core-extra. Enable via foldWithFlags
-    -- when targeting codebases with heavy constant expressions.
     foldConstantSubExpressionsHelp 3 NormalizationFlags.none env cfg node
 
 
@@ -1684,19 +1682,20 @@ tryInlineFunction env moduleName funcName args =
             if
                 List.length funcImpl.arguments == List.length args
                     && not (containsSelfCallInExpr funcName funcImpl.expression)
-                    && expressionSize funcImpl.expression < 30
-                    && (not isCrossModule || hasNoLocalBindings funcImpl.expression)
+                    && expressionSize funcImpl.expression < 11
             then
                 case extractVarPatternNames funcImpl.arguments of
                     Just paramNames ->
                         let
-                            -- Qualify BEFORE substituting: this way source-module
-                            -- function refs get qualified, then substitution replaces
-                            -- parameter refs with call-site args (which stay unqualified
-                            -- since they're introduced after qualification).
+                            sourceFunctionNames =
+                                Dict.get sourceModuleKey env.shared.functions
+                                    |> Maybe.map Dict.keys
+                                    |> Maybe.map Set.fromList
+                                    |> Maybe.withDefault Set.empty
+
                             preQualified =
                                 if isCrossModule then
-                                    qualifyUnqualifiedRefs sourceModuleName (paramNamesSet paramNames) funcImpl.expression
+                                    qualifyUnqualifiedRefs sourceModuleName sourceFunctionNames (paramNamesSet paramNames) funcImpl.expression
 
                                 else
                                     funcImpl.expression
@@ -1966,43 +1965,125 @@ substituteVars subs ((Node range expr) as node) =
 
 
 {-| Qualify unqualified FunctionOrValue references with the source module name.
-Used when inlining cross-module: `helper x` in module A becomes `A.helper x`
-when inlined into module B. Skips parameter names (already substituted) and
-known constructors (uppercase initial).
+Only qualifies names that exist in the source module's function dict OR are
+uppercase (constructors). Leaves Basics/default-import functions unqualified.
 -}
-qualifyUnqualifiedRefs : List String -> Set.Set String -> Node Expression -> Node Expression
-qualifyUnqualifiedRefs sourceModule paramNames ((Node range expr) as node) =
+qualifyUnqualifiedRefs : List String -> Set.Set String -> Set.Set String -> Node Expression -> Node Expression
+qualifyUnqualifiedRefs sourceModule moduleFunctions locals ((Node range expr) as node) =
+    let
+        q =
+            qualifyUnqualifiedRefs sourceModule moduleFunctions locals
+    in
     case expr of
         FunctionOrValue [] name ->
-            if Set.member name paramNames then
+            if Set.member name locals then
                 node
 
-            else
+            else if Set.member name moduleFunctions || Eval.Expression.isUpperName name then
                 Node range (FunctionOrValue sourceModule name)
 
+            else
+                node
+
         Application items ->
-            Node range (Application (List.map (qualifyUnqualifiedRefs sourceModule paramNames) items))
+            Node range (Application (List.map q items))
 
         OperatorApplication op dir l r ->
-            Node range (OperatorApplication op dir (qualifyUnqualifiedRefs sourceModule paramNames l) (qualifyUnqualifiedRefs sourceModule paramNames r))
+            Node range (OperatorApplication op dir (q l) (q r))
 
         IfBlock c t e ->
-            Node range (IfBlock (qualifyUnqualifiedRefs sourceModule paramNames c) (qualifyUnqualifiedRefs sourceModule paramNames t) (qualifyUnqualifiedRefs sourceModule paramNames e))
+            Node range (IfBlock (q c) (q t) (q e))
 
         CaseExpression { expression, cases } ->
-            Node range (CaseExpression { expression = qualifyUnqualifiedRefs sourceModule paramNames expression, cases = List.map (\( pat, body ) -> ( pat, qualifyUnqualifiedRefs sourceModule paramNames body )) cases })
+            Node range
+                (CaseExpression
+                    { expression = q expression
+                    , cases =
+                        List.map
+                            (\( pat, body ) ->
+                                ( pat
+                                , qualifyUnqualifiedRefs sourceModule moduleFunctions
+                                    (Set.union locals (collectPatternNames pat))
+                                    body
+                                )
+                            )
+                            cases
+                    }
+                )
+
+        LetExpression { declarations, expression } ->
+            let
+                letLocals =
+                    List.foldl
+                        (\(Node _ decl) acc ->
+                            case decl of
+                                LetFunction f ->
+                                    Set.insert (Node.value (Node.value f.declaration).name) acc
+
+                                LetDestructuring pat _ ->
+                                    Set.union acc (collectPatternNames pat)
+                        )
+                        locals
+                        declarations
+            in
+            Node range
+                (LetExpression
+                    { declarations =
+                        List.map
+                            (\(Node dRange decl) ->
+                                Node dRange
+                                    (case decl of
+                                        LetFunction f ->
+                                            let
+                                                (Node implRange impl) =
+                                                    f.declaration
+
+                                                fnLocals =
+                                                    List.foldl (\p acc -> Set.union acc (collectPatternNames p)) letLocals impl.arguments
+                                            in
+                                            LetFunction
+                                                { f
+                                                    | declaration =
+                                                        Node implRange
+                                                            { impl | expression = qualifyUnqualifiedRefs sourceModule moduleFunctions fnLocals impl.expression }
+                                                }
+
+                                        LetDestructuring pat val ->
+                                            LetDestructuring pat (qualifyUnqualifiedRefs sourceModule moduleFunctions letLocals val)
+                                    )
+                            )
+                            declarations
+                    , expression = qualifyUnqualifiedRefs sourceModule moduleFunctions letLocals expression
+                    }
+                )
 
         ListExpr items ->
-            Node range (ListExpr (List.map (qualifyUnqualifiedRefs sourceModule paramNames) items))
+            Node range (ListExpr (List.map q items))
 
         TupledExpression items ->
-            Node range (TupledExpression (List.map (qualifyUnqualifiedRefs sourceModule paramNames) items))
+            Node range (TupledExpression (List.map q items))
 
         ParenthesizedExpression inner ->
-            Node range (ParenthesizedExpression (qualifyUnqualifiedRefs sourceModule paramNames inner))
+            Node range (ParenthesizedExpression (q inner))
 
         LambdaExpression lambda ->
-            Node range (LambdaExpression { lambda | expression = qualifyUnqualifiedRefs sourceModule paramNames lambda.expression })
+            let
+                lambdaLocals =
+                    List.foldl (\p acc -> Set.union acc (collectPatternNames p)) locals lambda.args
+            in
+            Node range
+                (LambdaExpression
+                    { lambda | expression = qualifyUnqualifiedRefs sourceModule moduleFunctions lambdaLocals lambda.expression }
+                )
+
+        RecordExpr fields ->
+            Node range (RecordExpr (List.map (\(Node fRange ( name, val )) -> Node fRange ( name, q val )) fields))
+
+        RecordAccess inner field ->
+            Node range (RecordAccess (q inner) field)
+
+        Negation inner ->
+            Node range (Negation (q inner))
 
         _ ->
             node
