@@ -391,7 +391,10 @@ callNoStack moduleName name env =
         -- let-function names from leaking across scope boundaries.
         -- When calling a LET-function (not in shared dict), keep
         -- letFunctions so self-recursion works.
-        if Dict.member name (Dict.get key env.shared.functions |> Maybe.withDefault Dict.empty) then
+        --
+        -- Same-module case: env.currentModuleFunctions is already
+        -- env.shared.functions[key], so skip the redundant Dict.get.
+        if Dict.member name env.currentModuleFunctions then
             { currentModule = env.currentModule
             , currentModuleKey = env.currentModuleKey
             , callStack = env.callStack
