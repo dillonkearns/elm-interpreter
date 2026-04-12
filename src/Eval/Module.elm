@@ -1685,25 +1685,33 @@ tryInlineFunction env moduleName funcName args =
                 List.length funcImpl.arguments == List.length args
                     && not (containsSelfCallInExpr funcName funcImpl.expression)
                     && expressionSize funcImpl.expression < 30
+<<<<<<< HEAD
+||||||| parent of adc9304 (Fix cross-module inlining: qualify-before-substitute + scope-aware subst)
+                    && not isCrossModule
+                    && hasNoLocalBindings funcImpl.expression
+=======
+                    && (not isCrossModule || hasNoLocalBindings funcImpl.expression)
+>>>>>>> adc9304 (Fix cross-module inlining: qualify-before-substitute + scope-aware subst)
             then
                 case extractVarPatternNames funcImpl.arguments of
                     Just paramNames ->
                         let
+                            -- Qualify BEFORE substituting: this way source-module
+                            -- function refs get qualified, then substitution replaces
+                            -- parameter refs with call-site args (which stay unqualified
+                            -- since they're introduced after qualification).
+                            preQualified =
+                                if isCrossModule then
+                                    qualifyUnqualifiedRefs sourceModuleName (paramNamesSet paramNames) funcImpl.expression
+
+                                else
+                                    funcImpl.expression
+
                             substitution =
                                 List.map2 Tuple.pair paramNames args
                                     |> Dict.fromList
-
-                            substituted =
-                                substituteVars substitution funcImpl.expression
-
-                            qualified =
-                                if isCrossModule then
-                                    qualifyUnqualifiedRefs sourceModuleName (paramNamesSet paramNames) substituted
-
-                                else
-                                    substituted
                         in
-                        Just qualified
+                        Just (substituteVars substitution preQualified)
 
                     Nothing ->
                         Nothing
@@ -1831,52 +1839,136 @@ expressionSize (Node _ expr) =
             1
 
 
+{-| Scope-aware substitution: when entering a binding scope (case pattern,
+let binding, lambda param), removes shadowed names from the substitution
+dict. This prevents incorrectly replacing variables that are rebound in
+inner scopes — the standard fix for capture-avoiding substitution.
+-}
 substituteVars : Dict.Dict String (Node Expression) -> Node Expression -> Node Expression
 substituteVars subs ((Node range expr) as node) =
-    case expr of
-        FunctionOrValue [] name ->
-            case Dict.get name subs of
-                Just replacement ->
-                    replacement
+    if Dict.isEmpty subs then
+        node
 
-                Nothing ->
-                    node
+    else
+        let
+            s =
+                substituteVars subs
 
-        Application items ->
-            Node range (Application (List.map (substituteVars subs) items))
+            removeShadowed : Set.Set String -> Dict.Dict String (Node Expression)
+            removeShadowed shadows =
+                Set.foldl Dict.remove subs shadows
+        in
+        case expr of
+            FunctionOrValue [] name ->
+                case Dict.get name subs of
+                    Just replacement ->
+                        replacement
 
-        OperatorApplication op dir l r ->
-            Node range (OperatorApplication op dir (substituteVars subs l) (substituteVars subs r))
+                    Nothing ->
+                        node
 
-        IfBlock c t e ->
-            Node range (IfBlock (substituteVars subs c) (substituteVars subs t) (substituteVars subs e))
+            Application items ->
+                Node range (Application (List.map s items))
 
-        CaseExpression { expression, cases } ->
-            Node range (CaseExpression { expression = substituteVars subs expression, cases = List.map (\( pat, body ) -> ( pat, substituteVars subs body )) cases })
+            OperatorApplication op dir l r ->
+                Node range (OperatorApplication op dir (s l) (s r))
 
-        ListExpr items ->
-            Node range (ListExpr (List.map (substituteVars subs) items))
+            IfBlock c t e ->
+                Node range (IfBlock (s c) (s t) (s e))
 
-        TupledExpression items ->
-            Node range (TupledExpression (List.map (substituteVars subs) items))
+            CaseExpression { expression, cases } ->
+                Node range
+                    (CaseExpression
+                        { expression = s expression
+                        , cases =
+                            List.map
+                                (\( pat, body ) ->
+                                    let
+                                        shadows =
+                                            collectPatternNames pat
+                                    in
+                                    ( pat, substituteVars (removeShadowed shadows) body )
+                                )
+                                cases
+                        }
+                    )
 
-        ParenthesizedExpression inner ->
-            Node range (ParenthesizedExpression (substituteVars subs inner))
+            LetExpression { declarations, expression } ->
+                let
+                    letShadows =
+                        List.foldl
+                            (\(Node _ decl) acc ->
+                                case decl of
+                                    LetFunction f ->
+                                        Set.insert (Node.value (Node.value f.declaration).name) acc
 
-        Negation inner ->
-            Node range (Negation (substituteVars subs inner))
+                                    LetDestructuring pat _ ->
+                                        Set.union acc (collectPatternNames pat)
+                            )
+                            Set.empty
+                            declarations
 
-        LambdaExpression lambda ->
-            Node range (LambdaExpression { lambda | expression = substituteVars subs lambda.expression })
+                    innerSubs =
+                        removeShadowed letShadows
+                in
+                Node range
+                    (LetExpression
+                        { declarations =
+                            List.map
+                                (\(Node dRange decl) ->
+                                    Node dRange
+                                        (case decl of
+                                            LetFunction f ->
+                                                let
+                                                    (Node implRange impl) =
+                                                        f.declaration
 
-        RecordExpr fields ->
-            Node range (RecordExpr (List.map (\(Node fRange ( name, val )) -> Node fRange ( name, substituteVars subs val )) fields))
+                                                    argShadows =
+                                                        List.foldl (\p acc -> Set.union acc (collectPatternNames p)) letShadows impl.arguments
+                                                in
+                                                LetFunction
+                                                    { f
+                                                        | declaration =
+                                                            Node implRange
+                                                                { impl | expression = substituteVars (removeShadowed argShadows) impl.expression }
+                                                    }
 
-        RecordAccess inner field ->
-            Node range (RecordAccess (substituteVars subs inner) field)
+                                            LetDestructuring pat val ->
+                                                LetDestructuring pat (substituteVars innerSubs val)
+                                        )
+                                )
+                                declarations
+                        , expression = substituteVars innerSubs expression
+                        }
+                    )
 
-        _ ->
-            node
+            ListExpr items ->
+                Node range (ListExpr (List.map s items))
+
+            TupledExpression items ->
+                Node range (TupledExpression (List.map s items))
+
+            ParenthesizedExpression inner ->
+                Node range (ParenthesizedExpression (s inner))
+
+            Negation inner ->
+                Node range (Negation (s inner))
+
+            LambdaExpression lambda ->
+                let
+                    lambdaShadows =
+                        List.foldl (\p acc -> Set.union acc (collectPatternNames p)) Set.empty lambda.args
+                in
+                Node range (LambdaExpression { lambda | expression = substituteVars (removeShadowed lambdaShadows) lambda.expression })
+
+            RecordExpr fields ->
+                Node range (RecordExpr (List.map (\(Node fRange ( name, val )) -> Node fRange ( name, s val )) fields))
+
+            RecordAccess inner field ->
+                Node range (RecordAccess (s inner) field)
+
+            _ ->
+                node
 
 
 {-| Qualify unqualified FunctionOrValue references with the source module name.
