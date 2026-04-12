@@ -774,37 +774,20 @@ buildProjectEnvFromSummaries summaries =
                     )
                     coreFunctions
 
-        {- The default ImportedNames every module implicitly gets
-           via `defaultImports` (Basics exposing (..), Maybe, Result,
-           etc.). We use this as the baseline for core package
-           modules that aren't in `summaries` — otherwise
-           `delegateByName` and `callModuleFn` would fall through
-           to `baseEnv.imports = emptyImports` when dispatching a
-           core-module function like `Parser.Advanced.run`, and the
-           first unqualified reference inside that module's body
-           (e.g. `identity`, `not`) would hit a `NameError`.
-
-           User modules override this via their `summary.importedNames`
-           which already folds `defaultImports` into the full
-           resolution — so for user modules the override is a strict
-           superset of the core-default baseline.
-        -}
-        defaultCoreImportedNames : ImportedNames
-        defaultCoreImportedNames =
+        -- Pre-populate core module imports with the default import set
+        -- (see the note in `buildInitialEnv`). Without this, a caller's
+        -- alias like `import Array.Extra as Array` would leak into core
+        -- module bodies via the cross-module-call import fallback and
+        -- rewrite qualified `Array_elm_builtin` references.
+        defaultProcessedImports : ImportedNames
+        defaultProcessedImports =
             defaultImports
-                |> List.foldl (processImport allInterfaces) emptyImports
+                |> List.foldl (processImport Core.dependency.interfaces) emptyImports
 
         coreModuleImports : Dict.Dict String ImportedNames
         coreModuleImports =
-            Core.functions
-                |> Dict.foldl
-                    (\coreModuleName _ acc ->
-                        Dict.insert
-                            (Environment.moduleKey coreModuleName)
-                            defaultCoreImportedNames
-                            acc
-                    )
-                    Dict.empty
+            coreFunctions
+                |> Dict.foldl (\moduleKey _ acc -> Dict.insert moduleKey defaultProcessedImports acc) Dict.empty
 
         sharedModuleImports : Dict.Dict String ImportedNames
         sharedModuleImports =
@@ -1181,10 +1164,11 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
                     loop (remaining - 1) result.fns result.delta result.precomputed
     in
     -- Cap at a small number of passes to bound worst-case time. For any
-    -- realistic module this converges in 1-2 passes (the second pass picks
+    -- realistic module this converges in 1-2 passes: the second pass picks
     -- up constants whose alphabetical order placed them before their own
-    -- dependencies).
-    loop 4 originalModuleFns Dict.empty originalPrecomputedFns
+    -- dependencies. The third pass is an "all done" check that short-circuits
+    -- when no progress was made in the previous one.
+    loop 3 originalModuleFns Dict.empty originalPrecomputedFns
 
 
 {-| Determine whether a `Value` can be losslessly round-tripped through
@@ -3715,12 +3699,39 @@ buildInitialEnv file =
             (defaultImports ++ file.imports)
                 |> List.foldl (processImport coreInterfaces) emptyImports
 
+        -- Pre-populate moduleImports for every core module with the
+        -- default import set so cross-module calls INTO elm/core (Array,
+        -- List, Dict, …) don't fall back to the CALLER's imports — which
+        -- would incorrectly leak the caller's aliases (e.g. a
+        -- `import Array.Extra as Array` in the caller would rewrite
+        -- qualified `Array_elm_builtin` references inside Array.elm's own
+        -- code to `Array.Extra.Array_elm_builtin`). The default imports
+        -- (`import Basics exposing (..)`, etc.) are the ones every Elm
+        -- module has implicitly, so a core module's unqualified
+        -- references to `ceiling`, `not`, `identity`, etc. still resolve.
+        defaultProcessedImports : ImportedNames
+        defaultProcessedImports =
+            defaultImports
+                |> List.foldl (processImport coreInterfaces) emptyImports
+
+        coreModuleImports : Dict.Dict String ImportedNames
+        coreModuleImports =
+            coreFunctions
+                |> Dict.foldl (\moduleKey _ acc -> Dict.insert moduleKey defaultProcessedImports acc) Dict.empty
+
         coreEnv : Env
         coreEnv =
             { currentModule = moduleName
             , currentModuleKey = Environment.moduleKey moduleName
             , callStack = []
-            , shared = { functions = coreFunctions, moduleImports = Dict.singleton (Environment.moduleKey moduleName) imports, resolveBridge = Types.noResolveBridge, precomputedValues = Dict.empty }
+            , shared =
+                { functions = coreFunctions
+                , moduleImports =
+                    coreModuleImports
+                        |> Dict.insert (Environment.moduleKey moduleName) imports
+                , resolveBridge = Types.noResolveBridge
+                , precomputedValues = Dict.empty
+                }
             , currentModuleFunctions = Dict.empty
                         , letFunctions = Dict.empty
             , values = Dict.empty

@@ -249,6 +249,21 @@ functions evalFunction =
         , ( "all", twoWithError (function evalFunction anything to bool) anyList to bool Kernel.List.all Core.List.all )
         , ( "sortBy", twoWithError (function evalFunction anything to anything) anyList to anyList Kernel.List.sortBy Core.List.sortBy )
         , ( "sortWith", twoWithError (function2 evalFunction anything anything to order) anyList to anyList Kernel.List.sortWith Core.List.sortWith )
+
+        -- Simple, O(n) helpers that were previously interpreted through
+        -- the elm/core AST wrapper — each eval step walks
+        -- `lengthHelp accum xs` etc. at interpreter overhead, turning a
+        -- `List.length (List.repeat 1000000 5)` call (used by one of
+        -- elmcraft/core-extra's isInfixOf "stack safety" tests) into
+        -- a ~6-minute job. Routing them straight to host Elm's
+        -- `List.length` / `List.repeat` etc. collapses that to
+        -- sub-second.
+        , ( "length", one anyList to int List.length Core.List.length )
+        , ( "repeat", two int anything to anyList List.repeat Core.List.repeat )
+        , ( "reverse", one anyList to anyList List.reverse Core.List.reverse )
+        , ( "head", one anyList to (maybe anything) List.head Core.List.head )
+        , ( "tail", one anyList to (maybe anyList) List.tail Core.List.tail )
+        , ( "isEmpty", one anyList to bool List.isEmpty Core.List.isEmpty )
         ]
       )
 
