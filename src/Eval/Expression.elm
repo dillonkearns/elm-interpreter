@@ -1286,8 +1286,57 @@ evalSimple (Node _ expr) env =
         Expression.ParenthesizedExpression inner ->
             evalSimple inner env
 
+        Expression.ListExpr items ->
+            evalSimpleList items env []
+
+        Expression.TupledExpression [ a, b ] ->
+            case evalSimple a env of
+                Just va ->
+                    case evalSimple b env of
+                        Just vb ->
+                            Just (Tuple va vb)
+
+                        Nothing ->
+                            Nothing
+
+                Nothing ->
+                    Nothing
+
+        Expression.TupledExpression [ a, b, c ] ->
+            case evalSimple a env of
+                Just va ->
+                    case evalSimple b env of
+                        Just vb ->
+                            case evalSimple c env of
+                                Just vc ->
+                                    Just (Triple va vb vc)
+
+                                Nothing ->
+                                    Nothing
+
+                        Nothing ->
+                            Nothing
+
+                Nothing ->
+                    Nothing
+
         _ ->
             Nothing
+
+
+evalSimpleList : List (Node Expression) -> Env -> List Value -> Maybe Value
+evalSimpleList items env acc =
+    case items of
+        [] ->
+            Just (List (List.reverse acc))
+
+        item :: rest ->
+            case evalSimple item env of
+                Just v ->
+                    evalSimpleList rest env (v :: acc)
+
+                Nothing ->
+                    Nothing
 
 
 evalShortCircuitAnd : Node Expression -> Node Expression -> PartialEval Value

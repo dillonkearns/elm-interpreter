@@ -8,7 +8,7 @@ import Elm.Interface exposing (Exposed)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
-import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation)
+import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation, LetDeclaration(..))
 import Elm.Syntax.Import
 import Elm.Syntax.Pattern
 import Elm.Syntax.Range exposing (Range)
@@ -34,7 +34,7 @@ import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import EvalResult
-import Types exposing (CallTree, Env, Error(..), EvalResult(..), ImportedNames, Value)
+import Types exposing (CallTree, Config, Env, Error(..), EvalResult(..), ImportedNames, Value)
 import Value exposing (unsupported)
 
 
@@ -1207,7 +1207,86 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
     -- up constants whose alphabetical order placed them before their own
     -- dependencies. The third pass is an "all done" check that short-circuits
     -- when no progress was made in the previous one.
-    loop 3 originalModuleFns Dict.empty originalPrecomputedFns
+    let
+        ( fixpointFns, fixpointDelta, fixpointPrecomputed ) =
+            loop 3 originalModuleFns Dict.empty originalPrecomputedFns
+
+        foldEnv : Env
+        foldEnv =
+            { currentModule = moduleName
+            , currentModuleKey = moduleKey
+            , callStack = []
+            , shared =
+                { functions = Dict.insert moduleKey fixpointFns sharedFunctions
+                , moduleImports = sharedImports
+                , resolveBridge = Types.noResolveBridge
+                , precomputedValues = Dict.insert moduleKey fixpointPrecomputed sharedPrecomputedValues
+                }
+            , currentModuleFunctions = fixpointFns
+            , letFunctions = Dict.empty
+            , values = Dict.empty
+            , imports = moduleImports
+            , callDepth = 0
+            , recursionCheck = Nothing
+            }
+
+        foldCfg : Config
+        foldCfg =
+            { trace = False
+            , coverage = False
+            , coverageProbeLines = Set.empty
+            , maxSteps = Just 100000
+            , tcoTarget = Nothing
+            , callCounts = Nothing
+            , intercepts = Dict.empty
+            , memoizedFunctions = MemoSpec.emptyRegistry
+            , collectMemoStats = False
+            , useResolvedIR = False
+            }
+
+        foldedFns : Dict.Dict String FunctionImplementation
+        foldedFns =
+            fixpointFns
+                |> Dict.map
+                    (\_ funcImpl ->
+                        if not (List.isEmpty funcImpl.arguments) then
+                            { funcImpl
+                                | expression =
+                                    foldConstantSubExpressions foldEnv foldCfg funcImpl.expression
+                            }
+
+                        else
+                            funcImpl
+                    )
+
+        foldedDelta : Dict.Dict String FunctionImplementation
+        foldedDelta =
+            fixpointDelta
+                |> Dict.map
+                    (\name funcImpl ->
+                        Dict.get name foldedFns
+                            |> Maybe.withDefault funcImpl
+                    )
+
+        newDelta : Dict.Dict String FunctionImplementation
+        newDelta =
+            foldedFns
+                |> Dict.foldl
+                    (\name foldedImpl acc ->
+                        case Dict.get name originalModuleFns of
+                            Just origImpl ->
+                                if foldedImpl.expression /= origImpl.expression then
+                                    Dict.insert name foldedImpl acc
+
+                                else
+                                    acc
+
+                            Nothing ->
+                                acc
+                    )
+                    foldedDelta
+    in
+    ( foldedFns, newDelta, fixpointPrecomputed )
 
 
 {-| Determine whether a `Value` can be losslessly round-tripped through
@@ -1273,6 +1352,190 @@ isLosslessValue value =
             -- or uses a KernelImpl with runtime state would lose information.
             -- Skip for now; revisit if the pattern is common.
             False
+
+
+{-| Fold constant sub-expressions in a function body. Walks the AST
+bottom-up: for each sub-expression where all leaves are literals (no
+free variables or function calls), evaluates it and replaces with
+`Value.toExpression`. This extends normalization from "whole zero-arg
+functions" to "constant sub-expressions within any function body."
+
+Only folds expressions that:
+- Contain only literals, constructors, and pure operators
+- Evaluate successfully within a small step budget
+- Produce a lossless Value (survives toExpression round-trip)
+
+The folded AST uses standard Expression nodes, so it caches perfectly
+through AstWireCodec and the user-norm blob pipeline.
+-}
+foldConstantSubExpressions :
+    Env
+    -> Config
+    -> Node Expression
+    -> Node Expression
+foldConstantSubExpressions env cfg ((Node range expr) as node) =
+    let
+        tryFold : Node Expression -> Node Expression
+        tryFold foldedNode =
+            case Eval.Expression.evalExpression foldedNode cfg env |> EvalResult.toResult of
+                Ok value ->
+                    if isLosslessValue value then
+                        Value.toExpression value
+
+                    else
+                        foldedNode
+
+                Err _ ->
+                    foldedNode
+
+        isConstantLeaf : Expression -> Bool
+        isConstantLeaf e =
+            case e of
+                Integer _ ->
+                    True
+
+                Hex _ ->
+                    True
+
+                Floatable _ ->
+                    True
+
+                Literal _ ->
+                    True
+
+                CharLiteral _ ->
+                    True
+
+                UnitExpr ->
+                    True
+
+                FunctionOrValue [] "True" ->
+                    True
+
+                FunctionOrValue [] "False" ->
+                    True
+
+                _ ->
+                    False
+    in
+    case expr of
+        ListExpr items ->
+            Node range (ListExpr (List.map (foldConstantSubExpressions env cfg) items))
+
+        TupledExpression items ->
+            Node range (TupledExpression (List.map (foldConstantSubExpressions env cfg) items))
+
+        RecordExpr fields ->
+            Node range
+                (RecordExpr
+                    (List.map
+                        (\(Node fRange ( name, value )) ->
+                            Node fRange ( name, foldConstantSubExpressions env cfg value )
+                        )
+                        fields
+                    )
+                )
+
+        Application ((Node _ (FunctionOrValue moduleName funcName)) :: args) ->
+            let
+                foldedArgs =
+                    List.map (foldConstantSubExpressions env cfg) args
+            in
+            if
+                List.all (\(Node _ e) -> isConstantLeaf e) foldedArgs
+                    && not (List.isEmpty foldedArgs)
+            then
+                tryFold (Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs)))
+
+            else
+                Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs))
+
+        IfBlock cond thenBranch elseBranch ->
+            Node range
+                (IfBlock
+                    (foldConstantSubExpressions env cfg cond)
+                    (foldConstantSubExpressions env cfg thenBranch)
+                    (foldConstantSubExpressions env cfg elseBranch)
+                )
+
+        CaseExpression { expression, cases } ->
+            Node range
+                (CaseExpression
+                    { expression = foldConstantSubExpressions env cfg expression
+                    , cases =
+                        List.map
+                            (\( pat, body ) -> ( pat, foldConstantSubExpressions env cfg body ))
+                            cases
+                    }
+                )
+
+        LetExpression { declarations, expression } ->
+            Node range
+                (LetExpression
+                    { declarations =
+                        List.map
+                            (\(Node dRange decl) ->
+                                Node dRange
+                                    (case decl of
+                                        LetFunction f ->
+                                            LetFunction
+                                                { f
+                                                    | declaration =
+                                                        let
+                                                            (Node implRange impl) =
+                                                                f.declaration
+                                                        in
+                                                        Node implRange
+                                                            { impl
+                                                                | expression = foldConstantSubExpressions env cfg impl.expression
+                                                            }
+                                                }
+
+                                        LetDestructuring pat val ->
+                                            LetDestructuring pat (foldConstantSubExpressions env cfg val)
+                                    )
+                            )
+                            declarations
+                    , expression = foldConstantSubExpressions env cfg expression
+                    }
+                )
+
+        OperatorApplication op dir left right ->
+            let
+                foldedLeft =
+                    foldConstantSubExpressions env cfg left
+
+                foldedRight =
+                    foldConstantSubExpressions env cfg right
+            in
+            if isConstantLeaf ((\(Node _ e) -> e) foldedLeft) && isConstantLeaf ((\(Node _ e) -> e) foldedRight) then
+                tryFold (Node range (OperatorApplication op dir foldedLeft foldedRight))
+
+            else
+                Node range (OperatorApplication op dir foldedLeft foldedRight)
+
+        Negation inner ->
+            let
+                foldedInner =
+                    foldConstantSubExpressions env cfg inner
+            in
+            if isConstantLeaf ((\(Node _ e) -> e) foldedInner) then
+                tryFold (Node range (Negation foldedInner))
+
+            else
+                Node range (Negation foldedInner)
+
+        ParenthesizedExpression inner ->
+            Node range (ParenthesizedExpression (foldConstantSubExpressions env cfg inner))
+
+        LambdaExpression lambda ->
+            Node range
+                (LambdaExpression
+                    { lambda | expression = foldConstantSubExpressions env cfg lambda.expression }
+                )
+
+        _ ->
+            node
 
 
 {-| Replace a single module's declarations in an existing ProjectEnv.
@@ -3150,14 +3413,14 @@ isBlocklistedNode (Node.Node _ expr) =
 letDeclarationIsBlocklisted : Elm.Syntax.Expression.LetDeclaration -> Bool
 letDeclarationIsBlocklisted decl =
     case decl of
-        Elm.Syntax.Expression.LetFunction { declaration } ->
+        LetFunction { declaration } ->
             let
                 (Node.Node _ funcDecl) =
                     declaration
             in
             isBlocklistedNode funcDecl.expression
 
-        Elm.Syntax.Expression.LetDestructuring _ expression ->
+        LetDestructuring _ expression ->
             isBlocklistedNode expression
 
 
