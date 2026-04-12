@@ -29,6 +29,7 @@ suite =
         , nonTailRecursiveDepth50000
         , nonTailRecursiveDepth500000
         , mutuallyRecursiveDepth10000
+        , mutuallyRecursiveDepth500000
         , caseDispatchDepth10000
         , letBindingDepth10000
         ]
@@ -183,7 +184,12 @@ result =
 
 {-| Mutual recursion between two functions — exercises the cross-body
 trampoline across two different resolved bodies, not just one
-self-recursive function.
+self-recursive function. This is essentially a tail-call chain:
+    isEven N → isOdd (N-1) → isEven (N-2) → ...
+
+which is exactly the shape that `Recursion.recurse` handles without
+a continuation stack push — ideal for checking whether the
+trampoline's hot path has residual per-iteration allocation cost.
 -}
 mutuallyRecursiveDepth10000 : Test
 mutuallyRecursiveDepth10000 =
@@ -215,6 +221,51 @@ isOdd n =
 result : Bool
 result =
     isEven 10000
+"""
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "StackTest.result"
+                        |> expectValue (Bool True)
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+{-| Same shape as `mutuallyRecursiveDepth10000` but 50x deeper.
+If the trampoline is genuinely O(1) per iteration this should be
+~instantaneous. If not, we'll see where the cost curve bends.
+-}
+mutuallyRecursiveDepth500000 : Test
+mutuallyRecursiveDepth500000 =
+    test "mutually recursive even/odd depth 500000" <|
+        \_ ->
+            let
+                source : String
+                source =
+                    """module StackTest exposing (..)
+
+isEven : Int -> Bool
+isEven n =
+    if n == 0 then
+        True
+
+    else
+        isOdd (n - 1)
+
+
+isOdd : Int -> Bool
+isOdd n =
+    if n == 0 then
+        False
+
+    else
+        isEven (n - 1)
+
+
+result : Bool
+result =
+    isEven 500000
 """
             in
             case Eval.Module.buildProjectEnv [ source ] of

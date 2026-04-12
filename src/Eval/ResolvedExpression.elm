@@ -44,7 +44,6 @@ import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedIR as IR exposing (RExpr(..))
 import FastDict
 import MemoSpec
-import Recursion exposing (Rec)
 import Set
 import Syntax
 import Types
@@ -154,6 +153,93 @@ emptyREnv =
     }
 
 
+{-| Custom trampoline type, replacement for `Recursion.Rec`. The
+difference: `RTail` is a pure tail-recursive call that the runner
+handles WITHOUT pushing anything onto the continuation stack.
+
+`rTail` was implemented as `Recurse r base`, which pushes
+a `base` continuation even for pure tail calls. For iterative tail-call
+chains (like the hot RApply → RLambda shortcut used by parser
+combinators and review-rule visitors), that leaks the continuation
+stack — the heap profiler at a 512 MB OOM showed 10.5 million live
+`base`-continuation entries retaining ~480 MB. `RTail` fixes that by
+making pure tail calls truly iterative: `go (project r) stack` with no
+stack modification.
+
+`RecThen` carries a continuation for non-tail calls, matching the
+behavior of `rRecThen`.
+-}
+type Rec r t a
+    = RBase a
+    | RTail r
+    | RecThen r (t -> Rec r t a)
+
+
+{-| Construct a base (done) result. Equivalent to `rBase`.
+-}
+rBase : a -> Rec r t a
+rBase =
+    RBase
+
+
+{-| Pure tail call — recurse without pushing a continuation. Use this
+wherever a computation ends with a recursive call whose result is the
+computation's direct return value. For `RTail r`, the runner does
+`go (project r) stack`, so consecutive tail calls iterate in constant
+continuation-stack space.
+-}
+rTail : r -> Rec r t a
+rTail =
+    RTail
+
+
+{-| Non-tail recursion: recurse on `r`, then run `after` with the
+result. Equivalent to `rRecThen`. The continuation is
+pushed onto the runner's stack and popped when the recursion returns.
+-}
+rRecThen : r -> (t -> Rec r t a) -> Rec r t a
+rRecThen =
+    RecThen
+
+
+{-| Run a recursion given a step function and an initial value. Local
+`go` closes over `project` (matching `Recursion.runRecursion`'s
+structure — fewer arguments per iteration), but adds a fast path for
+`RTail` that skips the continuation push.
+
+`Rec` is restricted to `t = a` here (mirroring `runRecursion`'s
+`Rec r t t`), which matches every use site in the trampolined
+evaluator.
+-}
+runRec : (r -> Rec r t t) -> r -> t
+runRec project init =
+    let
+        go : Rec r t t -> List (t -> Rec r t t) -> t
+        go step stack =
+            case step of
+                RBase t ->
+                    case stack of
+                        [] ->
+                            t
+
+                        next :: rest ->
+                            go (next t) rest
+
+                RTail r ->
+                    {- Pure tail call: no stack modification. This is
+                       the key win over the stock `Recursion.recurse`,
+                       which always pushes a `base` continuation even
+                       for tail calls and makes iterative tail-call
+                       chains grow the continuation stack linearly.
+                    -}
+                    go (project r) stack
+
+                RecThen r after ->
+                    go (project r) (after :: stack)
+    in
+    go (project init) []
+
+
 emptyConfig : Config
 emptyConfig =
     { trace = False
@@ -171,10 +257,10 @@ emptyConfig =
 
 {-| Evaluate a resolved expression to a `Value`.
 
-Stack-safe via `Recursion.runRecursion`. The trampoline's state is
+Stack-safe via `runRec`. The trampoline's state is
 `(REnv, RExpr)` — whenever we need to enter a new body (via
 `evalGlobal`'s resolved-body branch, or `applyClosure`'s `RExprImpl`
-branch), we `Recursion.recurse` into that body instead of calling
+branch), we `rTail` into that body instead of calling
 `evalR` recursively. That keeps cross-body recursion iterative —
 the JS stack doesn't grow per Elm function call, which matters for
 deeply recursive user code like parser combinators in `elm/parser`
@@ -205,7 +291,7 @@ evalR initEnv initExpr =
        fallbacks are less frequent than the hot recurse path,
        so their record-construction cost doesn't dominate.
     -}
-    Recursion.runRecursion
+    runRec
         (\( locals, expr ) -> evalRStep initEnv locals expr)
         ( initEnv.locals, initExpr )
 
@@ -225,26 +311,26 @@ list separately, so the trampoline step state can be just
 `(List Value, RExpr)`. Returns a `Rec` computation that the
 outer `runRecursion` drives to completion.
 
-Most cases wrap the direct evaluator's result in `Recursion.base`;
+Most cases wrap the direct evaluator's result in `rBase`;
 only the cases that may lead to cross-body recursion route through
-`Recursion.recurse` / `recurseThen` so that cross-body transitions
+`rTail` / `recurseThen` so that cross-body transitions
 don't accumulate JS stack frames.
 -}
 evalRStep : REnv -> List Value -> RExpr -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
 evalRStep staticEnv locals expr =
     case expr of
         RIf cond t f ->
-            Recursion.recurseThen ( locals, cond )
+            rRecThen ( locals, cond )
                 (\condResult ->
                     case condResult of
                         EvOk (Bool True) ->
-                            Recursion.recurse ( locals, t )
+                            rTail ( locals, t )
 
                         EvOk (Bool False) ->
-                            Recursion.recurse ( locals, f )
+                            rTail ( locals, f )
 
                         EvOk other ->
-                            Recursion.base
+                            rBase
                                 (evErr (envWithLocals staticEnv locals)
                                     (TypeError
                                         ("if condition not Bool: "
@@ -260,7 +346,7 @@ evalRStep staticEnv locals expr =
                             -- continuation stack — the higher-order
                             -- helpers that care about those work on
                             -- EvalResult directly.
-                            Recursion.base condResult
+                            rBase condResult
                 )
 
         RApply (RGlobal id) argExprs ->
@@ -279,7 +365,7 @@ evalRStep staticEnv locals expr =
             -- parameter-passed callback. Evaluate head, evaluate args,
             -- then apply — all through the trampoline so cross-body
             -- invocations into the callback's body stay iterative.
-            Recursion.recurseThen ( locals, headExpr )
+            rRecThen ( locals, headExpr )
                 (\headResult ->
                     case headResult of
                         EvOk headValue ->
@@ -289,7 +375,7 @@ evalRStep staticEnv locals expr =
                                 )
 
                         _ ->
-                            Recursion.base headResult
+                            rBase headResult
                 )
 
         RGlobal id ->
@@ -300,14 +386,14 @@ evalRStep staticEnv locals expr =
             -- branches against it. The matching branch body is
             -- evaluated via `recurse` so cross-body calls inside the
             -- branch stay in this trampoline.
-            Recursion.recurseThen ( locals, scrutineeExpr )
+            rRecThen ( locals, scrutineeExpr )
                 (\scrutineeResult ->
                     case scrutineeResult of
                         EvOk scrutinee ->
                             matchCaseBranchesStep staticEnv locals scrutinee branches
 
                         _ ->
-                            Recursion.base scrutineeResult
+                            rBase scrutineeResult
                 )
 
         RLet bindings letBody ->
@@ -315,7 +401,7 @@ evalRStep staticEnv locals expr =
             -- then evaluate the body with the extended locals.
             evalLetBindingsStep staticEnv locals bindings
                 (\newLocals ->
-                    Recursion.recurse ( newLocals, letBody )
+                    rTail ( newLocals, letBody )
                 )
 
         _ ->
@@ -324,7 +410,7 @@ evalRStep staticEnv locals expr =
             -- sit on the hot recursion path — literals, RLocal,
             -- RLambda, RRecord, RCtor, etc. are all bounded by their
             -- body's structure, not by recursion depth.
-            Recursion.base (evalRDirect (envWithLocals staticEnv locals) expr)
+            rBase (evalRDirect (envWithLocals staticEnv locals) expr)
 
 
 {-| Rec-aware case branch matcher. Walks branches in order; on the first
@@ -342,7 +428,7 @@ matchCaseBranchesStep :
 matchCaseBranchesStep staticEnv locals scrutinee branches =
     case branches of
         [] ->
-            Recursion.base
+            rBase
                 (evErr (envWithLocals staticEnv locals)
                     (TypeError
                         ("case expression failed to match any branch for value: "
@@ -354,7 +440,7 @@ matchCaseBranchesStep staticEnv locals scrutinee branches =
         ( pattern, branchBody ) :: rest ->
             case matchPattern pattern scrutinee locals of
                 Just newLocals ->
-                    Recursion.recurse ( newLocals, branchBody )
+                    rTail ( newLocals, branchBody )
 
                 Nothing ->
                     matchCaseBranchesStep staticEnv locals scrutinee rest
@@ -401,7 +487,7 @@ evalLetBindingsStep staticEnv locals bindings k =
                         evalLetBindingsStep staticEnv (closureValue :: locals) rest k
 
                     _ ->
-                        Recursion.base
+                        rBase
                             (evErr (envWithLocals staticEnv locals)
                                 (TypeError
                                     ("let function binding '"
@@ -412,7 +498,7 @@ evalLetBindingsStep staticEnv locals bindings k =
                             )
 
             else
-                Recursion.recurseThen ( locals, binding.body )
+                rRecThen ( locals, binding.body )
                     (\bindingResult ->
                         case bindingResult of
                             EvOk value ->
@@ -421,7 +507,7 @@ evalLetBindingsStep staticEnv locals bindings k =
                                         evalLetBindingsStep staticEnv newLocals rest k
 
                                     Nothing ->
-                                        Recursion.base
+                                        rBase
                                             (evErr (envWithLocals staticEnv locals)
                                                 (TypeError
                                                     ("pattern match failed in let binding '"
@@ -432,7 +518,7 @@ evalLetBindingsStep staticEnv locals bindings k =
                                             )
 
                             _ ->
-                                Recursion.base bindingResult
+                                rBase bindingResult
                     )
 
 
@@ -453,7 +539,7 @@ applyClosureStep :
     -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
 applyClosureStep staticEnv locals head newArgs =
     if List.isEmpty newArgs then
-        Recursion.base (EvOk head)
+        rBase (EvOk head)
 
     else
         case head of
@@ -471,7 +557,7 @@ applyClosureStep staticEnv locals head newArgs =
                         in
                         if totalCount < arity then
                             -- Partial application: construct a new PA. No recursion.
-                            Recursion.base
+                            rBase
                                 (EvOk
                                     (PartiallyApplied
                                         (Environment.empty [])
@@ -508,7 +594,7 @@ applyClosureStep staticEnv locals head newArgs =
                                 bodyLocals =
                                     List.foldl (::) withSelf totalArgs
                             in
-                            Recursion.recurse ( bodyLocals, implBody.body )
+                            rTail ( bodyLocals, implBody.body )
 
                         else
                             -- Over-application: run the body with `arity` args,
@@ -543,26 +629,26 @@ applyClosureStep staticEnv locals head newArgs =
                                 bodyLocals =
                                     List.foldl (::) withSelf bodyArgs
                             in
-                            Recursion.recurseThen ( bodyLocals, implBody.body )
+                            rRecThen ( bodyLocals, implBody.body )
                                 (\bodyResult ->
                                     case bodyResult of
                                         EvOk resultValue ->
                                             applyClosureStep staticEnv locals resultValue extraArgs
 
                                         _ ->
-                                            Recursion.base bodyResult
+                                            rBase bodyResult
                                 )
 
                     _ ->
                         -- AstImpl / KernelImpl: delegate to the direct path.
                         -- `Eval.Expression.evalFunction` uses its own trampoline
-                        -- (`Recursion.runRecursion` on the expression tree), so
+                        -- (`runRec` on the expression tree), so
                         -- this doesn't accumulate JS frames.
-                        Recursion.base (applyClosure (envWithLocals staticEnv locals) head newArgs)
+                        rBase (applyClosure (envWithLocals staticEnv locals) head newArgs)
 
             _ ->
                 -- Custom constructor or other non-callable: delegate.
-                Recursion.base (applyClosure (envWithLocals staticEnv locals) head newArgs)
+                rBase (applyClosure (envWithLocals staticEnv locals) head newArgs)
 
 
 {-| Rec-aware arg list evaluator. Threads each expression evaluation
@@ -587,20 +673,20 @@ evalArgsStep staticEnv locals remaining accRev k =
             k (List.reverse accRev)
 
         head :: rest ->
-            Recursion.recurseThen ( locals, head )
+            rRecThen ( locals, head )
                 (\headResult ->
                     case headResult of
                         EvOk value ->
                             evalArgsStep staticEnv locals rest (value :: accRev) k
 
                         _ ->
-                            Recursion.base headResult
+                            rBase headResult
                 )
 
 
 {-| Rec-aware dispatch for `RApply (RGlobal id) args`. Mirrors
 `dispatchGlobalApplyNoIntercept`, but when the dispatch resolves to
-a user-declaration body this returns a `Recursion.recurse` on the
+a user-declaration body this returns a `rTail` on the
 body so the trampoline tail-calls into it instead of growing the JS
 stack.
 
@@ -618,12 +704,12 @@ dispatchGlobalApplyStep staticEnv locals id argValues =
     case FastDict.get id staticEnv.interceptsByGlobal of
         Just _ ->
             -- Intercept path — defer to the direct dispatch.
-            Recursion.base (dispatchGlobalApply (envWithLocals staticEnv locals) id argValues)
+            rBase (dispatchGlobalApply (envWithLocals staticEnv locals) id argValues)
 
         Nothing ->
             case FastDict.get id staticEnv.globals of
                 Just cached ->
-                    Recursion.base (applyClosure (envWithLocals staticEnv locals) cached argValues)
+                    rBase (applyClosure (envWithLocals staticEnv locals) cached argValues)
 
                 Nothing ->
                     case FastDict.get id staticEnv.resolvedBodies of
@@ -656,28 +742,28 @@ dispatchGlobalApplyStep staticEnv locals id argValues =
                                     bodyLocals =
                                         List.foldl (::) [] argValues
                                 in
-                                Recursion.recurse ( bodyLocals, lambda.body )
+                                rTail ( bodyLocals, lambda.body )
 
                             else
                                 -- Partial / over-application: fall back
                                 -- to the direct path, which handles both
                                 -- cases correctly via `applyClosure`.
-                                Recursion.base (dispatchGlobalApplyNoIntercept (envWithLocals staticEnv locals) id argValues)
+                                rBase (dispatchGlobalApplyNoIntercept (envWithLocals staticEnv locals) id argValues)
 
                         Just body ->
-                            Recursion.recurseThen ( [], body )
+                            rRecThen ( [], body )
                                 (\headResult ->
                                     case headResult of
                                         EvOk headValue ->
-                                            Recursion.base
+                                            rBase
                                                 (applyClosure (envWithLocals staticEnv locals) headValue argValues)
 
                                         _ ->
-                                            Recursion.base headResult
+                                            rBase headResult
                                 )
 
                         Nothing ->
-                            Recursion.base (fallbackDispatch (envWithLocals staticEnv locals) id argValues)
+                            rBase (fallbackDispatch (envWithLocals staticEnv locals) id argValues)
 
 
 {-| Rec-aware `evalGlobal`. Zero-arg top-level references dispatch
@@ -692,15 +778,15 @@ evalGlobalStep :
 evalGlobalStep staticEnv locals id =
     case FastDict.get id staticEnv.globals of
         Just cached ->
-            Recursion.base (EvOk cached)
+            rBase (EvOk cached)
 
         Nothing ->
             case FastDict.get id staticEnv.resolvedBodies of
                 Just body ->
-                    Recursion.recurse ( [], body )
+                    rTail ( [], body )
 
                 Nothing ->
-                    Recursion.base (delegateCoreApply (envWithLocals staticEnv locals) id [])
+                    rBase (delegateCoreApply (envWithLocals staticEnv locals) id [])
 
 
 {-| Fallback dispatch — native, higher-order, or old-evaluator delegation.
