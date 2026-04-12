@@ -13,6 +13,7 @@ concat-map, pipeline style) could be added later.
 -}
 
 import Elm.Syntax.Expression exposing (Expression(..), LetDeclaration(..))
+import Elm.Syntax.Infix
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..))
 import Elm.Syntax.Range exposing (emptyRange)
@@ -151,54 +152,124 @@ foldChildren ((Node range expr) as node) =
             node
 
 
-{-| Try to fuse at the current expression level.
-
-Pattern: `List.map outerFn (List.map innerFn xs)` — both args are
-direct applications of List.map. Rewrites to:
-`List.map (\x__fuse -> outerFn (innerFn x__fuse)) xs`.
+{-| Try to fuse at the current expression level. Each pattern is an
+independent rule; we try them in order and return the first that matches.
 -}
 fuseHelp : Node Expression -> Node Expression
 fuseHelp ((Node range expr) as node) =
     case expr of
-        Application [ Node _ (FunctionOrValue [ "List" ] "map"), outerFn, inner ] ->
-            case inner of
-                Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "map"), innerFn, xs ]) ->
-                    let
-                        varName =
-                            "__x_fused"
+        -- Pattern: List.map identity xs → xs
+        Application [ Node _ (FunctionOrValue [ "List" ] "map"), Node _ (FunctionOrValue [] "identity"), xs ] ->
+            xs
 
-                        varRef =
-                            Node emptyRange (FunctionOrValue [] varName)
+        Application [ Node _ (FunctionOrValue [ "List" ] "map"), Node _ (FunctionOrValue [ "Basics" ] "identity"), xs ] ->
+            xs
 
-                        composedBody =
-                            Node emptyRange
-                                (Application
-                                    [ outerFn
-                                    , Node emptyRange
-                                        (ParenthesizedExpression
-                                            (Node emptyRange (Application [ innerFn, varRef ]))
-                                        )
-                                    ]
-                                )
+        -- Pattern: List.reverse (List.reverse xs) → xs
+        Application [ Node _ (FunctionOrValue [ "List" ] "reverse"), Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "reverse"), xs ]) ] ->
+            xs
 
-                        fusedLambda =
-                            Node emptyRange
-                                (LambdaExpression
-                                    { args = [ Node emptyRange (VarPattern varName) ]
-                                    , expression = composedBody
-                                    }
-                                )
-                    in
-                    Node range
-                        (Application
-                            [ Node emptyRange (FunctionOrValue [ "List" ] "map")
-                            , fusedLambda
-                            , xs
-                            ]
-                        )
+        -- Pattern: List.concat (List.map f xs) → List.concatMap f xs
+        Application [ Node _ (FunctionOrValue [ "List" ] "concat"), Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "map"), f, xs ]) ] ->
+            Node range
+                (Application
+                    [ Node emptyRange (FunctionOrValue [ "List" ] "concatMap")
+                    , f
+                    , xs
+                    ]
+                )
 
-                _ ->
-                    node
+        -- Pattern: List.filterMap identity (List.map f xs) → List.filterMap f xs
+        Application [ Node _ (FunctionOrValue [ "List" ] "filterMap"), Node _ (FunctionOrValue [] "identity"), Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "map"), f, xs ]) ] ->
+            Node range
+                (Application
+                    [ Node emptyRange (FunctionOrValue [ "List" ] "filterMap")
+                    , f
+                    , xs
+                    ]
+                )
+
+        -- Pattern: List.foldl f init (List.reverse xs) → List.foldr f init xs
+        Application [ Node _ (FunctionOrValue [ "List" ] "foldl"), f, init, Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "reverse"), xs ]) ] ->
+            Node range
+                (Application
+                    [ Node emptyRange (FunctionOrValue [ "List" ] "foldr")
+                    , f
+                    , init
+                    , xs
+                    ]
+                )
+
+        -- Pattern: List.map outerFn (List.map innerFn xs) → List.map (\x -> outerFn (innerFn x)) xs
+        Application [ Node _ (FunctionOrValue [ "List" ] "map"), outerFn, Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "map"), innerFn, xs ]) ] ->
+            Node range
+                (Application
+                    [ Node emptyRange (FunctionOrValue [ "List" ] "map")
+                    , composeFn outerFn innerFn
+                    , xs
+                    ]
+                )
+
+        -- Pattern: List.filter p (List.filter q xs) → List.filter (\x -> p x && q x) xs
+        Application [ Node _ (FunctionOrValue [ "List" ] "filter"), outerP, Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "filter"), innerP, xs ]) ] ->
+            Node range
+                (Application
+                    [ Node emptyRange (FunctionOrValue [ "List" ] "filter")
+                    , conjoinPredicates outerP innerP
+                    , xs
+                    ]
+                )
 
         _ ->
             node
+
+
+{-| Build `\x -> outerFn (innerFn x)` from two function expressions.
+-}
+composeFn : Node Expression -> Node Expression -> Node Expression
+composeFn outerFn innerFn =
+    let
+        varName =
+            "__x_fused"
+
+        varRef =
+            Node emptyRange (FunctionOrValue [] varName)
+    in
+    Node emptyRange
+        (LambdaExpression
+            { args = [ Node emptyRange (VarPattern varName) ]
+            , expression =
+                Node emptyRange
+                    (Application
+                        [ outerFn
+                        , Node emptyRange
+                            (ParenthesizedExpression
+                                (Node emptyRange (Application [ innerFn, varRef ]))
+                            )
+                        ]
+                    )
+            }
+        )
+
+
+{-| Build `\x -> p1 x && p2 x` from two predicate expressions.
+-}
+conjoinPredicates : Node Expression -> Node Expression -> Node Expression
+conjoinPredicates p1 p2 =
+    let
+        varName =
+            "__x_fused"
+
+        varRef =
+            Node emptyRange (FunctionOrValue [] varName)
+
+        call p =
+            Node emptyRange (Application [ p, varRef ])
+    in
+    Node emptyRange
+        (LambdaExpression
+            { args = [ Node emptyRange (VarPattern varName) ]
+            , expression =
+                Node emptyRange (OperatorApplication "&&" Elm.Syntax.Infix.Right (call p1) (call p2))
+            }
+        )

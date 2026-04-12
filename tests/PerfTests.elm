@@ -54,6 +54,26 @@ listFusionTests =
                     )
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (List [ Int 1, Int 3, Int 5 ]))
+        , test "List.reverse (List.reverse xs) → xs" <|
+            \_ ->
+                Eval.eval "List.reverse (List.reverse [1, 2, 3])"
+                    |> Expect.equal (Ok (List [ Int 1, Int 2, Int 3 ]))
+        , test "List.map identity xs → xs" <|
+            \_ ->
+                Eval.eval "List.map identity [1, 2, 3]"
+                    |> Expect.equal (Ok (List [ Int 1, Int 2, Int 3 ]))
+        , test "List.concat (List.map f xs) → List.concatMap f xs" <|
+            \_ ->
+                Eval.eval "List.concat (List.map (\\x -> [x, x + 1]) [1, 2, 3])"
+                    |> Expect.equal (Ok (List [ Int 1, Int 2, Int 2, Int 3, Int 3, Int 4 ]))
+        , test "consecutive List.filter collapses" <|
+            \_ ->
+                Eval.eval "List.filter (\\x -> x < 10) (List.filter (\\x -> x > 2) [1, 2, 3, 5, 8, 13, 21])"
+                    |> Expect.equal (Ok (List [ Int 3, Int 5, Int 8 ]))
+        , test "List.foldl f init (List.reverse xs) → List.foldr f init xs" <|
+            \_ ->
+                Eval.eval "List.foldl (::) [] (List.reverse [1, 2, 3])"
+                    |> Expect.equal (Ok (List [ Int 1, Int 2, Int 3 ]))
         , test "double map produces correct result" <|
             \_ ->
                 Eval.eval
