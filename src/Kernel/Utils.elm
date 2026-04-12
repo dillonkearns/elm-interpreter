@@ -1,4 +1,4 @@
-module Kernel.Utils exposing (append, compare, comparison, equal, extractError, innerCompare)
+module Kernel.Utils exposing (append, compare, comparison, equal, equalValues, extractError, innerCompare)
 
 import Array
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -302,6 +302,74 @@ equal : Value -> Value -> Env -> Result EvalErrorData Bool
 equal l r env =
     innerCompare l r env
         |> Result.map (\order -> order == EQ)
+
+
+{-| Zero-allocation equality: returns Bool directly without Result/Order
+wrapping. Falls back to innerCompare for complex cases (Dict/Set/Array).
+-}
+equalValues : Value -> Value -> Bool
+equalValues l r =
+    case ( l, r ) of
+        ( Int lv, Int rv ) ->
+            lv == rv
+
+        ( Float lv, Float rv ) ->
+            lv == rv
+
+        ( Int lv, Float rv ) ->
+            toFloat lv == rv
+
+        ( Float lv, Int rv ) ->
+            lv == toFloat rv
+
+        ( String lv, String rv ) ->
+            lv == rv
+
+        ( Char lv, Char rv ) ->
+            lv == rv
+
+        ( Bool lb, Bool rb ) ->
+            lb == rb
+
+        ( Unit, Unit ) ->
+            True
+
+        ( Tuple la lb, Tuple ra rb ) ->
+            equalValues la ra && equalValues lb rb
+
+        ( Triple la lb lc, Triple ra rb rc ) ->
+            equalValues la ra && equalValues lb rb && equalValues lc rc
+
+        ( List ll, List rl ) ->
+            equalListHelp ll rl
+
+        ( Custom lname largs, Custom rname rargs ) ->
+            lname.name == rname.name && lname.moduleName == rname.moduleName && equalListHelp largs rargs
+
+        ( Record ldict, Record rdict ) ->
+            Dict.size ldict == Dict.size rdict && Dict.foldl (\k lv ok -> ok && (Dict.get k rdict |> Maybe.map (equalValues lv) |> Maybe.withDefault False)) True ldict
+
+        ( JsArray la, JsArray ra ) ->
+            Array.length la == Array.length ra && equalListHelp (Array.toList la) (Array.toList ra)
+
+        ( BytesValue la, BytesValue ra ) ->
+            la == ra
+
+        _ ->
+            False
+
+
+equalListHelp : List Value -> List Value -> Bool
+equalListHelp ll rl =
+    case ( ll, rl ) of
+        ( [], [] ) ->
+            True
+
+        ( lh :: lt, rh :: rt ) ->
+            equalValues lh rh && equalListHelp lt rt
+
+        _ ->
+            False
 
 
 comparison : List Order -> ModuleName -> ( Int, List Value -> Eval Value )

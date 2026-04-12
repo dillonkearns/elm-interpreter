@@ -1058,33 +1058,16 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                     )
 
                     "==" ->
-                        -- Fast path for equality: inline primitive comparison
                         case evalSimple l env of
                             Just lValue ->
                                 case evalSimple r env of
                                     Just rValue ->
-                                        case Kernel.Utils.equal lValue rValue env of
-                                            Ok True ->
-                                                continuation (Bool True)
-
-                                            Ok False ->
-                                                continuation (Bool False)
-
-                                            Err e ->
-                                                Recursion.base (EvErr e)
+                                        continuation (Bool (Kernel.Utils.equalValues lValue rValue))
 
                                     Nothing ->
                                         Types.recurseThenWithEval evalExpression ( r, cfg, env )
                                             (\rValue ->
-                                                case Kernel.Utils.equal lValue rValue env of
-                                                    Ok True ->
-                                                        continuation (Bool True)
-
-                                                    Ok False ->
-                                                        continuation (Bool False)
-
-                                                    Err e ->
-                                                        Recursion.base (EvErr e)
+                                                continuation (Bool (Kernel.Utils.equalValues lValue rValue))
                                             )
 
                             Nothing ->
@@ -1095,15 +1078,7 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             Just lValue ->
                                 case evalSimple r env of
                                     Just rValue ->
-                                        case Kernel.Utils.equal lValue rValue env of
-                                            Ok True ->
-                                                continuation (Bool False)
-
-                                            Ok False ->
-                                                continuation (Bool True)
-
-                                            Err e ->
-                                                Recursion.base (EvErr e)
+                                        continuation (Bool (not (Kernel.Utils.equalValues lValue rValue)))
 
                                     Nothing ->
                                         Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
