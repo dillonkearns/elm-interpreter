@@ -7,6 +7,7 @@ import Elm.Syntax.Node as Node exposing (Node(..))
 import Eval
 import Eval.Module
 import Expect
+import ListFusion
 import TcoAnalysis
 import Test exposing (Test, describe, test)
 import Types exposing (Value(..))
@@ -22,6 +23,84 @@ suite =
         , tcoAnalysisTests
         , constantFoldingTests
         , dictInliningTests
+        , listFusionTests
+        ]
+
+
+listFusionTests : Test
+listFusionTests =
+    describe "List.map fusion"
+        [ test "fused double map on 10K list returns correct sum" <|
+            \_ ->
+                Eval.Module.eval
+                    (String.join "\n"
+                        [ "module T exposing (main)"
+                        , "main = List.sum (List.map (\\x -> x * 2) (List.map (\\x -> x + 1) (List.range 1 10000)))"
+                        ]
+                    )
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 100030000))
+        , test "pipeline-style triple map is correct" <|
+            \_ ->
+                Eval.Module.eval
+                    (String.join "\n"
+                        [ "module T exposing (main)"
+                        , "main ="
+                        , "    [1, 2, 3]"
+                        , "        |> List.map (\\x -> x + 1)"
+                        , "        |> List.map (\\x -> x * 2)"
+                        , "        |> List.map (\\x -> x - 3)"
+                        ]
+                    )
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (List [ Int 1, Int 3, Int 5 ]))
+        , test "double map produces correct result" <|
+            \_ ->
+                Eval.eval
+                    "List.map (\\x -> x * 2) (List.map (\\x -> x + 1) [1, 2, 3])"
+                    |> Expect.equal (Ok (List [ Int 4, Int 6, Int 8 ]))
+        , test "triple map produces correct result" <|
+            \_ ->
+                Eval.eval
+                    "List.map (\\x -> x + 100) (List.map (\\x -> x * 2) (List.map (\\x -> x + 1) [1, 2, 3]))"
+                    |> Expect.equal (Ok (List [ Int 104, Int 106, Int 108 ]))
+        , test "ListFusion.fuse rewrites double map" <|
+            \_ ->
+                let
+                    source =
+                        "module T exposing (main)\nmain = List.map (\\x -> x * 2) (List.map (\\x -> x + 1) [1, 2, 3])\n"
+                in
+                case Elm.Parser.parseToFile source of
+                    Ok file ->
+                        case file.declarations of
+                            (Node _ (FunctionDeclaration f)) :: _ ->
+                                let
+                                    body =
+                                        (Node.value f.declaration).expression
+
+                                    fused =
+                                        ListFusion.fuse body
+
+                                    isSingleMap (Node _ expr) =
+                                        case expr of
+                                            Application ((Node _ (FunctionOrValue [ "List" ] "map")) :: _ :: (Node _ innerExpr) :: []) ->
+                                                case innerExpr of
+                                                    Application ((Node _ (FunctionOrValue [ "List" ] "map")) :: _) ->
+                                                        False
+
+                                                    _ ->
+                                                        True
+
+                                            _ ->
+                                                False
+                                in
+                                Expect.equal True (isSingleMap fused)
+
+                            _ ->
+                                Expect.fail "No function declaration"
+
+                    Err _ ->
+                        Expect.fail "Parse error"
         ]
 
 

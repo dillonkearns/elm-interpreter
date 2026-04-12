@@ -9,6 +9,7 @@ type alias NormalizationFlags =
     { foldConstantApplications : Bool
     , inlinePrecomputedRefs : Bool
     , inlineFunctions : Bool
+    , fuseListMaps : Bool
     }
 
 
@@ -17,6 +18,7 @@ all =
     { foldConstantApplications = True
     , inlinePrecomputedRefs = True
     , inlineFunctions = True
+    , fuseListMaps = True
     }
 
 
@@ -25,4 +27,5 @@ none =
     { foldConstantApplications = False
     , inlinePrecomputedRefs = False
     , inlineFunctions = False
+    , fuseListMaps = False
     }

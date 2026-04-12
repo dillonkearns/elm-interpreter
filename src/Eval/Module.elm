@@ -29,6 +29,7 @@ import FastDict as Dict
 import List.Extra
 import MemoRuntime
 import MemoSpec
+import ListFusion
 import NormalizationFlags
 import Result.MyExtra
 import Rope exposing (Rope)
@@ -1258,16 +1259,32 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
             , useResolvedIR = False
             }
 
+        activeFlags : NormalizationFlags.NormalizationFlags
+        activeFlags =
+            { foldConstantApplications = False
+            , inlinePrecomputedRefs = False
+            , inlineFunctions = False
+            , fuseListMaps = True
+            }
+
         foldedFns : Dict.Dict String FunctionImplementation
         foldedFns =
             fixpointFns
                 |> Dict.map
                     (\_ funcImpl ->
                         if not (List.isEmpty funcImpl.arguments) then
-                            { funcImpl
-                                | expression =
-                                    foldConstantSubExpressions foldEnv foldCfg funcImpl.expression
-                            }
+                            let
+                                afterFold =
+                                    foldWithFlags activeFlags foldEnv foldCfg funcImpl.expression
+
+                                afterFusion =
+                                    if activeFlags.fuseListMaps then
+                                        ListFusion.fuse afterFold
+
+                                    else
+                                        afterFold
+                            in
+                            { funcImpl | expression = afterFusion }
 
                         else
                             funcImpl
