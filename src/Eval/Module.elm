@@ -1685,13 +1685,7 @@ tryInlineFunction env moduleName funcName args =
                 List.length funcImpl.arguments == List.length args
                     && not (containsSelfCallInExpr funcName funcImpl.expression)
                     && expressionSize funcImpl.expression < 30
-<<<<<<< HEAD
-||||||| parent of adc9304 (Fix cross-module inlining: qualify-before-substitute + scope-aware subst)
-                    && not isCrossModule
-                    && hasNoLocalBindings funcImpl.expression
-=======
                     && (not isCrossModule || hasNoLocalBindings funcImpl.expression)
->>>>>>> adc9304 (Fix cross-module inlining: qualify-before-substitute + scope-aware subst)
             then
                 case extractVarPatternNames funcImpl.arguments of
                     Just paramNames ->
@@ -1980,7 +1974,7 @@ qualifyUnqualifiedRefs : List String -> Set.Set String -> Node Expression -> Nod
 qualifyUnqualifiedRefs sourceModule paramNames ((Node range expr) as node) =
     case expr of
         FunctionOrValue [] name ->
-            if Set.member name paramNames || Eval.Expression.isUpperName name || name == "True" || name == "False" then
+            if Set.member name paramNames then
                 node
 
             else
@@ -2012,6 +2006,74 @@ qualifyUnqualifiedRefs sourceModule paramNames ((Node range expr) as node) =
 
         _ ->
             node
+
+
+hasNoLocalBindings : Node Expression -> Bool
+hasNoLocalBindings (Node _ expr) =
+    case expr of
+        CaseExpression _ ->
+            False
+
+        LetExpression _ ->
+            False
+
+        LambdaExpression _ ->
+            False
+
+        Application items ->
+            List.all hasNoLocalBindings items
+
+        OperatorApplication _ _ l r ->
+            hasNoLocalBindings l && hasNoLocalBindings r
+
+        IfBlock c t e ->
+            hasNoLocalBindings c && hasNoLocalBindings t && hasNoLocalBindings e
+
+        ListExpr items ->
+            List.all hasNoLocalBindings items
+
+        TupledExpression items ->
+            List.all hasNoLocalBindings items
+
+        ParenthesizedExpression inner ->
+            hasNoLocalBindings inner
+
+        Negation inner ->
+            hasNoLocalBindings inner
+
+        RecordExpr fields ->
+            List.all (\(Node _ ( _, val )) -> hasNoLocalBindings val) fields
+
+        _ ->
+            True
+
+
+collectPatternNames : Node Pattern -> Set.Set String
+collectPatternNames (Node _ pat) =
+    case pat of
+        VarPattern name ->
+            Set.singleton name
+
+        TuplePattern items ->
+            List.foldl (\p acc -> Set.union acc (collectPatternNames p)) Set.empty items
+
+        UnConsPattern head tail ->
+            Set.union (collectPatternNames head) (collectPatternNames tail)
+
+        ListPattern items ->
+            List.foldl (\p acc -> Set.union acc (collectPatternNames p)) Set.empty items
+
+        NamedPattern _ args ->
+            List.foldl (\p acc -> Set.union acc (collectPatternNames p)) Set.empty args
+
+        AsPattern inner (Node _ alias) ->
+            Set.insert alias (collectPatternNames inner)
+
+        ParenthesizedPattern inner ->
+            collectPatternNames inner
+
+        _ ->
+            Set.empty
 
 
 {-| Replace a single module's declarations in an existing ProjectEnv.

@@ -21,6 +21,7 @@ suite =
         , largeListTailRecursionTests
         , tcoAnalysisTests
         , constantFoldingTests
+        , dictInliningTests
         ]
 
 
@@ -543,4 +544,39 @@ constantFoldingTests =
                     ]
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (Int 15))
+        ]
+
+
+dictInliningTests : Test
+dictInliningTests =
+    describe "Dict equality with inlining"
+        [ test "Dict.fromList compared via == is order-independent" <|
+            \_ ->
+                Eval.Module.eval
+                    (String.join "\n"
+                        [ "module T exposing (main)"
+                        , "import Dict"
+                        , "main ="
+                        , "    Dict.fromList [(1, \"a\"), (2, \"b\")] == Dict.fromList [(2, \"b\"), (1, \"a\")]"
+                        ]
+                    )
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Bool True))
+        , test "Dict with Set values compared via ==" <|
+            \_ ->
+                Eval.Module.eval
+                    (String.join "\n"
+                        [ "module T exposing (main)"
+                        , "import Dict"
+                        , "import Set"
+                        , "main ="
+                        , "    let"
+                        , "        d1 = Dict.fromList [(1, Set.fromList [\"a\", \"b\"]), (2, Set.fromList [\"c\"])]"
+                        , "        d2 = Dict.fromList [(2, Set.fromList [\"c\"]), (1, Set.fromList [\"b\", \"a\"])]"
+                        , "    in"
+                        , "    d1 == d2"
+                        ]
+                    )
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Bool True))
         ]
