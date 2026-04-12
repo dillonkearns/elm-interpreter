@@ -20,6 +20,7 @@ suite =
         , tcoProofTests
         , largeListTailRecursionTests
         , tcoAnalysisTests
+        , constantFoldingTests
         ]
 
 
@@ -495,4 +496,51 @@ tcoProofTests =
                 Eval.eval
                     "let f n = if n <= 0 then 0 else (n - 1) |> f in f 100"
                     |> Expect.equal (Ok (Int 0))
+        ]
+
+
+{-| Verify that constant folding inlines precomputed module-level constants
+into function bodies, avoiding dict lookups at eval time.
+-}
+constantFoldingTests : Test
+constantFoldingTests =
+    describe "Constant folding"
+        [ test "module constant inlined into function body" <|
+            \_ ->
+                Eval.Module.evalProject
+                    [ "module T exposing (main)\n\nmyList = [1, 2, 3]\n\nmain = List.length myList\n" ]
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 3))
+        , test "constant reference in recursive function" <|
+            \_ ->
+                Eval.Module.evalProject
+                    [ String.join "\n"
+                        [ "module T exposing (main)"
+                        , ""
+                        , "target = 42"
+                        , ""
+                        , "find xs ="
+                        , "    case xs of"
+                        , "        [] -> -1"
+                        , "        x :: rest ->"
+                        , "            if x == target then x"
+                        , "            else find rest"
+                        , ""
+                        , "main = find [1, 2, 42, 99]"
+                        ]
+                    ]
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 42))
+        , test "cross-module constant reference" <|
+            \_ ->
+                Eval.Module.evalProject
+                    [ "module Constants exposing (threshold)\n\nthreshold = 10\n"
+                    , String.join "\n"
+                        [ "module Main exposing (main)"
+                        , "import Constants"
+                        , "main = Constants.threshold + 5"
+                        ]
+                    ]
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 15))
         ]

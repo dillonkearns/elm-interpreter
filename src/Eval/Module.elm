@@ -1415,6 +1415,12 @@ foldConstantSubExpressions env cfg ((Node range expr) as node) =
                 FunctionOrValue [] "False" ->
                     True
 
+                ListExpr items ->
+                    List.all (\(Node _ ie) -> isConstantLeaf ie) items
+
+                TupledExpression items ->
+                    List.all (\(Node _ ie) -> isConstantLeaf ie) items
+
                 _ ->
                     False
     in
@@ -1533,6 +1539,44 @@ foldConstantSubExpressions env cfg ((Node range expr) as node) =
                 (LambdaExpression
                     { lambda | expression = foldConstantSubExpressions env cfg lambda.expression }
                 )
+
+        FunctionOrValue [] name ->
+            case Dict.get env.currentModuleKey env.shared.precomputedValues of
+                Just modulePrecomputed ->
+                    case Dict.get name modulePrecomputed of
+                        Just value ->
+                            if isLosslessValue value then
+                                Value.toExpression value
+
+                            else
+                                node
+
+                        Nothing ->
+                            node
+
+                Nothing ->
+                    node
+
+        FunctionOrValue ((_ :: _) as moduleName) name ->
+            let
+                qualifiedKey =
+                    Environment.moduleKey moduleName
+            in
+            case Dict.get qualifiedKey env.shared.precomputedValues of
+                Just modulePrecomputed ->
+                    case Dict.get name modulePrecomputed of
+                        Just value ->
+                            if isLosslessValue value then
+                                Value.toExpression value
+
+                            else
+                                node
+
+                        Nothing ->
+                            node
+
+                Nothing ->
+                    node
 
         _ ->
             node
