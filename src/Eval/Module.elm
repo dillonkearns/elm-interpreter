@@ -1421,6 +1421,13 @@ foldConstantSubExpressions env cfg ((Node range expr) as node) =
                 TupledExpression items ->
                     List.all (\(Node _ ie) -> isConstantLeaf ie) items
 
+                Application ((Node _ (FunctionOrValue _ name)) :: args) ->
+                    Eval.Expression.isUpperName name
+                        && List.all (\(Node _ ie) -> isConstantLeaf ie) args
+
+                RecordExpr fields ->
+                    List.all (\(Node _ ( _, Node _ ie )) -> isConstantLeaf ie) fields
+
                 _ ->
                     False
     in

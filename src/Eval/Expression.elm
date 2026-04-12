@@ -1,4 +1,4 @@
-module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs, kernelFunctions)
+module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs, isUpperName, kernelFunctions)
 
 import Array
 import Bitwise
@@ -1320,8 +1320,92 @@ evalSimple (Node _ expr) env =
                 Nothing ->
                     Nothing
 
+        Expression.Application ((Node _ (Expression.FunctionOrValue moduleName name)) :: args) ->
+            if isUpperName name then
+                evalSimpleConstructor moduleName name args env
+
+            else
+                Nothing
+
+        Expression.Negation inner ->
+            case evalSimple inner env of
+                Just (Int i) ->
+                    Just (Int (negate i))
+
+                Just (Float f) ->
+                    Just (Float (negate f))
+
+                _ ->
+                    Nothing
+
         _ ->
             Nothing
+
+
+isUpperName : String -> Bool
+isUpperName name =
+    case String.uncons name of
+        Just ( c, _ ) ->
+            Char.isUpper c
+
+        Nothing ->
+            False
+
+
+evalSimpleConstructor : List String -> String -> List (Node Expression) -> Env -> Maybe Value
+evalSimpleConstructor moduleName name args env =
+    case ( moduleName, name, args ) of
+        ( [], "Nothing", [] ) ->
+            Just (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+
+        ( [], "Just", [ arg ] ) ->
+            evalSimple arg env
+                |> Maybe.map (\v -> Custom { moduleName = [ "Maybe" ], name = "Just" } [ v ])
+
+        ( [], "Ok", [ arg ] ) ->
+            evalSimple arg env
+                |> Maybe.map (\v -> Custom { moduleName = [ "Result" ], name = "Ok" } [ v ])
+
+        ( [], "Err", [ arg ] ) ->
+            evalSimple arg env
+                |> Maybe.map (\v -> Custom { moduleName = [ "Result" ], name = "Err" } [ v ])
+
+        _ ->
+            -- General constructor: resolve module name and try to evalSimple all args
+            case evalSimpleArgs args env [] of
+                Just evaledArgs ->
+                    let
+                        resolvedModuleName =
+                            if List.isEmpty moduleName then
+                                case Dict.get name env.imports.exposedConstructors of
+                                    Just ( sourceModule, _ ) ->
+                                        sourceModule
+
+                                    Nothing ->
+                                        env.currentModule
+
+                            else
+                                moduleName
+                    in
+                    Just (Custom { moduleName = resolvedModuleName, name = name } evaledArgs)
+
+                Nothing ->
+                    Nothing
+
+
+evalSimpleArgs : List (Node Expression) -> Env -> List Value -> Maybe (List Value)
+evalSimpleArgs args env acc =
+    case args of
+        [] ->
+            Just (List.reverse acc)
+
+        arg :: rest ->
+            case evalSimple arg env of
+                Just v ->
+                    evalSimpleArgs rest env (v :: acc)
+
+                Nothing ->
+                    Nothing
 
 
 evalSimpleList : List (Node Expression) -> Env -> List Value -> Maybe Value
