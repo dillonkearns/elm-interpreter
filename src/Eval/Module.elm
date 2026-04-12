@@ -1682,7 +1682,8 @@ tryInlineFunction env moduleName funcName args =
             if
                 List.length funcImpl.arguments == List.length args
                     && not (containsSelfCallInExpr funcName funcImpl.expression)
-                    && expressionSize funcImpl.expression < 11
+                    && expressionSize funcImpl.expression < 30
+                    && not (referencesInternalHelper funcImpl.expression)
             then
                 case extractVarPatternNames funcImpl.arguments of
                     Just paramNames ->
@@ -2087,6 +2088,65 @@ qualifyUnqualifiedRefs sourceModule moduleFunctions locals ((Node range expr) as
 
         _ ->
             node
+
+
+{-| Check if an expression references functions that resolve via internal
+module helpers (like Basics.lt, Basics.gt) which are defined in the module
+but may not resolve correctly when qualified cross-module. These are
+lowercase functions that call Elm.Kernel.* — safe to skip inlining for.
+-}
+referencesInternalHelper : Node Expression -> Bool
+referencesInternalHelper (Node _ expr) =
+    case expr of
+        Application ((Node _ (FunctionOrValue ("Elm" :: "Kernel" :: _) _)) :: _) ->
+            True
+
+        Application items ->
+            List.any referencesInternalHelper items
+
+        OperatorApplication _ _ l r ->
+            referencesInternalHelper l || referencesInternalHelper r
+
+        IfBlock c t e ->
+            referencesInternalHelper c || referencesInternalHelper t || referencesInternalHelper e
+
+        CaseExpression { expression, cases } ->
+            referencesInternalHelper expression
+                || List.any (\( _, body ) -> referencesInternalHelper body) cases
+
+        LetExpression { declarations, expression } ->
+            referencesInternalHelper expression
+                || List.any
+                    (\(Node _ decl) ->
+                        case decl of
+                            LetFunction f ->
+                                referencesInternalHelper (Node.value f.declaration).expression
+
+                            LetDestructuring _ val ->
+                                referencesInternalHelper val
+                    )
+                    declarations
+
+        ListExpr items ->
+            List.any referencesInternalHelper items
+
+        TupledExpression items ->
+            List.any referencesInternalHelper items
+
+        ParenthesizedExpression inner ->
+            referencesInternalHelper inner
+
+        LambdaExpression { expression } ->
+            referencesInternalHelper expression
+
+        Negation inner ->
+            referencesInternalHelper inner
+
+        FunctionOrValue ("Elm" :: "Kernel" :: _) _ ->
+            True
+
+        _ ->
+            False
 
 
 hasNoLocalBindings : Node Expression -> Bool
