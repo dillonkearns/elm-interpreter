@@ -22,6 +22,7 @@ import Result.MyExtra
 import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
+import TcoAnalysis
 import TopologicalSort
 import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, ResolveBridge(..), Value(..))
 import Value exposing (nameError, typeError, unsupported)
@@ -60,15 +61,6 @@ fingerprintValue value =
             7
 
         List items ->
-            -- Use exact length (not just a size bucket) so successive TCO
-            -- loop iterations over a uniform list — e.g.
-            -- `List.Extra.transpose [ List.repeat 10000 1 ]` where every
-            -- element and the head value are identical, so a head-based
-            -- fingerprint can't distinguish iteration 16 from iteration 32 —
-            -- still produce different fingerprints as elements are peeled
-            -- off. Only runs every `tcoCycleCheckInterval` iterations, so
-            -- the O(n) cost is amortized and worth paying to eliminate the
-            -- false-positive "infinite recursion detected" on long lists.
             List.length items * 53 + 8
 
         Tuple a _ ->
@@ -137,10 +129,6 @@ sizeOfValue : Value -> Int
 sizeOfValue value =
     case value of
         List items ->
-            -- Use exact length (not a bucket) so Category B's size-growth
-            -- check can distinguish "accumulator grows by 1 per iteration"
-            -- from "stable size" on long lists. Only called every
-            -- `tcoCycleCheckInterval` iterations, so O(n) is amortized.
             List.length items
 
         String _ ->
@@ -171,6 +159,25 @@ sizeOfValue value =
 
         _ ->
             1
+
+
+boundedListLength : Int -> List a -> Int
+boundedListLength cap items =
+    boundedListLengthHelp cap 0 items
+
+
+boundedListLengthHelp : Int -> Int -> List a -> Int
+boundedListLengthHelp cap count items =
+    if count >= cap then
+        cap
+
+    else
+        case items of
+            [] ->
+                count
+
+            _ :: rest ->
+                boundedListLengthHelp cap (count + 1) rest
 
 
 shallowListBucket : List a -> Int
@@ -1052,7 +1059,6 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                                     )
 
                     "==" ->
-                        -- Fast path for equality: inline primitive comparison
                         case evalSimple l env of
                             Just lValue ->
                                 case evalSimple r env of
@@ -2404,23 +2410,130 @@ tcoLoop funcName body remaining cfg env =
             , collectMemoStats = cfg.collectMemoStats
             , useResolvedIR = cfg.useResolvedIR
             }
+
+        paramNames : List String
+        paramNames =
+            env.values
+                |> Dict.keys
+
+        hasIntercepts : Bool
+        hasIntercepts =
+            not (Dict.isEmpty cfg.intercepts)
+
     in
-    tcoLoopHelp funcName body remaining 0 0 0 0 innerCfg cfg env
+    tcoLoopHelp funcName body remaining 0 16 0 0 0 innerCfg cfg env
 
 
-{-| Only run the expensive cycle-detection fingerprinting once per
-`tcoCycleCheckInterval` iterations. Infinite recursion will still be
-caught, just `interval` steps later than it would otherwise — a tradeoff
-that's well worth it when the loop body does lots of interpreted work
-per iteration (e.g. List.foldl building up a Dict/Set).
+tcoLoopListDrain : String -> TcoAnalysis.ListDrainInfo -> Int -> Config -> Env -> EvalResult Value
+tcoLoopListDrain funcName info remaining innerCfg env =
+    if remaining <= 0 then
+        EvErr { currentModule = env.currentModule, callStack = env.callStack, error = Unsupported "Step limit exceeded" }
+
+    else
+        case Dict.get info.listArgName env.values of
+            Just (List []) ->
+                evalExpression info.baseCaseBody innerCfg env
+
+            Just (List (head :: tail)) ->
+                let
+                    envWithBindings =
+                        (case info.headBindingName of
+                            Just hName ->
+                                Environment.addValue hName head env
+
+                            Nothing ->
+                                env
+                        )
+                            |> Environment.addValue info.tailBindingName (List tail)
+                in
+                case evalExpression info.consCaseBody innerCfg envWithBindings of
+                    EvErr errData ->
+                        case errData.error of
+                            TailCall newValues ->
+                                tcoLoopListDrain funcName info (remaining - 1) innerCfg (Environment.replaceValues newValues env)
+
+                            _ ->
+                                EvErr errData
+
+                    other ->
+                        other
+
+            _ ->
+                evalExpression info.baseCaseBody innerCfg env
+
+
+{-| Fast TCO loop for provably-terminating patterns (e.g. list drain).
+No cycle detection, no fingerprinting, no size measurement. Just
+eval → extract TailCall → replace values → loop.
 -}
-tcoCycleCheckInterval : Int
-tcoCycleCheckInterval =
-    16
+tcoLoopSafe : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
+tcoLoopSafe funcName body remaining innerCfg env =
+    if remaining <= 0 then
+        EvErr
+            { currentModule = env.currentModule
+            , callStack = env.callStack
+            , error = Unsupported "Step limit exceeded"
+            }
+
+    else
+        case evalExpression body innerCfg env of
+            EvYield tag payload resume ->
+                EvYield tag payload
+                    (\resumeValue ->
+                        case resume resumeValue of
+                            EvErr { error } ->
+                                case error of
+                                    TailCall newValues ->
+                                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
+
+                                    _ ->
+                                        resume resumeValue
+
+                            other ->
+                                other
+                    )
+
+            EvMemoLookup payload resume ->
+                EvMemoLookup payload
+                    (\maybeValue ->
+                        case resume maybeValue of
+                            EvErr { error } ->
+                                case error of
+                                    TailCall newValues ->
+                                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
+
+                                    _ ->
+                                        resume maybeValue
+
+                            other ->
+                                other
+                    )
+
+            EvMemoStore payload next ->
+                case next of
+                    EvErr { error } ->
+                        case error of
+                            TailCall newValues ->
+                                EvMemoStore payload
+                                    (tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env))
+
+                            _ ->
+                                EvMemoStore payload next
+
+                    _ ->
+                        EvMemoStore payload next
+
+            other ->
+                case tcoExtractTailCall other of
+                    Just newValues ->
+                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
+
+                    Nothing ->
+                        other
 
 
-tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value
-tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env =
+tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value
+tcoLoopHelp funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env =
     if remaining <= 0 then
         EvErr
             { currentModule = env.currentModule
@@ -2437,30 +2550,28 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
             EvYield tag payload resume ->
                 EvYield tag payload
                     (\resumeValue ->
-                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
+                        tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
                     )
 
             EvMemoLookup payload resume ->
                 EvMemoLookup payload
                     (\maybeValue ->
-                        tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
+                        tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
                     )
 
             EvMemoStore payload next ->
                 EvMemoStore payload
-                    (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env next)
+                    (tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env next)
 
             _ ->
                 case tcoExtractTailCall result of
                     Just newValues ->
-                        -- Got a TailCall signal. Cheap per-iteration bookkeeping:
-                        -- increment iterationsSinceCheck. Only run full fingerprinting
-                        -- every tcoCycleCheckInterval iterations.
-                        if iterationsSinceCheck + 1 < tcoCycleCheckInterval then
+                        if iterationsSinceCheck + 1 < currentInterval then
                             tcoLoopHelp funcName
                                 body
                                 (remaining - 1)
                                 (iterationsSinceCheck + 1)
+                                currentInterval
                                 lastSize
                                 growCount
                                 lastFingerprint
@@ -2541,11 +2652,19 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
                                     }
 
                             else
-                                -- Continue loop, reset iterationsSinceCheck
+                                let
+                                    nextInterval =
+                                        if newGrowCount == 0 then
+                                            min (currentInterval * 2) 65536
+
+                                        else
+                                            max 16 (currentInterval // 2)
+                                in
                                 tcoLoopHelp funcName
                                     body
                                     (remaining - 1)
                                     0
+                                    nextInterval
                                     newSize
                                     newGrowCount
                                     newFingerprint
@@ -2558,35 +2677,33 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck lastSize growCount last
                         result
 
 
-tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value -> EvalResult Value
-tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env result =
+tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value -> EvalResult Value
+tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env result =
     case result of
         EvYield tag payload resume ->
             EvYield tag payload
                 (\resumeValue ->
-                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
+                    tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
                 )
 
         EvMemoLookup payload resume ->
             EvMemoLookup payload
                 (\maybeValue ->
-                    tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
+                    tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
                 )
 
         EvMemoStore payload next ->
             EvMemoStore payload
-                (tcoResumeResult funcName body remaining iterationsSinceCheck lastSize growCount lastFingerprint innerCfg cfg env next)
+                (tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env next)
 
         _ ->
             case tcoExtractTailCall result of
                 Just newValues ->
-                    -- Force a full cycle check on the iteration following a
-                    -- resume from yield/memo, so suspended state still gets
-                    -- validated periodically.
                     tcoLoopHelp funcName
                         body
                         (remaining - 1)
-                        tcoCycleCheckInterval
+                        currentInterval
+                        currentInterval
                         lastSize
                         growCount
                         lastFingerprint

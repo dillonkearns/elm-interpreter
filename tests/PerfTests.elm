@@ -1,9 +1,13 @@
 module PerfTests exposing (suite)
 
-import Elm.Syntax.Expression as Expression
+import Elm.Parser
+import Elm.Syntax.Declaration exposing (Declaration(..))
+import Elm.Syntax.Expression as Expression exposing (Expression(..))
+import Elm.Syntax.Node as Node exposing (Node(..))
 import Eval
 import Eval.Module
 import Expect
+import TcoAnalysis
 import Test exposing (Test, describe, test)
 import Types exposing (Value(..))
 
@@ -14,6 +18,147 @@ suite =
         [ listEqualityTests
         , tcoCorrectnessTests
         , tcoProofTests
+        , largeListTailRecursionTests
+        , tcoAnalysisTests
+        ]
+
+
+tcoAnalysisTests : Test
+tcoAnalysisTests =
+    let
+        analyzeModule src funcName params =
+            case Elm.Parser.parseToFile src of
+                Ok file ->
+                    let
+                        body =
+                            file.declarations
+                                |> List.filterMap
+                                    (\(Node _ decl) ->
+                                        case decl of
+                                            FunctionDeclaration f ->
+                                                let
+                                                    impl =
+                                                        Node.value f.declaration
+                                                in
+                                                if Node.value impl.name == funcName then
+                                                    Just impl.expression
+
+                                                else
+                                                    Nothing
+
+                                            _ ->
+                                                Nothing
+                                    )
+                                |> List.head
+                    in
+                    case body of
+                        Just expr ->
+                            TcoAnalysis.analyze funcName params expr
+
+                        Nothing ->
+                            TcoAnalysis.TcoGeneral
+
+                Err _ ->
+                    TcoAnalysis.TcoGeneral
+    in
+    describe "TcoAnalysis"
+        [ test "list drain detected as TcoListDrain" <|
+            \_ ->
+                let
+                    result =
+                        analyzeModule
+                            "module T exposing (..)\nwalk xs = case xs of\n    [] -> 0\n    _ :: rest -> walk rest\n"
+                            "walk"
+                            [ "xs" ]
+                in
+                case result of
+                    TcoAnalysis.TcoListDrain info ->
+                        Expect.all
+                            [ \i -> Expect.equal "xs" i.listArgName
+                            , \i -> Expect.equal Nothing i.headBindingName
+                            , \i -> Expect.equal "rest" i.tailBindingName
+                            ]
+                            info
+
+                    _ ->
+                        Expect.fail ("Expected TcoListDrain, got " ++ Debug.toString result)
+        , test "isInfixOfHelp-like pattern detected as TcoListDrain" <|
+            \_ ->
+                let
+                    result =
+                        analyzeModule
+                            "module T exposing (..)\ncheck h t list = case list of\n    [] -> False\n    x :: xs -> if x == h then True else check h t xs\n"
+                            "check"
+                            [ "h", "list", "t" ]
+                in
+                case result of
+                    TcoAnalysis.TcoListDrain info ->
+                        Expect.all
+                            [ \i -> Expect.equal "list" i.listArgName
+                            , \i -> Expect.equal (Just "x") i.headBindingName
+                            , \i -> Expect.equal "xs" i.tailBindingName
+                            ]
+                            info
+
+                    _ ->
+                        Expect.fail ("Expected TcoListDrain, got " ++ Debug.toString result)
+        , test "non-shrinking recursion is TcoGeneral" <|
+            \_ ->
+                analyzeModule
+                    "module T exposing (..)\nloop n = if n == 0 then 0 else loop n\n"
+                    "loop"
+                    [ "n" ]
+                    |> Expect.equal TcoAnalysis.TcoGeneral
+        , test "countdown is TcoGeneral (no list drain)" <|
+            \_ ->
+                analyzeModule
+                    "module T exposing (..)\ncountdown n = if n <= 0 then 0 else countdown (n - 1)\n"
+                    "countdown"
+                    [ "n" ]
+                    |> Expect.equal TcoAnalysis.TcoGeneral
+        ]
+
+
+{-| Regression: tail-recursive iteration over large lists was O(n²) because
+`sizeOfValue (List items) = List.length items` ran on every cycle-check
+(every 16 iterations). For a 1M-element list shrinking by 1 each iteration,
+total sizeOfValue cost was ~31 billion node traversals.
+
+These tests verify that iterating over large lists completes in bounded time
+(i.e. the cycle-check cost is O(1) per check, not O(listLen)).
+-}
+largeListTailRecursionTests : Test
+largeListTailRecursionTests =
+    describe "large list tail-recursion (sizeOfValue regression)"
+        [ test "walk 100K-element list in bounded time" <|
+            \_ ->
+                Eval.Module.eval
+                    (String.join "\n"
+                        [ "module T exposing (main)"
+                        , "walk xs = case xs of"
+                        , "    [] -> 0"
+                        , "    _ :: rest -> walk rest"
+                        , "main = walk (List.repeat 100000 1)"
+                        ]
+                    )
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 0))
+        , test "isInfixOf-like pattern on 100K list" <|
+            \_ ->
+                Eval.Module.eval
+                    (String.join "\n"
+                        [ "module T exposing (main)"
+                        , "check needle haystack ="
+                        , "    case haystack of"
+                        , "        [] -> False"
+                        , "        x :: xs ->"
+                        , "            if x == needle then True"
+                        , "            else check needle xs"
+                        , "main = check 999 (List.repeat 100000 1)"
+                        ]
+                    )
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Bool False))
         ]
 
 
