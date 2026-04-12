@@ -252,6 +252,45 @@ fuseHelp ((Node range expr) as node) =
         Application [ Node _ (FunctionOrValue [ "List" ] "length"), Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "reverse"), xs ]) ] ->
             Node range (Application [ Node emptyRange (FunctionOrValue [ "List" ] "length"), xs ])
 
+        -- Pattern: Maybe.map f (Maybe.map g x) → Maybe.map (\v -> f (g v)) x
+        Application [ Node _ (FunctionOrValue [ "Maybe" ] "map"), outerFn, Node _ (Application [ Node _ (FunctionOrValue [ "Maybe" ] "map"), innerFn, x ]) ] ->
+            Node range
+                (Application
+                    [ Node emptyRange (FunctionOrValue [ "Maybe" ] "map")
+                    , composeFn outerFn innerFn
+                    , x
+                    ]
+                )
+
+        -- Pattern: Maybe.map identity x → x
+        Application [ Node _ (FunctionOrValue [ "Maybe" ] "map"), Node _ (FunctionOrValue [] "identity"), x ] ->
+            x
+
+        -- Pattern: Result.map f (Result.map g r) → Result.map (\v -> f (g v)) r
+        Application [ Node _ (FunctionOrValue [ "Result" ] "map"), outerFn, Node _ (Application [ Node _ (FunctionOrValue [ "Result" ] "map"), innerFn, r ]) ] ->
+            Node range
+                (Application
+                    [ Node emptyRange (FunctionOrValue [ "Result" ] "map")
+                    , composeFn outerFn innerFn
+                    , r
+                    ]
+                )
+
+        -- Pattern: Result.map identity r → r
+        Application [ Node _ (FunctionOrValue [ "Result" ] "map"), Node _ (FunctionOrValue [] "identity"), r ] ->
+            r
+
+        -- Pattern: Maybe.withDefault x (Maybe.map f y) → stays (conditional, not always a win)
+        -- Pattern: Maybe.andThen f (Maybe.map g x) → Maybe.andThen (\v -> f (g v)) x
+        Application [ Node _ (FunctionOrValue [ "Maybe" ] "andThen"), andThenFn, Node _ (Application [ Node _ (FunctionOrValue [ "Maybe" ] "map"), mapFn, x ]) ] ->
+            Node range
+                (Application
+                    [ Node emptyRange (FunctionOrValue [ "Maybe" ] "andThen")
+                    , composeFn andThenFn mapFn
+                    , x
+                    ]
+                )
+
         _ ->
             node
 

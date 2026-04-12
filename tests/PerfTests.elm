@@ -94,6 +94,18 @@ listFusionTests =
             \_ ->
                 Eval.eval "List.length (List.map (\\x -> x * 2) [1, 2, 3, 4, 5])"
                     |> Expect.equal (Ok (Int 5))
+        , test "Maybe.map f (Maybe.map g x) fuses" <|
+            \_ ->
+                Eval.eval "Maybe.map (\\x -> x * 2) (Maybe.map (\\x -> x + 1) (Just 5))"
+                    |> Expect.equal (Ok (Custom { moduleName = [ "Maybe" ], name = "Just" } [ Int 12 ]))
+        , test "Maybe.map identity x → x" <|
+            \_ ->
+                Eval.eval "Maybe.map identity (Just 42)"
+                    |> Expect.equal (Ok (Custom { moduleName = [ "Maybe" ], name = "Just" } [ Int 42 ]))
+        , test "Result.map f (Result.map g r) fuses" <|
+            \_ ->
+                Eval.eval "Result.map (\\x -> x * 2) (Result.map (\\x -> x + 1) (Ok 5))"
+                    |> Expect.equal (Ok (Custom { moduleName = [ "Result" ], name = "Ok" } [ Int 12 ]))
         , test "double map produces correct result" <|
             \_ ->
                 Eval.eval
