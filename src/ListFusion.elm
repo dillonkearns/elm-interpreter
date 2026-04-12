@@ -220,6 +220,38 @@ fuseHelp ((Node range expr) as node) =
                     ]
                 )
 
+        -- Pattern: Dict.fromList (Dict.toList d) → d
+        Application [ Node _ (FunctionOrValue [ "Dict" ] "fromList"), Node _ (Application [ Node _ (FunctionOrValue [ "Dict" ] "toList"), d ]) ] ->
+            d
+
+        -- Pattern: Set.fromList (Set.toList s) → s
+        Application [ Node _ (FunctionOrValue [ "Set" ] "fromList"), Node _ (Application [ Node _ (FunctionOrValue [ "Set" ] "toList"), s ]) ] ->
+            s
+
+        -- Pattern: List.map Tuple.first (Dict.toList d) → Dict.keys d
+        Application [ Node _ (FunctionOrValue [ "List" ] "map"), Node _ (FunctionOrValue [ "Tuple" ] "first"), Node _ (Application [ Node _ (FunctionOrValue [ "Dict" ] "toList"), d ]) ] ->
+            Node range (Application [ Node emptyRange (FunctionOrValue [ "Dict" ] "keys"), d ])
+
+        -- Pattern: List.map Tuple.second (Dict.toList d) → Dict.values d
+        Application [ Node _ (FunctionOrValue [ "List" ] "map"), Node _ (FunctionOrValue [ "Tuple" ] "second"), Node _ (Application [ Node _ (FunctionOrValue [ "Dict" ] "toList"), d ]) ] ->
+            Node range (Application [ Node emptyRange (FunctionOrValue [ "Dict" ] "values"), d ])
+
+        -- Pattern: Dict.size (Dict.map f d) → Dict.size d  (map preserves size)
+        Application [ Node _ (FunctionOrValue [ "Dict" ] "size"), Node _ (Application [ Node _ (FunctionOrValue [ "Dict" ] "map"), _, d ]) ] ->
+            Node range (Application [ Node emptyRange (FunctionOrValue [ "Dict" ] "size"), d ])
+
+        -- Pattern: Dict.isEmpty (Dict.map f d) → Dict.isEmpty d
+        Application [ Node _ (FunctionOrValue [ "Dict" ] "isEmpty"), Node _ (Application [ Node _ (FunctionOrValue [ "Dict" ] "map"), _, d ]) ] ->
+            Node range (Application [ Node emptyRange (FunctionOrValue [ "Dict" ] "isEmpty"), d ])
+
+        -- Pattern: List.length (List.map f xs) → List.length xs  (map preserves length)
+        Application [ Node _ (FunctionOrValue [ "List" ] "length"), Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "map"), _, xs ]) ] ->
+            Node range (Application [ Node emptyRange (FunctionOrValue [ "List" ] "length"), xs ])
+
+        -- Pattern: List.length (List.reverse xs) → List.length xs
+        Application [ Node _ (FunctionOrValue [ "List" ] "length"), Node _ (Application [ Node _ (FunctionOrValue [ "List" ] "reverse"), xs ]) ] ->
+            Node range (Application [ Node emptyRange (FunctionOrValue [ "List" ] "length"), xs ])
+
         _ ->
             node
 

@@ -74,6 +74,26 @@ listFusionTests =
             \_ ->
                 Eval.eval "List.foldl (::) [] (List.reverse [1, 2, 3])"
                     |> Expect.equal (Ok (List [ Int 1, Int 2, Int 3 ]))
+        , test "Dict.fromList (Dict.toList d) → d" <|
+            \_ ->
+                Eval.eval "Dict.fromList (Dict.toList (Dict.fromList [(1, \"a\"), (2, \"b\")])) == Dict.fromList [(1, \"a\"), (2, \"b\")]"
+                    |> Expect.equal (Ok (Bool True))
+        , test "List.map Tuple.first (Dict.toList d) → Dict.keys d" <|
+            \_ ->
+                Eval.eval "List.map Tuple.first (Dict.toList (Dict.fromList [(1, \"a\"), (2, \"b\")]))"
+                    |> Expect.equal (Ok (List [ Int 1, Int 2 ]))
+        , test "List.map Tuple.second (Dict.toList d) → Dict.values d" <|
+            \_ ->
+                Eval.eval "List.map Tuple.second (Dict.toList (Dict.fromList [(1, \"a\"), (2, \"b\")]))"
+                    |> Expect.equal (Ok (List [ String "a", String "b" ]))
+        , test "Dict.size (Dict.map f d) → Dict.size d" <|
+            \_ ->
+                Eval.eval "Dict.size (Dict.map (\\k v -> v + 1) (Dict.fromList [(1, 10), (2, 20), (3, 30)]))"
+                    |> Expect.equal (Ok (Int 3))
+        , test "List.length (List.map f xs) → List.length xs" <|
+            \_ ->
+                Eval.eval "List.length (List.map (\\x -> x * 2) [1, 2, 3, 4, 5])"
+                    |> Expect.equal (Ok (Int 5))
         , test "double map produces correct result" <|
             \_ ->
                 Eval.eval
