@@ -24,6 +24,88 @@ suite =
         , constantFoldingTests
         , dictInliningTests
         , listFusionTests
+        , normalizationLosslessnessTests
+        ]
+
+
+{-| Regression: the elm-review package defines `infinity = round (1 / 0)`,
+which evaluated to `Int Infinity` at normalization time. The normalizer
+replaced the body with `Expression.Integer Infinity`, which the Wire3
+codec can't round-trip — making the package summary cache silently
+refuse to persist (package_summary_cache_roundtrip_ok = 0 on every
+warm run, ~500ms wasted on body-edit scenarios). Fix was to make
+`isLosslessValue` reject non-finite Int/Float values so the normalizer
+leaves the original expression alone.
+-}
+normalizationLosslessnessTests : Test
+normalizationLosslessnessTests =
+    describe "normalization skips non-finite Int/Float"
+        [ test "round (1/0) stays as an Application, not Integer Infinity" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        "module Test exposing (infinity)\n\ninfinity : Int\ninfinity =\n    round (1 / 0)\n"
+                in
+                case Eval.Module.parseProjectSources [ source ] of
+                    Err _ ->
+                        Expect.fail "parse failed"
+
+                    Ok parsedModules ->
+                        let
+                            normalized =
+                                Eval.Module.normalizeSummaries
+                                    (Eval.Module.buildCachedModuleSummariesFromParsed parsedModules)
+
+                            infinityBody =
+                                normalized
+                                    |> List.concatMap .functions
+                                    |> List.filter (\f -> Node.value f.name == "infinity")
+                                    |> List.head
+                                    |> Maybe.map (\f -> Node.value f.expression)
+                        in
+                        case infinityBody of
+                            Just (Integer _) ->
+                                Expect.fail "infinity was normalized to an Integer literal (Infinity cannot round-trip through Wire3)"
+
+                            Just (Application _) ->
+                                Expect.pass
+
+                            Just _ ->
+                                Expect.pass
+
+                            Nothing ->
+                                Expect.fail "infinity function not found in normalized output"
+        , test "1/0 stays as an OperatorApplication, not Floatable Infinity" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        "module Test exposing (inf)\n\ninf : Float\ninf =\n    1 / 0\n"
+                in
+                case Eval.Module.parseProjectSources [ source ] of
+                    Err _ ->
+                        Expect.fail "parse failed"
+
+                    Ok parsedModules ->
+                        let
+                            normalized =
+                                Eval.Module.normalizeSummaries
+                                    (Eval.Module.buildCachedModuleSummariesFromParsed parsedModules)
+
+                            infBody =
+                                normalized
+                                    |> List.concatMap .functions
+                                    |> List.filter (\f -> Node.value f.name == "inf")
+                                    |> List.head
+                                    |> Maybe.map (\f -> Node.value f.expression)
+                        in
+                        case infBody of
+                            Just (Floatable _) ->
+                                Expect.fail "inf was normalized to a Float literal (Infinity cannot round-trip through Wire3)"
+
+                            _ ->
+                                Expect.pass
         ]
 
 

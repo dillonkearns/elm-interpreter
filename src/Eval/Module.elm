@@ -1331,11 +1331,22 @@ isLosslessValue value =
         Types.String _ ->
             True
 
-        Types.Int _ ->
-            True
+        Types.Int i ->
+            -- `round (1 / 0)` and friends produce an `Int Infinity` at the
+            -- JS level; the AstWireCodec's Wire3 integer encoder can't
+            -- round-trip non-finite values, so skip normalization and keep
+            -- the original expression (e.g., `round (1 / 0)` stays as-is).
+            let
+                asFloat : Float
+                asFloat =
+                    toFloat i
+            in
+            not (isInfinite asFloat) && not (isNaN asFloat)
 
-        Types.Float _ ->
-            True
+        Types.Float f ->
+            -- Same concern: `Value.toExpression (Float Infinity)` encodes as
+            -- `Floatable Infinity`, which Wire3 can't serialize cleanly.
+            not (isInfinite f) && not (isNaN f)
 
         Types.Char _ ->
             True
