@@ -1063,12 +1063,28 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             Just lValue ->
                                 case evalSimple r env of
                                     Just rValue ->
-                                        continuation (Bool (Kernel.Utils.equalValues lValue rValue))
+                                        case Kernel.Utils.equal lValue rValue env of
+                                            Ok True ->
+                                                continuation (Bool True)
+
+                                            Ok False ->
+                                                continuation (Bool False)
+
+                                            Err e ->
+                                                Recursion.base (EvErr e)
 
                                     Nothing ->
                                         Types.recurseThenWithEval evalExpression ( r, cfg, env )
                                             (\rValue ->
-                                                continuation (Bool (Kernel.Utils.equalValues lValue rValue))
+                                                case Kernel.Utils.equal lValue rValue env of
+                                                    Ok True ->
+                                                        continuation (Bool True)
+
+                                                    Ok False ->
+                                                        continuation (Bool False)
+
+                                                    Err e ->
+                                                        Recursion.base (EvErr e)
                                             )
 
                             Nothing ->
@@ -1079,7 +1095,15 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                             Just lValue ->
                                 case evalSimple r env of
                                     Just rValue ->
-                                        continuation (Bool (not (Kernel.Utils.equalValues lValue rValue)))
+                                        case Kernel.Utils.equal lValue rValue env of
+                                            Ok True ->
+                                                continuation (Bool False)
+
+                                            Ok False ->
+                                                continuation (Bool True)
+
+                                            Err e ->
+                                                Recursion.base (EvErr e)
 
                                     Nothing ->
                                         Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
@@ -2392,16 +2416,50 @@ tcoLoop funcName body remaining cfg env =
             env.values
                 |> Dict.keys
 
-        strategy : TcoAnalysis.TcoStrategy
-        strategy =
-            TcoAnalysis.analyze funcName paramNames body
-    in
-    case strategy of
-        TcoAnalysis.TcoSafe ->
-            tcoLoopSafe funcName body remaining innerCfg env
+        hasIntercepts : Bool
+        hasIntercepts =
+            not (Dict.isEmpty cfg.intercepts)
 
-        TcoAnalysis.TcoGeneral ->
-            tcoLoopHelp funcName body remaining 0 16 0 0 0 innerCfg cfg env
+    in
+    tcoLoopHelp funcName body remaining 0 16 0 0 0 innerCfg cfg env
+
+
+tcoLoopListDrain : String -> TcoAnalysis.ListDrainInfo -> Int -> Config -> Env -> EvalResult Value
+tcoLoopListDrain funcName info remaining innerCfg env =
+    if remaining <= 0 then
+        EvErr { currentModule = env.currentModule, callStack = env.callStack, error = Unsupported "Step limit exceeded" }
+
+    else
+        case Dict.get info.listArgName env.values of
+            Just (List []) ->
+                evalExpression info.baseCaseBody innerCfg env
+
+            Just (List (head :: tail)) ->
+                let
+                    envWithBindings =
+                        (case info.headBindingName of
+                            Just hName ->
+                                Environment.addValue hName head env
+
+                            Nothing ->
+                                env
+                        )
+                            |> Environment.addValue info.tailBindingName (List tail)
+                in
+                case evalExpression info.consCaseBody innerCfg envWithBindings of
+                    EvErr errData ->
+                        case errData.error of
+                            TailCall newValues ->
+                                tcoLoopListDrain funcName info (remaining - 1) innerCfg (Environment.replaceValues newValues env)
+
+                            _ ->
+                                EvErr errData
+
+                    other ->
+                        other
+
+            _ ->
+                evalExpression info.baseCaseBody innerCfg env
 
 
 {-| Fast TCO loop for provably-terminating patterns (e.g. list drain).

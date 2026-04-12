@@ -62,20 +62,46 @@ tcoAnalysisTests =
                     TcoAnalysis.TcoGeneral
     in
     describe "TcoAnalysis"
-        [ test "list drain detected as TcoSafe" <|
+        [ test "list drain detected as TcoListDrain" <|
             \_ ->
-                analyzeModule
-                    "module T exposing (..)\nwalk xs = case xs of\n    [] -> 0\n    _ :: rest -> walk rest\n"
-                    "walk"
-                    [ "xs" ]
-                    |> Expect.equal TcoAnalysis.TcoSafe
-        , test "isInfixOfHelp-like pattern detected as TcoSafe" <|
+                let
+                    result =
+                        analyzeModule
+                            "module T exposing (..)\nwalk xs = case xs of\n    [] -> 0\n    _ :: rest -> walk rest\n"
+                            "walk"
+                            [ "xs" ]
+                in
+                case result of
+                    TcoAnalysis.TcoListDrain info ->
+                        Expect.all
+                            [ \i -> Expect.equal "xs" i.listArgName
+                            , \i -> Expect.equal Nothing i.headBindingName
+                            , \i -> Expect.equal "rest" i.tailBindingName
+                            ]
+                            info
+
+                    _ ->
+                        Expect.fail ("Expected TcoListDrain, got " ++ Debug.toString result)
+        , test "isInfixOfHelp-like pattern detected as TcoListDrain" <|
             \_ ->
-                analyzeModule
-                    "module T exposing (..)\ncheck h t list = case list of\n    [] -> False\n    x :: xs -> if x == h then True else check h t xs\n"
-                    "check"
-                    [ "h", "list", "t" ]
-                    |> Expect.equal TcoAnalysis.TcoSafe
+                let
+                    result =
+                        analyzeModule
+                            "module T exposing (..)\ncheck h t list = case list of\n    [] -> False\n    x :: xs -> if x == h then True else check h t xs\n"
+                            "check"
+                            [ "h", "list", "t" ]
+                in
+                case result of
+                    TcoAnalysis.TcoListDrain info ->
+                        Expect.all
+                            [ \i -> Expect.equal "list" i.listArgName
+                            , \i -> Expect.equal (Just "x") i.headBindingName
+                            , \i -> Expect.equal "xs" i.tailBindingName
+                            ]
+                            info
+
+                    _ ->
+                        Expect.fail ("Expected TcoListDrain, got " ++ Debug.toString result)
         , test "non-shrinking recursion is TcoGeneral" <|
             \_ ->
                 analyzeModule

@@ -1,64 +1,178 @@
-module TcoAnalysis exposing (TcoStrategy(..), analyze)
+module TcoAnalysis exposing (ListDrainInfo, TcoStrategy(..), analyze)
 
 {-| Static analysis of tail-recursive function bodies to determine
-whether cycle detection can be safely skipped at runtime.
-
-Computed once per function (during normalization or at first call),
-then stored/cached so tcoLoop can dispatch to a cycle-check-free
-fast path for provably-terminating patterns.
+whether cycle detection can be safely skipped at runtime, and to
+extract structural info for body specialization.
 
 -}
 
-import Elm.Syntax.Expression exposing (Expression(..), LetDeclaration(..))
+import Elm.Syntax.Expression exposing (CaseBlock, Expression(..), LetDeclaration(..))
 import Elm.Syntax.Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..))
 import Set exposing (Set)
 
 
 type TcoStrategy
-    = TcoSafe
+    = TcoListDrain ListDrainInfo
+    | TcoSafe
     | TcoGeneral
 
 
-{-| Analyze a tail-recursive function body. Given the function name and
-its parameter names, determine if every tail-recursive call passes a
-structurally-smaller argument for at least one parameter (guaranteeing
-termination).
+type alias ListDrainInfo =
+    { listArgName : String
+    , headBindingName : Maybe String
+    , tailBindingName : String
+    , baseCaseBody : Node Expression
+    , consCaseBody : Node Expression
+    }
 
-Currently detects:
-- List drain: a parameter matched via `x :: rest` in a case, where the
-  tail call passes `rest` for that parameter
-- Countdown: a parameter compared via `n <= 0` (or similar), where the
-  tail call passes `n - 1` for that parameter
 
--}
 analyze : String -> List String -> Node Expression -> TcoStrategy
-analyze funcName paramNames body =
+analyze qualifiedFuncName paramNames body =
     let
-        tailCalls =
-            collectTailCalls funcName body
+        funcName =
+            qualifiedFuncName
+                |> String.split "."
+                |> List.reverse
+                |> List.head
+                |> Maybe.withDefault qualifiedFuncName
     in
-    if List.isEmpty tailCalls then
-        TcoGeneral
+    case analyzeListDrain funcName paramNames body of
+        Just info ->
+            TcoListDrain info
 
-    else if List.all (callHasShrinkingArg paramNames body) tailCalls then
-        TcoSafe
+        Nothing ->
+            let
+                tailCalls =
+                    collectTailCalls funcName body
+            in
+            if List.isEmpty tailCalls then
+                TcoGeneral
 
-    else
-        TcoGeneral
+            else if List.all (callHasShrinkingArg body) tailCalls then
+                TcoSafe
+
+            else
+                TcoGeneral
 
 
-{-| Collect all tail-recursive call argument lists from the body.
--}
+analyzeListDrain : String -> List String -> Node Expression -> Maybe ListDrainInfo
+analyzeListDrain funcName paramNames body =
+    case unwrapLets body of
+        Node _ (CaseExpression caseBlock) ->
+            analyzeListDrainCase funcName paramNames caseBlock
+
+        _ ->
+            Nothing
+
+
+unwrapLets : Node Expression -> Node Expression
+unwrapLets ((Node _ expr) as node) =
+    case expr of
+        LetExpression { expression } ->
+            unwrapLets expression
+
+        _ ->
+            node
+
+
+analyzeListDrainCase : String -> List String -> CaseBlock -> Maybe ListDrainInfo
+analyzeListDrainCase funcName paramNames { expression, cases } =
+    case expression of
+        Node _ (FunctionOrValue [] listArgName) ->
+            if not (List.member listArgName paramNames) then
+                Nothing
+
+            else
+                case ( findBaseCase funcName cases, findConsCase cases ) of
+                    ( Just baseCaseBody, Just ( headBinding, tailBinding, consCaseBody ) ) ->
+                        if List.all (callPassesTailVar tailBinding) (collectTailCalls funcName consCaseBody) then
+                            Just
+                                { listArgName = listArgName
+                                , headBindingName = headBinding
+                                , tailBindingName = tailBinding
+                                , baseCaseBody = baseCaseBody
+                                , consCaseBody = consCaseBody
+                                }
+
+                        else
+                            Nothing
+
+                    _ ->
+                        Nothing
+
+        _ ->
+            Nothing
+
+
+findBaseCase : String -> List ( Node Pattern, Node Expression ) -> Maybe (Node Expression)
+findBaseCase funcName cases =
+    List.filterMap
+        (\( Node _ pat, body ) ->
+            case pat of
+                ListPattern [] ->
+                    if List.isEmpty (collectTailCalls funcName body) then
+                        Just body
+
+                    else
+                        Nothing
+
+                _ ->
+                    Nothing
+        )
+        cases
+        |> List.head
+
+
+findConsCase : List ( Node Pattern, Node Expression ) -> Maybe ( Maybe String, String, Node Expression )
+findConsCase cases =
+    List.filterMap
+        (\( Node _ pat, body ) ->
+            case pat of
+                UnConsPattern (Node _ headPat) (Node _ (VarPattern tailName)) ->
+                    Just
+                        ( case headPat of
+                            VarPattern n ->
+                                Just n
+
+                            AllPattern ->
+                                Nothing
+
+                            _ ->
+                                Just "__head__"
+                        , tailName
+                        , body
+                        )
+
+                _ ->
+                    Nothing
+        )
+        cases
+        |> List.head
+
+
+callPassesTailVar : String -> List (Node Expression) -> Bool
+callPassesTailVar tailVarName args =
+    List.any
+        (\(Node _ argExpr) ->
+            case argExpr of
+                FunctionOrValue [] name ->
+                    name == tailVarName
+
+                _ ->
+                    False
+        )
+        args
+
+
 collectTailCalls : String -> Node Expression -> List (List (Node Expression))
 collectTailCalls funcName (Node _ expr) =
     case expr of
-        IfBlock _ (Node _ trueExpr) (Node _ falseExpr) ->
-            collectTailCallsFromExpr funcName trueExpr
-                ++ collectTailCallsFromExpr funcName falseExpr
+        IfBlock _ thenBranch elseBranch ->
+            collectTailCalls funcName thenBranch ++ collectTailCalls funcName elseBranch
 
         CaseExpression { cases } ->
-            List.concatMap (\( _, Node _ branchExpr ) -> collectTailCallsFromExpr funcName branchExpr) cases
+            List.concatMap (\( _, branchBody ) -> collectTailCalls funcName branchBody) cases
 
         LetExpression { expression } ->
             collectTailCalls funcName expression
@@ -74,40 +188,11 @@ collectTailCalls funcName (Node _ expr) =
             []
 
 
-collectTailCallsFromExpr : String -> Expression -> List (List (Node Expression))
-collectTailCallsFromExpr funcName expr =
-    case expr of
-        IfBlock _ (Node _ trueExpr) (Node _ falseExpr) ->
-            collectTailCallsFromExpr funcName trueExpr
-                ++ collectTailCallsFromExpr funcName falseExpr
-
-        CaseExpression { cases } ->
-            List.concatMap (\( _, Node _ branchExpr ) -> collectTailCallsFromExpr funcName branchExpr) cases
-
-        LetExpression { expression } ->
-            collectTailCalls funcName expression
-
-        Application ((Node _ (FunctionOrValue [] name)) :: args) ->
-            if name == funcName then
-                [ args ]
-
-            else
-                []
-
-        _ ->
-            []
-
-
-{-| Check if a tail call has at least one argument that is a cons-tail
-variable from a case match on one of the parameters. Order-independent:
-doesn't rely on argument position matching parameter position.
--}
-callHasShrinkingArg : List String -> Node Expression -> List (Node Expression) -> Bool
-callHasShrinkingArg _ body callArgs =
+callHasShrinkingArg : Node Expression -> List (Node Expression) -> Bool
+callHasShrinkingArg body callArgs =
     let
         consTailVars =
-            collectConsTailBindings body
-                |> Set.map Tuple.second
+            collectConsTailBindings body |> Set.map Tuple.second
     in
     List.any
         (\(Node _ argExpr) ->
@@ -121,43 +206,21 @@ callHasShrinkingArg _ body callArgs =
         callArgs
 
 
-{-| Walk the body and collect (listParam, tailVar) pairs from
-`case listParam of ... x :: tailVar -> ...` patterns.
--}
 collectConsTailBindings : Node Expression -> Set ( String, String )
 collectConsTailBindings (Node _ expr) =
     case expr of
         CaseExpression { expression, cases } ->
-            let
-                scrutineeVar =
-                    case expression of
-                        Node _ (FunctionOrValue [] name) ->
-                            Just name
-
-                        _ ->
-                            Nothing
-            in
-            case scrutineeVar of
-                Just sVar ->
-                    cases
-                        |> List.foldl
-                            (\( Node _ pattern, branchBody ) acc ->
-                                let
-                                    tailBindings =
-                                        extractConsTail sVar pattern
-
-                                    innerBindings =
-                                        collectConsTailBindings branchBody
-                                in
-                                Set.union (Set.union tailBindings innerBindings) acc
-                            )
-                            Set.empty
-
-                Nothing ->
+            case expression of
+                Node _ (FunctionOrValue [] sVar) ->
                     List.foldl
-                        (\( _, branchBody ) acc -> Set.union (collectConsTailBindings branchBody) acc)
+                        (\( Node _ pattern, branchBody ) acc ->
+                            Set.union (Set.union (extractConsTail sVar pattern) (collectConsTailBindings branchBody)) acc
+                        )
                         Set.empty
                         cases
+
+                _ ->
+                    List.foldl (\( _, branchBody ) acc -> Set.union (collectConsTailBindings branchBody) acc) Set.empty cases
 
         IfBlock _ thenBranch elseBranch ->
             Set.union (collectConsTailBindings thenBranch) (collectConsTailBindings elseBranch)
@@ -169,30 +232,11 @@ collectConsTailBindings (Node _ expr) =
             Set.empty
 
 
-{-| From a case pattern matching on `scrutineeVar`, extract (scrutineeVar, tailVar)
-if the pattern is `_ :: tailVar` or `x :: tailVar`.
--}
 extractConsTail : String -> Pattern -> Set ( String, String )
 extractConsTail scrutineeVar pattern =
     case pattern of
         UnConsPattern _ (Node _ (VarPattern tailName)) ->
             Set.singleton ( scrutineeVar, tailName )
-
-        UnConsPattern _ (Node _ (AsPattern _ (Node _ tailName))) ->
-            Set.singleton ( scrutineeVar, tailName )
-
-        NamedPattern _ subPatterns ->
-            List.foldl
-                (\(Node _ subPat) acc ->
-                    case subPat of
-                        UnConsPattern _ (Node _ (VarPattern tailName)) ->
-                            Set.insert ( scrutineeVar, tailName ) acc
-
-                        _ ->
-                            acc
-                )
-                Set.empty
-                subPatterns
 
         _ ->
             Set.empty

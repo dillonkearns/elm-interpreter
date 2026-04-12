@@ -344,7 +344,39 @@ equalValues l r =
             equalListHelp ll rl
 
         ( Custom lname largs, Custom rname rargs ) ->
-            lname.name == rname.name && lname.moduleName == rname.moduleName && equalListHelp largs rargs
+            if lname.name /= rname.name then
+                if isDictNode lname.name && isDictNode rname.name then
+                    equalValues (dictToSortedList l) (dictToSortedList r)
+
+                else
+                    False
+
+            else if lname.moduleName /= rname.moduleName then
+                False
+
+            else
+                case lname.name of
+                    "Set_elm_builtin" ->
+                        case ( largs, rargs ) of
+                            ( [ ldict ], [ rdict ] ) ->
+                                equalValues (dictToSortedList ldict) (dictToSortedList rdict)
+
+                            _ ->
+                                equalListHelp largs rargs
+
+                    "RBNode_elm_builtin" ->
+                        equalValues (dictToSortedList l) (dictToSortedList r)
+
+                    "RBEmpty_elm_builtin" ->
+                        True
+
+                    _ ->
+                        case ( Value.toArray l, Value.toArray r ) of
+                            ( Just la, Just ra ) ->
+                                equalListHelp la ra
+
+                            _ ->
+                                equalListHelp largs rargs
 
         ( Record ldict, Record rdict ) ->
             Dict.size ldict == Dict.size rdict && Dict.foldl (\k lv ok -> ok && (Dict.get k rdict |> Maybe.map (equalValues lv) |> Maybe.withDefault False)) True ldict

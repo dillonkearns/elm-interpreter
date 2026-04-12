@@ -3269,6 +3269,7 @@ setModulePrecomputedValues moduleName values (ProjectEnv projectEnv) =
                     | shared =
                         { functions = env.shared.functions
                         , moduleImports = env.shared.moduleImports
+                        , resolveBridge = env.shared.resolveBridge
                         , precomputedValues = Dict.insert key values env.shared.precomputedValues
                         }
                 }
