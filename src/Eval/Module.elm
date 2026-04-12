@@ -464,47 +464,60 @@ resolveProject summaries =
             RE.buildHigherOrderRegistry
                 (\key -> Dict.get key globalIds)
 
-        -- Build the kernel dispatcher registry by walking Core.functions
-        -- and finding entries whose body is a direct kernel reference
-        -- (the common "wrapper" pattern). For each such entry, precompute
-        -- the (arity, kernelFn) tuple so the new evaluator can call the
-        -- kernel function directly at delegation time, skipping the
-        -- AST synthesis round-trip.
+        {- Build the kernel dispatcher registry by walking EVERY kernel
+           function from `Eval.Expression.kernelFunctions` and mapping
+           each one to its user-facing `GlobalId`. This covers:
+
+           1. `Elm.Kernel.*` functions (e.g. `Elm.Kernel.Basics.add`)
+              → mapped to the core module (`Basics.add`) via prefix strip
+           2. User-level module kernels (e.g. `Dict.empty`, `Dict.insert`)
+              → mapped directly by module name
+
+           Previously only covered direct 0-arg kernel aliases found
+           by `extractKernelReference`. The widened version registers
+           ALL kernel functions, which means evalR's `delegateCoreApply`
+           can dispatch via int-keyed `FastDict.get id` instead of
+           falling through to the string-keyed `delegateByName` path.
+
+           The profile shows `_Utils_cmp` (string comparison for Dict
+           key ordering) at 18.5% of total time, with 85% of that
+           coming from `Dict.get` in `evalKernelFunction`'s string-keyed
+           lookup. This change eliminates that entire string-comparison
+           cost path for kernel functions.
+        -}
         kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
         kernelDispatchers =
-            Core.functions
+            Eval.Expression.kernelFunctions
                 |> Dict.foldl
-                    (\coreModuleName moduleDict outer ->
+                    (\moduleKey moduleDict outer ->
+                        let
+                            -- Map kernel module key back to a ModuleName
+                            -- for globalIds lookup. kernelFunctions keys
+                            -- are joined strings like "Elm.Kernel.Basics"
+                            -- or "Dict". Split and strip the Elm.Kernel prefix.
+                            coreModuleName : ModuleName
+                            coreModuleName =
+                                let
+                                    parts =
+                                        String.split "." moduleKey
+                                in
+                                case parts of
+                                    "Elm" :: "Kernel" :: rest ->
+                                        rest
+
+                                    _ ->
+                                        parts
+                        in
                         moduleDict
                             |> Dict.foldl
-                                (\funcName impl acc ->
-                                    case extractKernelReference impl of
-                                        Just ( kernelModuleName, kernelName ) ->
-                                            let
-                                                kernelModuleKey : String
-                                                kernelModuleKey =
-                                                    Environment.moduleKey kernelModuleName
-                                            in
-                                            case Dict.get kernelModuleKey Eval.Expression.kernelFunctions of
-                                                Just kernelModule ->
-                                                    case Dict.get kernelName kernelModule of
-                                                        Just ( arity, kernelFn ) ->
-                                                            case Dict.get ( coreModuleName, funcName ) globalIds of
-                                                                Just id ->
-                                                                    Dict.insert id
-                                                                        { arity = arity
-                                                                        , kernelFn = kernelFn
-                                                                        }
-                                                                        acc
-
-                                                                Nothing ->
-                                                                    acc
-
-                                                        Nothing ->
-                                                            acc
-
-                                                Nothing ->
-                                                    acc
+                                (\funcName ( arity, kernelFn ) acc ->
+                                    case Dict.get ( coreModuleName, funcName ) globalIds of
+                                        Just id ->
+                                            Dict.insert id
+                                                { arity = arity
+                                                , kernelFn = kernelFn
+                                                }
+                                                acc
 
                                         Nothing ->
                                             acc
