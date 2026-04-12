@@ -797,7 +797,7 @@ update msg model =
 
                 ( result, callTree, logLines ) =
                     Eval.Module.traceOrEvalModule
-                        { trace = tracing, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = FastDict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False }
+                        { trace = tracing, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = FastDict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
                         moduleSource
                         (Expression.FunctionOrValue [] "main")
 

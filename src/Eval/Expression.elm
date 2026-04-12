@@ -1,4 +1,4 @@
-module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs)
+module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs, kernelFunctions)
 
 import Array
 import Bitwise
@@ -23,7 +23,7 @@ import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TopologicalSort
-import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, Value(..))
+import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, ResolveBridge(..), Value(..))
 import Value exposing (nameError, typeError, unsupported)
 
 
@@ -1759,29 +1759,66 @@ evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv 
 
 evalFullyApplied : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
 evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env =
-    -- Fast path: if all patterns are simple VarPatterns or AllPatterns,
-    -- bind directly via addValue instead of building an intermediate Dict.
-    case bindSimplePatterns patterns args localEnv of
-        Just boundEnv ->
-            evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env
+    case implementation of
+        RExprImpl payload ->
+            {- RExprImpl closures carry `patterns = []` (the new evaluator
+               uses De Bruijn indices + cached arity instead of named
+               patterns). Pattern binding with empty patterns against
+               non-empty args always fails — `bindSimplePatterns [] [arg]`
+               returns Nothing, and `match (ListPattern []) (List [arg])`
+               returns Ok Nothing, triggering the "Could not match lambda
+               patterns" error.
 
-        Nothing ->
+               Dispatch RExprImpl directly via the ResolveBridge, mirroring
+               the fix in `evalFunction` (commit 13a6cd6). This covers the
+               `evalApplication` fast path which calls `evalFullyApplied`
+               directly without going through `evalFunction`.
+
+               Without this, any old-evaluator call into an RExprImpl
+               closure (e.g. Parser.Advanced.andThen calling a thunk from
+               `Elm.Type.tipe`) hits the pattern-binding code and errors
+               out with "Could not match lambda patterns".
+            -}
             let
-                maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
-                maybeNewBindings =
-                    match env
-                        (fakeNode <| ListPattern patterns)
-                        (List args)
+                selfClosure : Value
+                selfClosure =
+                    PartiallyApplied
+                        (Environment.empty [])
+                        []
+                        []
+                        maybeQualifiedName
+                        (RExprImpl payload)
+                        (List.length args)
+
+                (ResolveBridge bridge) =
+                    localEnv.shared.resolveBridge
             in
-            case maybeNewBindings of
-                Err e ->
-                    Types.failPartial e
+            Recursion.base (bridge payload selfClosure args cfg localEnv)
 
-                Ok Nothing ->
-                    Types.failPartial <| typeError env "Could not match lambda patterns"
+        _ ->
+            -- Fast path: if all patterns are simple VarPatterns or AllPatterns,
+            -- bind directly via addValue instead of building an intermediate Dict.
+            case bindSimplePatterns patterns args localEnv of
+                Just boundEnv ->
+                    evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env
 
-                Ok (Just newBindings) ->
-                    evalFullyAppliedWithEnv (Environment.withBindings newBindings localEnv) args maybeQualifiedName implementation cfg env
+                Nothing ->
+                    let
+                        maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
+                        maybeNewBindings =
+                            match env
+                                (fakeNode <| ListPattern patterns)
+                                (List args)
+                    in
+                    case maybeNewBindings of
+                        Err e ->
+                            Types.failPartial e
+
+                        Ok Nothing ->
+                            Types.failPartial <| typeError env "Could not match lambda patterns"
+
+                        Ok (Just newBindings) ->
+                            evalFullyAppliedWithEnv (Environment.withBindings newBindings localEnv) args maybeQualifiedName implementation cfg env
 
 
 {-| Try to bind all patterns directly via addValue. Returns Just the new env
@@ -2036,11 +2073,11 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
 
                             else
                                 -- Not tail-recursive: clear tcoTarget
-                                Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, newEnv )
+                                Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, newEnv )
 
                         Nothing ->
                             -- No tcoTarget: skip qualifiedNameToString for tcoKey
@@ -2054,7 +2091,7 @@ call maybeQualifiedName implementation cfg env =
                                             Just n -> n
                                             Nothing -> 500000
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
 
                             else
                                 -- Common case: not TCO, no tcoTarget — pass cfg as-is
@@ -2066,7 +2103,7 @@ call maybeQualifiedName implementation cfg env =
                         Recursion.recurse ( expr, cfg, env )
 
                     else
-                        Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats }, env )
+                        Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, env )
 
         KernelImpl moduleName name f ->
             if cfg.trace then
@@ -2079,6 +2116,34 @@ call maybeQualifiedName implementation cfg env =
 
             else
                 Recursion.base (f [] cfg env)
+
+        RExprImpl payload ->
+            {- `call` is the 0-arg dispatch entry: used from
+               `evalQualifiedOrVariant` for name lookups whose target has
+               arity 0. Passing `[]` to the bridge is correct because the
+               function body has no parameter slots to fill.
+
+               The non-zero-arg RExprImpl path doesn't reach this branch
+               any more because `evalFullyAppliedWithEnv` now handles its
+               own RExprImpl case directly (with the real `args` list), and
+               `evalFunctionOrValue` gates the arity-0 shortcut on
+               `cachedArity == 0` before calling `call`.
+            -}
+            let
+                selfClosure : Value
+                selfClosure =
+                    PartiallyApplied
+                        (Environment.empty [])
+                        []
+                        []
+                        maybeQualifiedName
+                        (RExprImpl payload)
+                        0
+
+                (ResolveBridge bridge) =
+                    env.shared.resolveBridge
+            in
+            Recursion.base (bridge payload selfClosure [] cfg env)
 
 
 
@@ -2337,6 +2402,7 @@ tcoLoop funcName body remaining cfg env =
             , intercepts = cfg.intercepts
             , memoizedFunctions = cfg.memoizedFunctions
             , collectMemoStats = cfg.collectMemoStats
+            , useResolvedIR = cfg.useResolvedIR
             }
     in
     tcoLoopHelp funcName body remaining 0 0 0 0 innerCfg cfg env
@@ -2625,8 +2691,31 @@ evalFunctionOrValue moduleName name cfg env =
                 Nothing ->
                     -- Then check values (local bindings, parameters)
                     case Dict.get name env.values of
-                        Just (PartiallyApplied localEnv [] [] maybeName implementation _) ->
-                            call maybeName implementation cfg localEnv
+                        Just ((PartiallyApplied localEnv [] [] maybeName implementation cachedArity) as paValue) ->
+                            if cachedArity == 0 then
+                                call maybeName implementation cfg localEnv
+
+                            else
+                                {- Arity > 0 lookup: return the PA as a
+                                   value (partial application). For
+                                   AstImpl PAs this case never fires
+                                   because their `patterns` list matches
+                                   the function's arity — `[]` implies
+                                   a 0-arg function. But RExprImpl PAs
+                                   always carry `patterns = []` (the new
+                                   evaluator uses `cachedArity` directly
+                                   instead of counting patterns), so
+                                   without the `cachedArity` check an
+                                   arity-N RExprImpl PA would hit the
+                                   0-arg `call` path above, and `call`'s
+                                   RExprImpl branch would dispatch the
+                                   bridge with `[]` args — running the
+                                   body with the wrong locals stack.
+                                   This was the arg-binding bug
+                                   surfaced by widening the resolver
+                                   coverage.
+                                -}
+                                Types.succeedPartial paValue
 
                         Just value ->
                             Types.succeedPartial value
@@ -3178,38 +3267,48 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
         EvalResult.succeed <| Value.mkPartiallyApplied localEnv oldArgs patterns functionName implementation
 
     else
-        -- Just right, we special case this for TCO
-        case bindSimplePatterns patterns oldArgs localEnv of
-            Just boundEnv ->
-                case implementation of
-                    KernelImpl moduleName name f ->
-                        if cfg.trace then
-                            f oldArgs
-                                cfg
-                                (Environment.callKernel moduleName name localEnv)
+        case implementation of
+            RExprImpl payload ->
+                {- RExprImpl closures always carry `patterns = []` (the new
+                   evaluator uses De Bruijn indices + the cached arity
+                   instead of named patterns). `bindSimplePatterns [] args`
+                   fails whenever args is non-empty, and the slow
+                   `match (ListPattern []) (List args)` path also fails —
+                   so routing RExprImpl through the pattern-binding code
+                   was unreachable except for the zero-arg case.
 
-                        else
-                            f oldArgs cfg localEnv
+                   Dispatch RExprImpl directly via the ResolveBridge
+                   before attempting pattern binding. The bridge threads
+                   args into the locals stack as the resolved body
+                   expects.
 
-                    AstImpl expr ->
-                        evalExpression expr cfg boundEnv
-
-            Nothing ->
+                   Without this, any kernel higher-order call into an
+                   RExprImpl closure (e.g. `Kernel.Json.applyFunction`
+                   running a user-provided `map2` callback inside
+                   `Elm.Docs.decoder`) errors out with "Could not match
+                   lambda patterns" and the failure propagates silently
+                   through `Json.Decode.decodeString`.
+                -}
                 let
-                    maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
-                    maybeNewBindings =
-                        match localEnv
-                            (Node (Range.combine (List.map Node.range patterns)) <| ListPattern patterns)
-                            (List oldArgs)
+                    selfClosure : Value
+                    selfClosure =
+                        PartiallyApplied
+                            (Environment.empty [])
+                            []
+                            []
+                            functionName
+                            (RExprImpl payload)
+                            patternsLength
+
+                    (ResolveBridge bridge) =
+                        localEnv.shared.resolveBridge
                 in
-                case maybeNewBindings of
-                    Err e ->
-                        EvalResult.fail e
+                bridge payload selfClosure oldArgs cfg localEnv
 
-                    Ok Nothing ->
-                        EvalResult.fail <| typeError localEnv "Could not match lambda patterns"
-
-                    Ok (Just newBindings) ->
+            _ ->
+                -- Just right, we special case this for TCO
+                case bindSimplePatterns patterns oldArgs localEnv of
+                    Just boundEnv ->
                         case implementation of
                             KernelImpl moduleName name f ->
                                 if cfg.trace then
@@ -3221,10 +3320,47 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                                     f oldArgs cfg localEnv
 
                             AstImpl expr ->
-                                -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
-                                evalExpression expr
-                                    cfg
-                                    (localEnv |> Environment.withBindings newBindings)
+                                evalExpression expr cfg boundEnv
+
+                            RExprImpl _ ->
+                                -- Unreachable: handled above.
+                                EvalResult.fail <| typeError localEnv "unreachable: RExprImpl in bindSimplePatterns fast path"
+
+                    Nothing ->
+                        let
+                            maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
+                            maybeNewBindings =
+                                match localEnv
+                                    (Node (Range.combine (List.map Node.range patterns)) <| ListPattern patterns)
+                                    (List oldArgs)
+                        in
+                        case maybeNewBindings of
+                            Err e ->
+                                EvalResult.fail e
+
+                            Ok Nothing ->
+                                EvalResult.fail <| typeError localEnv "Could not match lambda patterns"
+
+                            Ok (Just newBindings) ->
+                                case implementation of
+                                    KernelImpl moduleName name f ->
+                                        if cfg.trace then
+                                            f oldArgs
+                                                cfg
+                                                (Environment.callKernel moduleName name localEnv)
+
+                                        else
+                                            f oldArgs cfg localEnv
+
+                                    AstImpl expr ->
+                                        -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
+                                        evalExpression expr
+                                            cfg
+                                            (localEnv |> Environment.withBindings newBindings)
+
+                                    RExprImpl _ ->
+                                        -- Unreachable: handled above.
+                                        EvalResult.fail <| typeError localEnv "unreachable: RExprImpl in slow-match path"
 
 
 {-| Check for native-kernel overrides registered against user-level modules

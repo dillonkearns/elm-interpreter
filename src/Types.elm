@@ -1,4 +1,4 @@
-module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), InterceptContext, JsonDecoder(..), JsonVal(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, Value(..), evalErrorKindToString, packRange, unpackRange)
+module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(..), Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), ImportedNames, Intercept(..), InterceptContext, JsonDecoder(..), JsonVal(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, ResolveBridge(..), SharedContext, Value(..), evalErrorKindToString, noResolveBridge, packRange, unpackRange)
 
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
@@ -7,6 +7,7 @@ import Elm.Syntax.Range exposing (Range)
 import Regex
 import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (Pattern, QualifiedNameRef)
+import Eval.ResolvedIR as IR
 import FastDict exposing (Dict)
 import MemoSpec
 import Parser exposing (DeadEnd)
@@ -52,6 +53,7 @@ type alias Config =
     , intercepts : Dict String Intercept
     , memoizedFunctions : MemoSpec.Registry
     , collectMemoStats : Bool
+    , useResolvedIR : Bool
     }
 
 
@@ -172,16 +174,50 @@ type JsonDecoder
 
 
 {-| Function implementation: either an AST expression to evaluate,
-or a pre-resolved kernel function that can be called directly.
+or a pre-resolved kernel function that can be called directly,
+or a resolved-IR body produced by `Eval.Resolver` for Phase 3's
+new evaluator.
+
+`RExprImpl` carries the closure's body as an `RExpr`, the captured
+locals list that was in scope when the closure was created, and
+`selfSlots` — the number of synthetic "self reference" slots the
+evaluator should prepend to `capturedLocals` at call time, filled
+with the closure itself.
+
+`selfSlots` supports single-binding self-recursion: `let f x = f
+(x - 1) in f 5` needs `f` to be visible inside its own body. At
+closure creation time we can't put the finished closure into its
+own captured locals (that would be a cycle), so the evaluator
+substitutes at call time instead. For `RLambda` expressions and
+non-recursive contexts, `selfSlots = 0` and the substitution is
+skipped.
+
+Mutual recursion of multiple function bindings in the same let
+group is NOT supported — the resolver's sequential scoping only
+gives a single binding visibility of itself, not siblings. That's
+deferred to a later iteration when the evaluator gains a
+pre-allocation story.
+
+The new evaluator (`Eval.ResolvedExpression`) is the only code
+that creates or reads these values. The old evaluator code treats
+them as an error if it ever encounters one, which should only
+happen via `useResolvedIR = False` misrouting.
+
 -}
 type Implementation
     = AstImpl (Node Expression)
     | KernelImpl ModuleName String (List Value -> Eval Value)
+    | RExprImpl
+        { body : IR.RExpr
+        , capturedLocals : List Value
+        , selfSlots : Int
+        }
 
 
 type alias SharedContext =
     { functions : Dict String (Dict String FunctionImplementation)
     , moduleImports : Dict String ImportedNames
+    , resolveBridge : ResolveBridge
 
     -- Module-level 0-arg values that have already been evaluated to a
     -- concrete `Value`. Keyed by moduleKey → name. Populated during the
@@ -194,6 +230,72 @@ type alias SharedContext =
     -- 87 s per reference without this cache.
     , precomputedValues : Dict String (Dict String Value)
     }
+
+
+{-| Bridge that lets the string-keyed evaluator execute a resolved-IR
+closure by handing it back to the new evaluator.
+
+When `Eval.Expression.call` / `evalFunction` encounters an
+`Implementation.RExprImpl` payload — because the new evaluator created
+a closure and passed it through a higher-order call (e.g.
+`List.foldl userFn acc xs`) to code that runs in the old evaluator —
+it calls `cfg.env.shared.resolveBridge` to run the body.
+
+The bridge closure captures the resolver state (resolvedBodies,
+native/kernel dispatchers, interceptsByGlobal, etc.) at installation
+time in `Eval.Module.evalWithResolvedIRFromFilesAndIntercepts`. The
+default `noResolveBridge` (used on every code path that doesn't route
+through the new entry point) returns a `TypeError`, matching the
+pre-bridge "RExprImpl misrouted" behavior.
+
+The bridge takes:
+  - `payload` — the `RExprImpl` inner record with body, captured
+    locals, and selfSlots
+  - `selfClosure` — the `Value` to prepend for self-recursion; the
+    caller constructs it as the arity-restored `PartiallyApplied` it
+    just unpacked
+  - `args` — the fully-applied argument Values (already bound /
+    evaluated by the old evaluator's call machinery)
+  - `cfg`, `env` — the current evaluation context; the bridge pulls
+    resolver state from `env.shared.resolveBridge`'s closure capture,
+    not from these two directly
+
+Returns an `EvalResult Value` that may be `EvOk`, `EvErr`,
+`EvYield`, `EvMemoLookup`, or `EvMemoStore` — whatever the new
+evaluator produces. The old evaluator's surrounding `call` / trampoline
+machinery handles the non-Ok variants uniformly.
+
+-}
+type ResolveBridge
+    = ResolveBridge
+        ({ body : IR.RExpr
+         , capturedLocals : List Value
+         , selfSlots : Int
+         }
+         -> Value
+         -> List Value
+         -> Config
+         -> Env
+         -> EvalResult Value
+        )
+
+
+{-| Default bridge installed on code paths that never run the new
+evaluator. Returns an `Unsupported` error so misrouting shows up as a
+clearly-labeled evaluator failure, not a silent miscompile.
+-}
+noResolveBridge : ResolveBridge
+noResolveBridge =
+    ResolveBridge
+        (\_ _ _ _ env ->
+            EvErr
+                { currentModule = env.currentModule
+                , callStack = env.callStack
+                , error =
+                    Unsupported
+                        "RExprImpl encountered with noResolveBridge — useResolvedIR misrouted, or new evaluator state not installed"
+                }
+        )
 
 
 type alias Env =
