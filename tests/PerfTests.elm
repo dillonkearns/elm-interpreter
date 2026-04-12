@@ -33,9 +33,15 @@ which evaluated to `Int Infinity` at normalization time. The normalizer
 replaced the body with `Expression.Integer Infinity`, which the Wire3
 codec can't round-trip — making the package summary cache silently
 refuse to persist (package_summary_cache_roundtrip_ok = 0 on every
-warm run, ~500ms wasted on body-edit scenarios). Fix was to make
-`isLosslessValue` reject non-finite Int/Float values so the normalizer
-leaves the original expression alone.
+warm run, ~500ms wasted on body-edit scenarios).
+
+Fix: `isLosslessValue` rejects non-finite Int/Float values, so the
+normalizer leaves the original expression alone. But
+`tryNormalizeConstant` still returns the evaluated value to the caller,
+so the in-memory `precomputedValues` cache still hits — recovering the
+runtime speedup without re-introducing the cache corruption. The
+on-disk user-norm cache filters non-lossless values at encode time in
+`InterpreterProject.encodeUserNormCacheEntry`.
 -}
 normalizationLosslessnessTests : Test
 normalizationLosslessnessTests =
