@@ -7,12 +7,14 @@ module Kernel.Dict exposing
     , get
     , insert
     , isEmpty
+    , keys
     , map
     , member
     , remove
     , size
     , toList
     , union
+    , values
     )
 
 {-| Kernel implementations for Dict operations.
@@ -775,3 +777,58 @@ filterOutKeyHelp targetKey pairs acc env =
 
                 Ok _ ->
                     filterOutKeyHelp targetKey rest (( k, v ) :: acc) env
+
+
+{-| Kernel Dict.keys: walk the tree in-order, accumulating keys into a list.
+Avoids the 3 interpreter trampolines per element that foldr+lambda would pay.
+-}
+keys : Value -> Eval Value
+keys dict _ _ =
+    EvalResult.succeed (List (keysHelp dict []))
+
+
+keysHelp : Value -> List Value -> List Value
+keysHelp dict acc =
+    case dict of
+        Custom ref args ->
+            if ref.name == "RBEmpty_elm_builtin" then
+                acc
+
+            else
+                case args of
+                    [ _, key, _, left, right ] ->
+                        keysHelp left (key :: keysHelp right acc)
+
+                    _ ->
+                        acc
+
+        _ ->
+            acc
+
+
+{-| Kernel Dict.values: walk the tree in-order, accumulating values into a list.
+-}
+values : Value -> Eval Value
+values dict _ _ =
+    EvalResult.succeed (List (valuesHelp dict []))
+
+
+valuesHelp : Value -> List Value -> List Value
+valuesHelp dict acc =
+    case dict of
+        Custom ref args ->
+            if ref.name == "RBEmpty_elm_builtin" then
+                acc
+
+            else
+                case args of
+                    [ _, _, value, left, right ] ->
+                        valuesHelp left (value :: valuesHelp right acc)
+
+                    _ ->
+                        acc
+
+        _ ->
+            acc
+
+

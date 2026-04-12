@@ -32,6 +32,12 @@ suite =
             , dictFoldlLetBound3ArgCallback
             , dictFoldlReverseBuild
             ]
+        , describe "Dict.keys / values kernels"
+            [ dictKeysSortedOrder
+            , dictKeysEmpty
+            , dictValuesSortedOrder
+            , dictValuesEmpty
+            ]
         ]
 
 
@@ -226,6 +232,60 @@ result =
                     Eval.Module.evalWithResolvedIR projectEnv "Foo.result"
                         -- foldl in-order visits a,b,c. Cons prepends → c,b,a.
                         |> expectValue (List [ String "c", String "b", String "a" ])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictKeysSortedOrder : Test
+dictKeysSortedOrder =
+    test "Dict.keys returns keys in sorted order" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv
+                        "Dict.keys (Dict.fromList [ ( \"c\", 3 ), ( \"a\", 1 ), ( \"b\", 2 ) ])"
+                        |> expectValue (List [ String "a", String "b", String "c" ])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictKeysEmpty : Test
+dictKeysEmpty =
+    test "Dict.keys on empty dict == []" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Dict.keys Dict.empty"
+                        |> expectValue (List [])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictValuesSortedOrder : Test
+dictValuesSortedOrder =
+    test "Dict.values returns values in sorted-key order" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv
+                        "Dict.values (Dict.fromList [ ( \"c\", 3 ), ( \"a\", 1 ), ( \"b\", 2 ) ])"
+                        |> expectValue (List [ Int 1, Int 2, Int 3 ])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictValuesEmpty : Test
+dictValuesEmpty =
+    test "Dict.values on empty dict == []" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Dict.values Dict.empty"
+                        |> expectValue (List [])
 
                 Err _ ->
                     Expect.fail "buildProjectEnv failed"
