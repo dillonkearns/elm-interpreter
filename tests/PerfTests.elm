@@ -1,9 +1,13 @@
 module PerfTests exposing (suite)
 
-import Elm.Syntax.Expression as Expression
+import Elm.Parser
+import Elm.Syntax.Declaration exposing (Declaration(..))
+import Elm.Syntax.Expression as Expression exposing (Expression(..))
+import Elm.Syntax.Node as Node exposing (Node(..))
 import Eval
 import Eval.Module
 import Expect
+import TcoAnalysis
 import Test exposing (Test, describe, test)
 import Types exposing (Value(..))
 
@@ -15,6 +19,77 @@ suite =
         , tcoCorrectnessTests
         , tcoProofTests
         , largeListTailRecursionTests
+        , tcoAnalysisTests
+        ]
+
+
+tcoAnalysisTests : Test
+tcoAnalysisTests =
+    let
+        analyzeModule src funcName params =
+            case Elm.Parser.parseToFile src of
+                Ok file ->
+                    let
+                        body =
+                            file.declarations
+                                |> List.filterMap
+                                    (\(Node _ decl) ->
+                                        case decl of
+                                            FunctionDeclaration f ->
+                                                let
+                                                    impl =
+                                                        Node.value f.declaration
+                                                in
+                                                if Node.value impl.name == funcName then
+                                                    Just impl.expression
+
+                                                else
+                                                    Nothing
+
+                                            _ ->
+                                                Nothing
+                                    )
+                                |> List.head
+                    in
+                    case body of
+                        Just expr ->
+                            TcoAnalysis.analyze funcName params expr
+
+                        Nothing ->
+                            TcoAnalysis.TcoGeneral
+
+                Err _ ->
+                    TcoAnalysis.TcoGeneral
+    in
+    describe "TcoAnalysis"
+        [ test "list drain detected as TcoSafe" <|
+            \_ ->
+                analyzeModule
+                    "module T exposing (..)\nwalk xs = case xs of\n    [] -> 0\n    _ :: rest -> walk rest\n"
+                    "walk"
+                    [ "xs" ]
+                    |> Expect.equal TcoAnalysis.TcoSafe
+        , test "isInfixOfHelp-like pattern detected as TcoSafe" <|
+            \_ ->
+                analyzeModule
+                    "module T exposing (..)\ncheck h t list = case list of\n    [] -> False\n    x :: xs -> if x == h then True else check h t xs\n"
+                    "check"
+                    [ "h", "list", "t" ]
+                    |> Expect.equal TcoAnalysis.TcoSafe
+        , test "non-shrinking recursion is TcoGeneral" <|
+            \_ ->
+                analyzeModule
+                    "module T exposing (..)\nloop n = if n == 0 then 0 else loop n\n"
+                    "loop"
+                    [ "n" ]
+                    |> Expect.equal TcoAnalysis.TcoGeneral
+        , test "countdown is TcoGeneral (no list drain)" <|
+            \_ ->
+                analyzeModule
+                    "module T exposing (..)\ncountdown n = if n <= 0 then 0 else countdown (n - 1)\n"
+                    "countdown"
+                    [ "n" ]
+                    |> Expect.equal TcoAnalysis.TcoGeneral
         ]
 
 

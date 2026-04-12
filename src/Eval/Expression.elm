@@ -22,6 +22,7 @@ import Result.MyExtra
 import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
+import TcoAnalysis
 import TopologicalSort
 import Types exposing (CallTree(..), Config, Env, EnvValues, Eval, EvalErrorData, EvalErrorKind(..), EvalResult(..), Implementation(..), MemoLookupPayload, MemoStorePayload, PartialEval, PartialResult, ResolveBridge(..), Value(..))
 import Value exposing (nameError, typeError, unsupported)
@@ -2385,8 +2386,92 @@ tcoLoop funcName body remaining cfg env =
             , collectMemoStats = cfg.collectMemoStats
             , useResolvedIR = cfg.useResolvedIR
             }
+
+        paramNames : List String
+        paramNames =
+            env.values
+                |> Dict.keys
+
+        strategy : TcoAnalysis.TcoStrategy
+        strategy =
+            TcoAnalysis.analyze funcName paramNames body
     in
-    tcoLoopHelp funcName body remaining 0 16 0 0 0 innerCfg cfg env
+    case strategy of
+        TcoAnalysis.TcoSafe ->
+            tcoLoopSafe funcName body remaining innerCfg env
+
+        TcoAnalysis.TcoGeneral ->
+            tcoLoopHelp funcName body remaining 0 16 0 0 0 innerCfg cfg env
+
+
+{-| Fast TCO loop for provably-terminating patterns (e.g. list drain).
+No cycle detection, no fingerprinting, no size measurement. Just
+eval → extract TailCall → replace values → loop.
+-}
+tcoLoopSafe : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
+tcoLoopSafe funcName body remaining innerCfg env =
+    if remaining <= 0 then
+        EvErr
+            { currentModule = env.currentModule
+            , callStack = env.callStack
+            , error = Unsupported "Step limit exceeded"
+            }
+
+    else
+        case evalExpression body innerCfg env of
+            EvYield tag payload resume ->
+                EvYield tag payload
+                    (\resumeValue ->
+                        case resume resumeValue of
+                            EvErr { error } ->
+                                case error of
+                                    TailCall newValues ->
+                                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
+
+                                    _ ->
+                                        resume resumeValue
+
+                            other ->
+                                other
+                    )
+
+            EvMemoLookup payload resume ->
+                EvMemoLookup payload
+                    (\maybeValue ->
+                        case resume maybeValue of
+                            EvErr { error } ->
+                                case error of
+                                    TailCall newValues ->
+                                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
+
+                                    _ ->
+                                        resume maybeValue
+
+                            other ->
+                                other
+                    )
+
+            EvMemoStore payload next ->
+                case next of
+                    EvErr { error } ->
+                        case error of
+                            TailCall newValues ->
+                                EvMemoStore payload
+                                    (tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env))
+
+                            _ ->
+                                EvMemoStore payload next
+
+                    _ ->
+                        EvMemoStore payload next
+
+            other ->
+                case tcoExtractTailCall other of
+                    Just newValues ->
+                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
+
+                    Nothing ->
+                        other
 
 
 tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value
