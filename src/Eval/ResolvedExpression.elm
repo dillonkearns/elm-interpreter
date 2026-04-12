@@ -226,12 +226,6 @@ runRec project init =
                             go (next t) rest
 
                 RTail r ->
-                    {- Pure tail call: no stack modification. This is
-                       the key win over the stock `Recursion.recurse`,
-                       which always pushes a `base` continuation even
-                       for tail calls and makes iterative tail-call
-                       chains grow the continuation stack linearly.
-                    -}
                     go (project r) stack
 
                 RecThen r after ->

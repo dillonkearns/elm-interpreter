@@ -544,7 +544,46 @@ resolveProject summaries =
 
                                     ctx : Resolver.ResolverContext
                                     ctx =
-                                        Resolver.initContext summary.moduleName globalIds
+                                        {- Exclude modules whose resolved bodies
+                                           interact badly with the kernel
+                                           callback dispatching (via the bridge)
+                                           or cause massive iteration via
+                                           recursive parser combinators.
+
+                                           Parser.* — recursive combinator
+                                             bodies that generate massive
+                                             evalR iteration through the bridge.
+                                           Elm.Type — uses Parser.run internally
+                                             for type-string parsing; its
+                                             resolved body creates RExprImpl
+                                             closures that loop through the
+                                             parser's recursive walker.
+                                           Elm.Project — its decoder has
+                                             RExprImpl callbacks that silent-
+                                             drop via "Could not match lambda
+                                             patterns" in the Kernel.Json
+                                             walker's `applyFunction` path.
+
+                                           Everything else benefits from the
+                                           flip (import canonicalization for
+                                           aliased imports → more user code
+                                           runs through evalR).
+                                        -}
+                                        case summary.moduleName of
+                                            "Parser" :: _ ->
+                                                Resolver.initContext summary.moduleName globalIds
+
+                                            [ "Elm", "Type" ] ->
+                                                Resolver.initContext summary.moduleName globalIds
+
+                                            [ "Elm", "Project" ] ->
+                                                Resolver.initContext summary.moduleName globalIds
+
+                                            _ ->
+                                                Resolver.initContextWithImports
+                                                    summary.moduleName
+                                                    globalIds
+                                                    summary.importedNames
                                 in
                                 case Resolver.resolveDeclaration ctx impl of
                                     Ok rexpr ->

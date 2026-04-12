@@ -1759,29 +1759,66 @@ evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv 
 
 evalFullyApplied : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
 evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env =
-    -- Fast path: if all patterns are simple VarPatterns or AllPatterns,
-    -- bind directly via addValue instead of building an intermediate Dict.
-    case bindSimplePatterns patterns args localEnv of
-        Just boundEnv ->
-            evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env
+    case implementation of
+        RExprImpl payload ->
+            {- RExprImpl closures carry `patterns = []` (the new evaluator
+               uses De Bruijn indices + cached arity instead of named
+               patterns). Pattern binding with empty patterns against
+               non-empty args always fails — `bindSimplePatterns [] [arg]`
+               returns Nothing, and `match (ListPattern []) (List [arg])`
+               returns Ok Nothing, triggering the "Could not match lambda
+               patterns" error.
 
-        Nothing ->
+               Dispatch RExprImpl directly via the ResolveBridge, mirroring
+               the fix in `evalFunction` (commit 13a6cd6). This covers the
+               `evalApplication` fast path which calls `evalFullyApplied`
+               directly without going through `evalFunction`.
+
+               Without this, any old-evaluator call into an RExprImpl
+               closure (e.g. Parser.Advanced.andThen calling a thunk from
+               `Elm.Type.tipe`) hits the pattern-binding code and errors
+               out with "Could not match lambda patterns".
+            -}
             let
-                maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
-                maybeNewBindings =
-                    match env
-                        (fakeNode <| ListPattern patterns)
-                        (List args)
+                selfClosure : Value
+                selfClosure =
+                    PartiallyApplied
+                        (Environment.empty [])
+                        []
+                        []
+                        maybeQualifiedName
+                        (RExprImpl payload)
+                        (List.length args)
+
+                (ResolveBridge bridge) =
+                    localEnv.shared.resolveBridge
             in
-            case maybeNewBindings of
-                Err e ->
-                    Types.failPartial e
+            Recursion.base (bridge payload selfClosure args cfg localEnv)
 
-                Ok Nothing ->
-                    Types.failPartial <| typeError env "Could not match lambda patterns"
+        _ ->
+            -- Fast path: if all patterns are simple VarPatterns or AllPatterns,
+            -- bind directly via addValue instead of building an intermediate Dict.
+            case bindSimplePatterns patterns args localEnv of
+                Just boundEnv ->
+                    evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env
 
-                Ok (Just newBindings) ->
-                    evalFullyAppliedWithEnv (Environment.withBindings newBindings localEnv) args maybeQualifiedName implementation cfg env
+                Nothing ->
+                    let
+                        maybeNewBindings : Result EvalErrorData (Maybe (List ( String, Value )))
+                        maybeNewBindings =
+                            match env
+                                (fakeNode <| ListPattern patterns)
+                                (List args)
+                    in
+                    case maybeNewBindings of
+                        Err e ->
+                            Types.failPartial e
+
+                        Ok Nothing ->
+                            Types.failPartial <| typeError env "Could not match lambda patterns"
+
+                        Ok (Just newBindings) ->
+                            evalFullyAppliedWithEnv (Environment.withBindings newBindings localEnv) args maybeQualifiedName implementation cfg env
 
 
 {-| Try to bind all patterns directly via addValue. Returns Just the new env

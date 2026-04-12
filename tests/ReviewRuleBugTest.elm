@@ -4,11 +4,13 @@ module ReviewRuleBugTest exposing (suite)
 Auto-generated — do not edit by hand.
 -}
 
-import Elm.Syntax.Expression as Expression
+import Elm.Parser
+import Elm.Syntax.Expression as Expression exposing (Expression(..))
 import Eval.Module
 import Expect
+import FastDict
 import Test exposing (Test, describe, test)
-import Types exposing (Error(..), Value(..))
+import Types exposing (Error(..), EvalResult(..), Value(..))
 
 
 suite : Test
@@ -30,6 +32,85 @@ suite =
 
                             Ok _ ->
                                 Expect.pass
+        , test "Elm.Docs.decoder works via resolved IR path (no-values docs JSON)" <|
+            \_ ->
+                let
+                    -- Minimal set of sources needed for Elm.Docs.decoder
+                    decoderSources : List String
+                    decoderSources =
+                        List.filter
+                            (\src ->
+                                let
+                                    modName =
+                                        src
+                                            |> String.lines
+                                            |> List.head
+                                            |> Maybe.withDefault ""
+                                in
+                                String.startsWith "module Json.Decode " modName
+                                    || String.startsWith "module Json.Encode " modName
+                                    || String.startsWith "module Parser " modName
+                                    || String.startsWith "module Parser.Advanced " modName
+                                    || String.startsWith "module Elm.Docs " modName
+                                    || String.startsWith "module Elm.Type " modName
+                            )
+                            packageSources
+
+                    -- A docs JSON with no values/unions/aliases (avoids Elm.Type.decoder/Parser)
+                    noValuesDocsJson : String
+                    noValuesDocsJson =
+                        "[{\"name\":\"Foo\",\"comment\":\"test\",\"unions\":[],\"aliases\":[],\"values\":[],\"binops\":[]}]"
+
+                    testDecoderModule : String
+                    testDecoderModule =
+                        String.join "\n"
+                            [ "module TestDecoder exposing (..)"
+                            , ""
+                            , "import Json.Decode"
+                            , "import Elm.Docs"
+                            , ""
+                            , "result ="
+                            , "    Json.Decode.decodeString (Json.Decode.list Elm.Docs.decoder) json"
+                            , ""
+                            , "json = \"\"\"" ++ noValuesDocsJson ++ "\"\"\""
+                            ]
+                in
+                case Eval.Module.buildProjectEnv decoderSources of
+                    Err e ->
+                        Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)
+
+                    Ok projectEnv ->
+                        case Elm.Parser.parseToFile testDecoderModule of
+                            Err _ ->
+                                Expect.fail "Failed to parse TestDecoder module"
+
+                            Ok file ->
+                                let
+                                    evalResult =
+                                        Eval.Module.evalWithResolvedIRFromFilesAndIntercepts
+                                            projectEnv
+                                            [ file ]
+                                            FastDict.empty
+                                            FastDict.empty
+                                            (FunctionOrValue [] "result")
+                                in
+                                case evalResult of
+                                    EvOk val ->
+                                        case val of
+                                            Custom { name } _ ->
+                                                if name == "Ok" then
+                                                    Expect.pass
+                                                else
+                                                    Expect.fail ("Got Err result: " ++ Debug.toString val)
+
+                                            _ ->
+                                                Expect.fail ("Unexpected value shape: " ++ Debug.toString val)
+
+                                    EvErr e ->
+                                        Expect.fail ("Eval error: " ++ Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                                    _ ->
+                                        Expect.fail ("Unexpected EvalResult variant: " ++ Debug.toString evalResult)
         ]
 
 
