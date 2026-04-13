@@ -608,16 +608,28 @@ checkAndUpdateCycle qualifiedName args callDepth checkDict =
                     threshold =
                         -- Elm-review's Rule module uses legitimate structural recursion
                         -- with identical arguments (state machine through `raise`/`createVisitor`).
-                        -- Closure args keep a very high threshold because closure fingerprinting
-                        -- can't distinguish nested state changes, so legitimate elm-review patterns
-                        -- can reach thousands of identical-fingerprint calls. Plain data args use a
-                        -- much lower threshold so non-closure mutual recursion (ping/pong with Int
-                        -- args) is caught before the JS call stack overflows (~10k frames).
+                        -- With N modules × M rules × ~10 visitors, this can reach thousands of
+                        -- identical-arg calls that are NOT infinite — they terminate after processing
+                        -- all modules. The callDepth check (200) provides first-line defense.
+                        -- Use very high threshold to avoid false positives.
+                        --
+                        -- NOTE: commit 4e3fa15 (Lower non-closure recursion threshold for
+                        -- mutual-recursion detection) lowered the non-closure threshold from
+                        -- 100000 to 300 to catch `ping n = pong n` / `pong n = ping n`
+                        -- patterns before the JS stack overflows. That change caused a
+                        -- ~20% wall regression on small-12 warm_import_graph_change AND
+                        -- dropped reported lint errors from 751 to 12 across all scenarios
+                        -- — legitimate rule-eval patterns were hitting the 300 threshold
+                        -- and returning EvErr instead of the correct results. Reverted
+                        -- pending a smarter heuristic that can distinguish ping/pong from
+                        -- rule-eval. The `tests/EndToEnd.elm "mutual recursion with
+                        -- identical args"` test regresses to a JS stack overflow as a
+                        -- result; that's a known trade-off of this revert.
                         if hasClosureArgs then
                             100000
 
                         else
-                            300
+                            100000
                 in
                 if entry.count >= threshold then
                     CycleDetected
