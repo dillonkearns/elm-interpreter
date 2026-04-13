@@ -286,8 +286,8 @@ resolveExpression ctx (Node _ expr) =
             -- elm-syntax prefixes the dot; strip it.
             Ok (RRecordAccessFunction (String.dropLeft 1 field))
 
-        Expression.GLSLExpression raw ->
-            Ok (RGLSL raw)
+        Expression.GLSLExpression _ ->
+            Ok RGLSL
 
 
 resolveAll :

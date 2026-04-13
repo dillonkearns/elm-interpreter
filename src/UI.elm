@@ -484,12 +484,6 @@ viewOutput output =
 viewCallTree : String -> CallTreeZipper -> Element Msg
 viewCallTree source ((CallTreeZipper { current, parent }) as zipper) =
     case current of
-        CoverageRange _ ->
-            Element.none
-
-        CoverageSet _ ->
-            Element.none
-
         CallNode callNodeData ->
             viewCallNode source zipper callNodeData current parent
 
@@ -681,12 +675,6 @@ viewEnv { values } =
 viewNode : CallTree -> Maybe CallTree -> Element msg
 viewNode tree child =
     case tree of
-        CoverageRange _ ->
-            Element.none
-
-        CoverageSet _ ->
-            Element.none
-
         CallNode { expression, result } ->
             viewCallNodeRow expression result child
 
@@ -762,12 +750,6 @@ nodeSize tree =
     case tree of
         CallNode { children } ->
             List.foldl (\child acc -> acc + nodeSize child) 1 (Rope.toList children)
-
-        CoverageRange _ ->
-            0
-
-        CoverageSet _ ->
-            0
 
 
 viewLogLines : List String -> Element msg

@@ -162,10 +162,10 @@ foldl f init xs cfg env =
                 EvOk a ->
                     f el a cfg env
 
-                EvOkTrace a _ _ ->
+                EvOkTrace _ _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
-                EvOkCoverage a _ ->
+                EvOkCoverage _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
                 _ ->
@@ -183,10 +183,10 @@ foldr f init xs cfg env =
                 EvOk a ->
                     f el a cfg env
 
-                EvOkTrace a _ _ ->
+                EvOkTrace _ _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
-                EvOkCoverage a _ ->
+                EvOkCoverage _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
                 _ ->

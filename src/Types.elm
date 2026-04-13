@@ -3,15 +3,15 @@ module Types exposing (CallCounts, CallTree(..), Config, Env, EnvValues, Error(.
 import Array exposing (Array)
 import Elm.Syntax.Expression exposing (Expression, FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
-import Elm.Syntax.Range exposing (Range)
-import Regex
 import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (Pattern, QualifiedNameRef)
+import Elm.Syntax.Range exposing (Range)
 import Eval.ResolvedIR as IR
 import FastDict exposing (Dict)
 import MemoSpec
 import Parser exposing (DeadEnd)
 import Recursion exposing (Rec)
+import Regex
 import Rope exposing (Rope)
 import Set
 
@@ -63,6 +63,7 @@ when the interpreter encounters a registered qualified function name.
 Receives the fully-applied arguments and the current eval context.
 Framework authors use this for callbacks (BackendTask, Test, Cmd)
 and for memoization/caching hooks.
+
 -}
 type alias InterceptContext =
     { qualifiedName : String
@@ -90,8 +91,6 @@ type CallTree
         , children : Rope CallTree
         , env : Env
         }
-    | CoverageRange Range
-    | CoverageSet (Set.Set Int)
 
 
 type Error
@@ -249,6 +248,7 @@ through the new entry point) returns a `TypeError`, matching the
 pre-bridge "RExprImpl misrouted" behavior.
 
 The bridge takes:
+
   - `payload` — the `RExprImpl` inner record with body, captured
     locals, and selfSlots
   - `selfClosure` — the `Value` to prepend for self-recursion; the
@@ -406,4 +406,3 @@ unpackRange packed =
     { start = { row = sr - 2, column = sc - 2 }
     , end = { row = er - 2, column = ec - 2 }
     }
-

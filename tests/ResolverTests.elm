@@ -162,7 +162,7 @@ stripDebugNames expr =
         RRecordAccessFunction _ ->
             expr
 
-        RGLSL _ ->
+        RGLSL ->
             expr
 
         RIf c t f ->

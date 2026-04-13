@@ -2509,7 +2509,7 @@ containsSelfCall funcName expr =
         Expression.FunctionOrValue [] name ->
             name == funcName
 
-        Expression.LetExpression { declarations, expression } ->
+        Expression.LetExpression { expression } ->
             let
                 (Node _ bodyExpr) =
                     expression
@@ -2642,18 +2642,18 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck currentInterval lastSiz
                 EvYield tag
                     payload
                     (\resumeValue ->
-                        tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
+                        tcoResumeResult funcName body remaining currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
                     )
 
             EvMemoLookup payload resume ->
                 EvMemoLookup payload
                     (\maybeValue ->
-                        tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
+                        tcoResumeResult funcName body remaining currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
                     )
 
             EvMemoStore payload next ->
                 EvMemoStore payload
-                    (tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env next)
+                    (tcoResumeResult funcName body remaining currentInterval lastSize growCount lastFingerprint innerCfg cfg env next)
 
             _ ->
                 case tcoExtractTailCall result of
@@ -2769,25 +2769,25 @@ tcoLoopHelp funcName body remaining iterationsSinceCheck currentInterval lastSiz
                         result
 
 
-tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value -> EvalResult Value
-tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env result =
+tcoResumeResult : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value -> EvalResult Value
+tcoResumeResult funcName body remaining currentInterval lastSize growCount lastFingerprint innerCfg cfg env result =
     case result of
         EvYield tag payload resume ->
             EvYield tag
                 payload
                 (\resumeValue ->
-                    tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
+                    tcoResumeResult funcName body remaining currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume resumeValue)
                 )
 
         EvMemoLookup payload resume ->
             EvMemoLookup payload
                 (\maybeValue ->
-                    tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
+                    tcoResumeResult funcName body remaining currentInterval lastSize growCount lastFingerprint innerCfg cfg env (resume maybeValue)
                 )
 
         EvMemoStore payload next ->
             EvMemoStore payload
-                (tcoResumeResult funcName body remaining iterationsSinceCheck currentInterval lastSize growCount lastFingerprint innerCfg cfg env next)
+                (tcoResumeResult funcName body remaining currentInterval lastSize growCount lastFingerprint innerCfg cfg env next)
 
         _ ->
             case tcoExtractTailCall result of

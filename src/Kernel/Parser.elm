@@ -183,6 +183,6 @@ advancePosition offset row col target string =
 so the actual implementation is a stub here. The real logic is in Kernel.elm's
 custom entry function since it needs to call back into the evaluator.
 -}
-isSubChar : () -> ()
-isSubChar _ =
+isSubChar : ()
+isSubChar =
     ()

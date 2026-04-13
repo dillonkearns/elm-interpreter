@@ -443,7 +443,7 @@ decode decoderFn bytesVal cfg env =
                     EvalResult.succeed
                         (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
 
-                EvErr e ->
+                EvErr _ ->
                     EvalResult.succeed
                         (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
 
@@ -766,7 +766,9 @@ bytesToFloat64 bs =
                         )
 
                 mantissaFloat =
-                    toFloat mantissaHigh * 4294967296 + toFloat (Bitwise.and mantissaLow 0x7FFFFFFF)
+                    toFloat mantissaHigh
+                        * 4294967296
+                        + toFloat (Bitwise.and mantissaLow 0x7FFFFFFF)
                         + (if Bitwise.and mantissaLow 0x80000000 /= 0 then
                             2147483648
 

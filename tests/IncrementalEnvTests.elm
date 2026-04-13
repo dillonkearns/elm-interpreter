@@ -365,7 +365,7 @@ interceptReplacesResult =
                 intercepts =
                     FastDict.singleton "Helpers.greet"
                         (Intercept
-                            (\_ args _ _ ->
+                            (\_ _ _ _ ->
                                 -- Always return "INTERCEPTED" regardless of args
                                 EvOk (String "INTERCEPTED")
                             )
@@ -1321,20 +1321,20 @@ yieldInsideListFoldl =
                     in
                     -- Manually drive yields to see what happens at each step
                     case rawResult of
-                        EvYield tag1 (Int n1) resume1 ->
+                        EvYield _ (Int n1) resume1 ->
                             let
                                 step2 =
                                     resume1 Unit
                             in
                             case step2 of
-                                EvYield tag2 (Int n2) resume2 ->
+                                EvYield _ (Int n2) resume2 ->
                                     -- Great, second yield! Continue...
                                     let
                                         step3 =
                                             resume2 Unit
                                     in
                                     case step3 of
-                                        EvYield _ (Int n3) resume3 ->
+                                        EvYield _ (Int _) resume3 ->
                                             case resume3 Unit of
                                                 EvOk (Int total) ->
                                                     Expect.equal 60 total

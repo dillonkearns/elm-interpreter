@@ -353,7 +353,7 @@ evalRStep staticEnv locals expr =
             -- call. Walking the arg list uses direct recursion in Elm
             -- but it's bounded by arg count (typically 1–6), not by
             -- recursion depth — so no stack issue from that.
-            evalArgsStep staticEnv
+            evalArgsStep
                 locals
                 argExprs
                 []
@@ -370,7 +370,7 @@ evalRStep staticEnv locals expr =
                 (\headResult ->
                     case headResult of
                         EvOk headValue ->
-                            evalArgsStep staticEnv
+                            evalArgsStep
                                 locals
                                 argExprs
                                 []
@@ -722,13 +722,12 @@ the next `Rec` step. Short-circuits on non-`EvOk` intermediate results.
 
 -}
 evalArgsStep :
-    REnv
-    -> List Value
+    List Value
     -> List RExpr
     -> List Value
     -> (List Value -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value))
     -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
-evalArgsStep staticEnv locals remaining accRev k =
+evalArgsStep locals remaining accRev k =
     case remaining of
         [] ->
             k (List.reverse accRev)
@@ -738,7 +737,7 @@ evalArgsStep staticEnv locals remaining accRev k =
                 (\headResult ->
                     case headResult of
                         EvOk value ->
-                            evalArgsStep staticEnv locals rest (value :: accRev) k
+                            evalArgsStep locals rest (value :: accRev) k
 
                         _ ->
                             rBase headResult
@@ -1173,7 +1172,7 @@ evalRDirect env expr =
         RGlobal id ->
             evalGlobal env id
 
-        RGLSL _ ->
+        RGLSL ->
             evErr env (Unsupported "RGLSL (not supported)")
 
 

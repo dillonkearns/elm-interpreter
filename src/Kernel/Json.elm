@@ -744,7 +744,7 @@ runDecoder evalFn decoder json cfg env =
         DecodeAndThen callback innerDecoder ->
             case runDecoder evalFn innerDecoder json cfg env of
                 Ok val ->
-                    case applyFunction evalFn callback val cfg env of
+                    case applyFunction evalFn callback val cfg of
                         Ok (JsonDecoderValue newDecoder) ->
                             runDecoder evalFn newDecoder json cfg env
 
@@ -805,7 +805,7 @@ runMapDecoderHelp evalFn currentFunc decoders json cfg env =
         decoder :: rest ->
             case runDecoder evalFn decoder json cfg env of
                 Ok val ->
-                    case applyFunction evalFn currentFunc val cfg env of
+                    case applyFunction evalFn currentFunc val cfg of
                         Ok result ->
                             runMapDecoderHelp evalFn result rest json cfg env
 
@@ -847,8 +847,8 @@ type alias EvalFunction =
 {-| Apply an Elm function (stored as a PartiallyApplied value) to an argument.
 Uses the interpreter's evalFunction to handle the actual evaluation.
 -}
-applyFunction : EvalFunction -> Value -> Value -> Types.Config -> Types.Env -> Result String Value
-applyFunction evalFn func arg cfg _ =
+applyFunction : EvalFunction -> Value -> Value -> Types.Config -> Result String Value
+applyFunction evalFn func arg cfg =
     case func of
         PartiallyApplied closureEnv oldArgs patterns maybeName implementation arity ->
             let
