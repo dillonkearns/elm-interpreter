@@ -603,40 +603,151 @@ resolveProjectFromSummariesAndInitial initialAcc summaries =
             initialAcc
 
 
-{-| Reconstruct a coherent `ResolvedProject` from an `Env`'s current state.
+{-| Incrementally update the resolved-IR sidecar for a set of changed
+modules, splicing the results into an existing `ResolvedProject`.
 
-Used by `replaceModuleInEnv` and `extendWithFiles` so the resolved-IR sidecar
-stays in sync with `env.shared.functions` after incremental updates. Walks
-every module recorded in `allInterfaces`, rebuilds `CachedModuleSummary`
-values from `env.shared.functions` and `env.shared.moduleImports`, and
-re-runs `resolveProject` over the reconstructed list.
+Used by `replaceModuleInEnv` (one module) and `extendWithFiles` (N new
+modules) so the resolved-IR view stays coherent with
+`env.shared.functions` without paying for a full project-wide
+resolver walk on every incremental update.
 
-Modules whose `importedNames` entry is missing from `env.shared.moduleImports`
-are skipped — they cannot be resolved against import context anyway. This
-matches the behaviour of `buildInitialEnv`, which requires imports to be
-present before resolution.
+Algorithm:
 
-**Perf**: O(modules × decls) per call. For mutation testing's hot loop
-(one `replaceModuleInEnv` per mutant), this is a few tens of ms on small
-projects and should be acceptable; if it becomes a bottleneck, an
-incremental variant can update just the replaced module's decls.
+1.  **Purge** every entry in `base.globalIds`, `base.globalIdToName`,
+    `base.bodies`, and `base.errors` whose module name appears in
+    `changedModules`. The purge keeps every unchanged module's
+    resolved declarations alive under their existing GlobalIds, so
+    cross-module references from unchanged modules stay valid.
+
+2.  **Reconstruct** a `CachedModuleSummary` for each changed module
+    from `env.shared.functions` + `env.shared.moduleImports` +
+    `allInterfaces`. Modules that lack an `importedNames` entry
+    (which only happens before `buildModuleEnv` has run on them)
+    are skipped.
+
+3.  **Allocate fresh GlobalIds** for every declaration in the
+    changed modules, starting from `1 + max(purged globalIdToName keys)`.
+    This keeps existing IDs stable — any IDs that were freed by
+    the purge are not reused, which fragments the ID space slightly
+    but avoids any risk of reusing an ID that some in-flight
+    computation is holding. Fragmentation is irrelevant for
+    correctness and the space is 32-bit, so there's no pressure
+    to reclaim.
+
+4.  **Resolve** each changed decl's body against the merged
+    `globalIds` context and insert the result into `bodies`. This
+    shares `resolveProjectFromSummariesAndInitial` with the initial
+    full build path so the resolver walk stays in one place.
+
+The `nativeDispatchers`, `higherOrderDispatchers`, and
+`kernelDispatchers` maps are keyed by **core** GlobalIds only, which
+never change under user-module edits, so they carry over from
+`base` unchanged.
+
+**Perf**: O(changed_modules × decls_per_module) resolver walks +
+O(base.globalIds) purge scan. For mutation testing's hot loop
+(one module changed per mutant) this is 1/N the cost of the
+full-project rebuild from Phase 1a, where N is the total module
+count. On small-12 that's ~40× faster per call.
 -}
-rebuildResolvedFromEnv : Env -> ElmDict.Dict ModuleName (List Exposed) -> ResolvedProject
-rebuildResolvedFromEnv env allInterfaces =
+rebuildResolvedForModules :
+    List ModuleName
+    -> Env
+    -> ElmDict.Dict ModuleName (List Exposed)
+    -> ResolvedProject
+    -> ResolvedProject
+rebuildResolvedForModules changedModules env allInterfaces base =
     let
-        reconstructedSummaries : List CachedModuleSummary
-        reconstructedSummaries =
-            allInterfaces
-                |> ElmDict.toList
+        changedKeys : Set String
+        changedKeys =
+            changedModules
+                |> List.map Environment.moduleKey
+                |> Set.fromList
+
+        isChanged : ModuleName -> Bool
+        isChanged moduleName =
+            Set.member (Environment.moduleKey moduleName) changedKeys
+
+        -- Collect every GlobalId currently mapped to a changed module.
+        -- Used to purge the reverse map and the bodies dict below.
+        idsToRemove : Set IR.GlobalId
+        idsToRemove =
+            base.globalIds
+                |> Dict.foldl
+                    (\( modName, _ ) id acc ->
+                        if isChanged modName then
+                            Set.insert id acc
+
+                        else
+                            acc
+                    )
+                    Set.empty
+
+        purgedGlobalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+        purgedGlobalIds =
+            base.globalIds
+                |> Dict.foldl
+                    (\key id acc ->
+                        if isChanged (Tuple.first key) then
+                            acc
+
+                        else
+                            Dict.insert key id acc
+                    )
+                    Dict.empty
+
+        purgedGlobalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
+        purgedGlobalIdToName =
+            base.globalIdToName
+                |> Dict.foldl
+                    (\id name acc ->
+                        if Set.member id idsToRemove then
+                            acc
+
+                        else
+                            Dict.insert id name acc
+                    )
+                    Dict.empty
+
+        purgedBodies : Dict.Dict IR.GlobalId IR.RExpr
+        purgedBodies =
+            base.bodies
+                |> Dict.foldl
+                    (\id body acc ->
+                        if Set.member id idsToRemove then
+                            acc
+
+                        else
+                            Dict.insert id body acc
+                    )
+                    Dict.empty
+
+        purgedErrors : List ResolveErrorEntry
+        purgedErrors =
+            base.errors
+                |> List.filter (\err -> not (isChanged err.moduleName))
+
+        -- Reconstruct CachedModuleSummary values for the changed
+        -- modules only. Summaries whose `importedNames` entry is
+        -- missing from `env.shared.moduleImports` are skipped — that
+        -- matches `rebuildResolvedFromEnvFull`'s behaviour and is a
+        -- no-op before `buildModuleEnv` has registered them.
+        changedSummaries : List CachedModuleSummary
+        changedSummaries =
+            changedModules
                 |> List.filterMap
-                    (\( moduleName, interface ) ->
+                    (\moduleName ->
                         let
                             key : String
                             key =
                                 Environment.moduleKey moduleName
                         in
-                        case Dict.get key env.shared.moduleImports of
-                            Just importedNames ->
+                        case
+                            ( ElmDict.get moduleName allInterfaces
+                            , Dict.get key env.shared.moduleImports
+                            )
+                        of
+                            ( Just interface, Just importedNames ) ->
                                 Just
                                     { moduleName = moduleName
                                     , interface = interface
@@ -647,11 +758,70 @@ rebuildResolvedFromEnv env allInterfaces =
                                             |> Maybe.withDefault []
                                     }
 
-                            Nothing ->
+                            _ ->
                                 Nothing
                     )
+
+        -- Allocate fresh GlobalIds for every decl in the changed
+        -- summaries, starting at 1 + max(remaining ids). This avoids
+        -- reusing any ID that in-flight intercept tables or closure
+        -- captures may still be holding.
+        nextStartId : IR.GlobalId
+        nextStartId =
+            (purgedGlobalIdToName
+                |> Dict.keys
+                |> List.maximum
+                |> Maybe.withDefault -1
+            )
+                + 1
+
+        idAssignment :
+            { next : IR.GlobalId
+            , ids : Dict.Dict ( ModuleName, String ) IR.GlobalId
+            , reverseIds : Dict.Dict IR.GlobalId ( ModuleName, String )
+            }
+        idAssignment =
+            changedSummaries
+                |> List.foldl
+                    (\summary outer ->
+                        summary.functions
+                            |> List.foldl
+                                (\impl inner ->
+                                    if isCustomTypeConstructor impl then
+                                        inner
+
+                                    else
+                                        let
+                                            name : String
+                                            name =
+                                                Node.value impl.name
+                                        in
+                                        { next = inner.next + 1
+                                        , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
+                                        , reverseIds = Dict.insert inner.next ( summary.moduleName, name ) inner.reverseIds
+                                        }
+                                )
+                                outer
+                    )
+                    { next = nextStartId
+                    , ids = purgedGlobalIds
+                    , reverseIds = purgedGlobalIdToName
+                    }
+
+        deltaAcc : ResolvedProject
+        deltaAcc =
+            { globalIds = idAssignment.ids
+            , bodies = purgedBodies
+            , globalIdToName = idAssignment.reverseIds
+            , nativeDispatchers = base.nativeDispatchers
+            , higherOrderDispatchers = base.higherOrderDispatchers
+            , kernelDispatchers = base.kernelDispatchers
+            , errors = purgedErrors
+            }
     in
-    resolveProject reconstructedSummaries
+    -- Resolve the changed decls' bodies against the merged globalIds
+    -- via the same resolver walk the initial full build uses.
+    resolveProjectFromSummariesAndInitial deltaAcc changedSummaries
 
 
 eval : String -> Expression -> Result Error Value
@@ -2247,7 +2417,12 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
                 ProjectEnv
                     { env = env
                     , allInterfaces = updatedInterfaces
-                    , resolved = rebuildResolvedFromEnv env updatedInterfaces
+                    , resolved =
+                        rebuildResolvedForModules
+                            [ newModule.moduleName ]
+                            env
+                            updatedInterfaces
+                            projectEnv.resolved
                     }
             )
 
@@ -3934,7 +4109,12 @@ extendWithFiles (ProjectEnv projectEnv) additionalFiles =
                 ProjectEnv
                     { env = env
                     , allInterfaces = allInterfaces
-                    , resolved = rebuildResolvedFromEnv env allInterfaces
+                    , resolved =
+                        rebuildResolvedForModules
+                            (List.map .moduleName parsedModules)
+                            env
+                            allInterfaces
+                            projectEnv.resolved
                     }
             )
 
