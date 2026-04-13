@@ -2562,13 +2562,32 @@ tcoLoop funcName body remaining cfg env =
         paramNames =
             env.values
                 |> Dict.keys
-
-        hasIntercepts : Bool
-        hasIntercepts =
-            not (Dict.isEmpty cfg.intercepts)
-
     in
-    tcoLoopHelp funcName body remaining 0 16 0 0 0 innerCfg cfg env
+    -- Item 2a (surgical): for statically-safe shapes, skip the
+    -- fingerprint / bounded-progress cycle probe by starting the
+    -- amortized-check interval beyond the remaining step budget.
+    -- `tcoLoopHelp` won't enter the probe branch on this run, but
+    -- its env handling, Yield/Memo plumbing, and cfg threading are
+    -- unchanged — avoiding the regressions that replacing the whole
+    -- loop body with `tcoLoopSafe` / `tcoLoopListDrain` caused in
+    -- Parser.Advanced and Review.Rule tests.
+    --
+    -- `TcoGeneral` uses the default interval=16 with adaptive growth.
+    -- `maxSteps` absolute cap still applies via `remaining`.
+    let
+        initialInterval : Int
+        initialInterval =
+            case TcoAnalysis.analyze funcName paramNames body of
+                TcoAnalysis.TcoListDrain _ ->
+                    remaining + 1
+
+                TcoAnalysis.TcoSafe ->
+                    remaining + 1
+
+                TcoAnalysis.TcoGeneral ->
+                    16
+    in
+    tcoLoopHelp funcName body remaining 0 initialInterval 0 0 0 innerCfg cfg env
 
 
 tcoLoopListDrain : String -> TcoAnalysis.ListDrainInfo -> Int -> Config -> Env -> EvalResult Value
