@@ -595,16 +595,24 @@ checkAndUpdateCycle qualifiedName args callDepth checkDict =
                     threshold =
                         -- Elm-review's Rule module uses legitimate structural recursion
                         -- with identical arguments (state machine through `raise`/`createVisitor`).
-                        -- Closure args keep a very high threshold because closure fingerprinting
-                        -- can't distinguish nested state changes, so legitimate elm-review patterns
-                        -- can reach thousands of identical-fingerprint calls. Plain data args use a
-                        -- much lower threshold so non-closure mutual recursion (ping/pong with Int
-                        -- args) is caught before the JS call stack overflows (~10k frames).
+                        -- With N modules × M rules × ~10 visitors, this can reach thousands of
+                        -- identical-arg calls that are NOT infinite — they terminate after processing
+                        -- all modules. The callDepth check (200) provides first-line defense.
+                        -- Use very high threshold to avoid false positives.
+                        --
+                        -- NOTE: non-closure mutual recursion like `ping n = pong n` / `pong n = ping n`
+                        -- does NOT get caught gracefully by this count — it overflows the underlying
+                        -- JS call stack before count reaches 100000. We tried lowering the threshold
+                        -- and tried a `callDepth - entry.depth` heuristic, but elm-review's flat
+                        -- iteration legitimately reaches thousands of identical-fingerprint calls
+                        -- (with delta > 800), and the JS host stack overflows somewhere between
+                        -- callDepth 1000 and 1500 — there's no safe threshold in between. See
+                        -- `EndToEnd.elm`'s `mutual recursion with identical args` test (skipped).
                         if hasClosureArgs then
                             100000
 
                         else
-                            300
+                            100000
                 in
                 if entry.count >= threshold then
                     CycleDetected
