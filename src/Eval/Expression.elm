@@ -608,15 +608,16 @@ checkAndUpdateCycle qualifiedName args callDepth checkDict =
                     threshold =
                         -- Elm-review's Rule module uses legitimate structural recursion
                         -- with identical arguments (state machine through `raise`/`createVisitor`).
-                        -- With N modules × M rules × ~10 visitors, this can reach thousands of
-                        -- identical-arg calls that are NOT infinite — they terminate after processing
-                        -- all modules. The callDepth check (200) provides first-line defense.
-                        -- Use very high threshold to avoid false positives.
+                        -- Closure args keep a very high threshold because closure fingerprinting
+                        -- can't distinguish nested state changes, so legitimate elm-review patterns
+                        -- can reach thousands of identical-fingerprint calls. Plain data args use a
+                        -- much lower threshold so non-closure mutual recursion (ping/pong with Int
+                        -- args) is caught before the JS call stack overflows (~10k frames).
                         if hasClosureArgs then
                             100000
 
                         else
-                            100000
+                            300
                 in
                 if entry.count >= threshold then
                     CycleDetected
