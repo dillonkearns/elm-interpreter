@@ -1789,7 +1789,7 @@ evalApplication first rest cfg env =
 
                         [] ->
                             -- 0 patterns with 1 arg: need general path (splitting)
-                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+                            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
                 ( [], [ arg1, arg2 ] ) ->
                     -- Fast path: two arguments, no oldArgs
@@ -1816,7 +1816,7 @@ evalApplication first rest cfg env =
 
                         _ ->
                             -- 0 or 1 pattern with 2 args: need general path (splitting)
-                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+                            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
                 ( [], [ arg1, arg2, arg3 ] ) ->
                     -- Fast path: three arguments, no oldArgs (A3 shape).
@@ -1838,7 +1838,7 @@ evalApplication first rest cfg env =
                                 )
 
                         _ ->
-                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+                            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
                 ( [], [ arg1, arg2, arg3, arg4 ] ) ->
                     -- Fast path: four arguments, no oldArgs (A4 shape).
@@ -1859,10 +1859,10 @@ evalApplication first rest cfg env =
                                 )
 
                         _ ->
-                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+                            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
                 _ ->
-                    evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+                    evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
     in
     evalOrRecurse ( first, cfg, env )
         (\firstValue ->
@@ -1884,32 +1884,72 @@ evalApplication first rest cfg env =
         )
 
 
-evalApplicationGeneralCompute : Node Expression -> List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> Int -> PartialEval Value
-evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env =
+{-| Apply an already-evaluated `Value` to a list of argument expressions.
+Used by the over-application path in `evalApplicationGeneral` — once the
+function's body has been evaluated with the first `arity` args, the
+resulting Value (typically a `PartiallyApplied` representing the
+returned function) needs to absorb the leftover args without going back
+through an AST reconstruction. Mirrors the post-eval dispatch at the
+bottom of `evalApplication`.
+-}
+applyValueToExprs : Value -> List (Node Expression) -> PartialEval Value
+applyValueToExprs firstValue rest cfg env =
+    case firstValue of
+        Custom name customArgs ->
+            Types.recurseMapThenWithEval evalExpression
+                ( rest, cfg, env )
+                (\values -> Types.succeedPartial <| Custom name (customArgs ++ values))
+
+        PartiallyApplied localEnv oldArgs patterns maybeQualifiedName implementation patternsLength ->
+            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+
+        other ->
+            Types.failPartial <|
+                typeError env <|
+                    "Trying to apply "
+                        ++ Value.toString other
+                        ++ ", which is a non-lambda non-variant"
+
+
+evalApplicationGeneralCompute : List (Node Expression) -> List Value -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> Int -> PartialEval Value
+evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env =
     -- patternsLength comes from the cached arity on PartiallyApplied.
     -- oldArgs length is still recomputed here because it grows through
     -- curried application; it's usually a short list and only matters on
     -- the general (slow) path.
-    evalApplicationGeneral first rest oldArgs (List.length oldArgs) patternsLength localEnv patterns maybeQualifiedName implementation cfg env
+    evalApplicationGeneral rest oldArgs (List.length oldArgs) patternsLength localEnv patterns maybeQualifiedName implementation cfg env
 
 
-evalApplicationGeneral : Node Expression -> List (Node Expression) -> List Value -> Int -> Int -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
-evalApplicationGeneral first rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env =
+evalApplicationGeneral : List (Node Expression) -> List Value -> Int -> Int -> Env -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
+evalApplicationGeneral rest oldArgs oldArgsLength patternsLength localEnv patterns maybeQualifiedName implementation cfg env =
     let
         ( used, leftover ) =
             List.Extra.splitAt (patternsLength - oldArgsLength) rest
     in
     if not (List.isEmpty leftover) then
-        -- Too many args, we split
-        Recursion.recurse
-            ( fakeNode <|
-                Expression.Application
-                    (fakeNode
-                        (Expression.Application (first :: used))
-                        :: leftover
-                    )
-            , cfg
-            , env
+        -- Over-application: eval the first `patternsLength - oldArgsLength`
+        -- args, call the body with those, then apply the leftover args to
+        -- whatever Value the body returns. Previously this reconstructed a
+        -- fake nested `Application` AST node and re-entered `evalExpression`
+        -- via `Recursion.recurse`; the direct flow here avoids the AST
+        -- round-trip and sidesteps any load-time AST rewrite (e.g.
+        -- `ListFusion.flattenApplicationHead`) that would otherwise have to
+        -- special-case the reconstruction.
+        Types.recurseMapThenWithEval evalExpression
+            ( used, cfg, env )
+            (\usedValues ->
+                let
+                    args : List Value
+                    args =
+                        oldArgs ++ usedValues
+                in
+                evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env
+                    |> Recursion.andThen
+                        (Types.wrapThenWithEval evalExpression
+                            (\intermediateValue ->
+                                applyValueToExprs intermediateValue leftover cfg env
+                            )
+                        )
             )
 
     else

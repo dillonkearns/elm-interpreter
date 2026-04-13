@@ -26,6 +26,84 @@ suite =
         , listFusionTests
         , normalizationLosslessnessTests
         , spineCollectionTests
+        , overApplicationTests
+        ]
+
+
+{-| Regression coverage for over-application: a call site supplies
+more arguments than the outer function's arity, and each surplus arg
+has to be applied to the value returned by the preceding call. The
+evaluator's general path handles this by re-entering the application
+machinery after the inner call completes. These tests exist to catch
+any breakage of that re-entry when the over-application path is
+refactored (ZAM task C — replacing AST reconstruction with a direct
+synchronous dispatch).
+-}
+overApplicationTests : Test
+overApplicationTests =
+    describe "over-application re-entry"
+        [ test "outer arity-1 returning inner lambda, called with 2 args" <|
+            \_ ->
+                Eval.Module.eval
+                    "module Temp exposing (main)\n\nmain : Int\nmain = (\\a -> \\b -> a + b) 3 5\n"
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 8))
+        , test "outer arity-1 returning inner lambda, called with 3 args" <|
+            \_ ->
+                Eval.Module.eval
+                    "module Temp exposing (main)\n\nmain : Int\nmain = (\\a -> \\b -> \\c -> a * 100 + b * 10 + c) 1 2 3\n"
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 123))
+        , test "if-returning-function over-applied picks correct branch" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+pickOp : Int -> (Int -> Int)
+pickOp flag =
+    if flag > 0 then
+        \\n -> n + 1
+
+    else
+        \\n -> n - 1
+
+main : Int
+main =
+    pickOp 1 10
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 11))
+        , test "user function returning partial application, over-applied" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+add : Int -> Int -> Int
+add a b =
+    a + b
+
+makeAdder : Int -> (Int -> Int)
+makeAdder k =
+    add k
+
+main : Int
+main =
+    makeAdder 3 7
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 10))
+        , test "deeply over-applied (5 args into arity-1 chain)" <|
+            \_ ->
+                Eval.Module.eval
+                    "module Temp exposing (main)\n\nmain : Int\nmain = (\\a -> \\b -> \\c -> \\d -> \\e -> a + b + c + d + e) 1 2 3 4 5\n"
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 15))
         ]
 
 

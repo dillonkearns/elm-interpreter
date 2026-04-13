@@ -1,4 +1,4 @@
-module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseMapThenWithEval, recurseThen, recurseThenWithEval, resolveRecWithStep, succeedPartial)
+module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseMapThenWithEval, recurseThen, recurseThenWithEval, resolveRecWithStep, succeedPartial, wrapThenWithEval)
 
 import Elm.Syntax.Expression exposing (Expression)
 import Elm.Syntax.Node exposing (Node)
