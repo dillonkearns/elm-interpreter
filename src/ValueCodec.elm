@@ -8,9 +8,8 @@ RegexValue, and JsonDecoderValue are encoded as sentinel values.
 
 -}
 
-import Array exposing (Array)
-import Elm.Syntax.Pattern exposing (QualifiedNameRef)
-import FastDict as Dict exposing (Dict)
+import Array
+import FastDict as Dict
 import Json.Decode as D
 import Json.Encode as E
 import Types exposing (JsonVal(..), Value(..))

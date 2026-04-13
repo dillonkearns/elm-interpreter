@@ -3,10 +3,9 @@ module TcoAnalysis exposing (ListDrainInfo, TcoStrategy(..), analyze)
 {-| Static analysis of tail-recursive function bodies to determine
 whether cycle detection can be safely skipped at runtime, and to
 extract structural info for body specialization.
-
 -}
 
-import Elm.Syntax.Expression exposing (CaseBlock, Expression(..), LetDeclaration(..))
+import Elm.Syntax.Expression exposing (CaseBlock, Expression(..))
 import Elm.Syntax.Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..))
 import Set exposing (Set)

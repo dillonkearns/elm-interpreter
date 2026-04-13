@@ -9,7 +9,6 @@ import Elm.Parser
 import Elm.Syntax.Expression as Expression
 import Elm.Syntax.File exposing (File)
 import Elm.Syntax.ModuleName exposing (ModuleName)
-import Elm.Syntax.Pattern exposing (QualifiedNameRef)
 import Eval.Expression
 import Eval.Module
 import Expect
@@ -111,7 +110,7 @@ combinedListConcatMap =
 
 
 {-| Test: List.filterMap selecting from a config list, then concatMap.
-Simulates: selectedRules = indices |> List.filterMap (\i -> List.head (List.drop i config))
+Simulates: selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i config))
 -}
 combinedFilterMapApply : Test
 combinedFilterMapApply =
@@ -475,9 +474,9 @@ parseModule src =
 
 {-| Helper: evaluate using incremental replacement.
 
-1. Build base env from original sources (all modules)
-2. Replace one module with its mutated version
-3. Evaluate in the context of the "main" module (passed as additional file)
+1.  Build base env from original sources (all modules)
+2.  Replace one module with its mutated version
+3.  Evaluate in the context of the "main" module (passed as additional file)
 
 -}
 evalIncremental : List String -> String -> String -> String -> Result Types.Error Value
@@ -763,10 +762,10 @@ interceptCanYield =
 
 {-| Test: yield from a function called inside a let binding.
 This is the pattern elm-review uses for initialCacheMarker:
-    let
-        cache = initialCacheMarker name id emptyCache
-        ...
-    in result
+let
+cache = initialCacheMarker name id emptyCache
+...
+in result
 -}
 yieldInLetBindingPropagates : Test
 yieldInLetBindingPropagates =
@@ -832,9 +831,9 @@ yieldInLetBindingPropagates =
 
 
 {-| Test: yield from a function that's called (not directly in let binding).
-    let
-        result = someFunc (marker 1)
-    in result
+let
+result = someFunc (marker 1)
+in result
 -}
 yieldFromCalledFunctionInLet : Test
 yieldFromCalledFunctionInLet =
@@ -896,10 +895,10 @@ yieldFromCalledFunctionInLet =
 
 {-| Test: multiple functions that yield, called sequentially.
 This is the pattern for saving ALL rule caches:
-    let
-        cache1 = marker "rule1" emptyCache
-        cache2 = marker "rule2" emptyCache
-    in ...
+let
+cache1 = marker "rule1" emptyCache
+cache2 = marker "rule2" emptyCache
+in ...
 -}
 multipleYieldsFromSequentialCalls : Test
 multipleYieldsFromSequentialCalls =
@@ -1220,9 +1219,9 @@ results =
 
 
 {-| Test: multiple yields from sequential let bindings.
-    let x = marker 1
-        y = marker 2
-    in x + y
+let x = marker 1
+y = marker 2
+in x + y
 -}
 multipleYieldsFromLetBindings : Test
 multipleYieldsFromLetBindings =
@@ -1512,6 +1511,7 @@ yieldInsideListMap =
                         , \_ ->
                             if yieldCount /= 3 then
                                 Expect.fail ("Expected 3 yields, got " ++ String.fromInt yieldCount ++ ". Payloads: " ++ Debug.toString payloads ++ ". Final: " ++ Debug.toString final)
+
                             else
                                 Expect.pass
                         ]

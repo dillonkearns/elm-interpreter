@@ -20,7 +20,7 @@ evaluator code.
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
-import Types exposing (Error(..), EvalErrorKind(..), Value(..))
+import Types exposing (Error, Value(..))
 
 
 suite : Test

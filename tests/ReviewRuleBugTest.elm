@@ -10,7 +10,7 @@ import Eval.Module
 import Expect
 import FastDict
 import Test exposing (Test, describe, test)
-import Types exposing (Error(..), EvalResult(..), Value(..))
+import Types exposing (EvalResult(..), Value(..))
 
 
 suite : Test
@@ -100,6 +100,7 @@ suite =
                                             Custom { name } _ ->
                                                 if name == "Ok" then
                                                     Expect.pass
+
                                                 else
                                                     Expect.fail ("Got Err result: " ++ Debug.toString val)
 

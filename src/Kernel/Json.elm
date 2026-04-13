@@ -37,7 +37,6 @@ import Array
 import Elm.Syntax.Node
 import Elm.Syntax.Pattern
 import EvalResult
-import FastDict as Dict
 import Rope
 import Set
 import Types exposing (Eval, EvalResult(..), JsonDecoder(..), JsonVal(..), Value(..))
@@ -334,6 +333,7 @@ encodeListHelp func remaining acc cfg env =
 
                 Types.EvErrCoverage e s ->
                     Types.EvErrCoverage e s
+
 
 {-| Json.Encode.object : List ( String, Value ) -> Value
 Build a JSON object from key-value pairs.
@@ -883,6 +883,7 @@ applyFunction evalFn func arg cfg _ =
 
                     EvErrCoverage e _ ->
                         Err (Types.evalErrorKindToString e.error)
+
             else
                 Ok (PartiallyApplied closureEnv newArgs patterns maybeName implementation arity)
 

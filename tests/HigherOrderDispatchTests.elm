@@ -9,12 +9,13 @@ arity > 0) under the `initContextWithImports` resolver widening.
 Each test goes through `Eval.Module.evalWithResolvedIR`, which is the
 new-evaluator entry point. The dispatchers receive pre-evaluated args
 and should produce results that match the host-Elm implementations.
+
 -}
 
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
-import Types exposing (Error(..), Value(..))
+import Types exposing (Error, Value(..))
 
 
 suite : Test
@@ -155,7 +156,6 @@ result =
                     Expect.fail "buildProjectEnv failed"
 
 
-
 dictFoldlCountKeys : Test
 dictFoldlCountKeys =
     test "Dict.foldl counts keys with a KernelImpl callback" <|
@@ -169,7 +169,7 @@ import Dict
 
 result : Int
 result =
-    Dict.foldl (\\_ _ acc -> acc + 1) 0 (Dict.fromList [ ( \"a\", 1 ), ( \"b\", 2 ), ( \"c\", 3 ) ])
+    Dict.foldl (\\_ _ acc -> acc + 1) 0 (Dict.fromList [ ( "a", 1 ), ( "b", 2 ), ( "c", 3 ) ])
 """
             in
             case Eval.Module.buildProjectEnv [ source ] of
@@ -199,7 +199,7 @@ result =
         step key value acc =
             acc + value
     in
-    Dict.foldl step 0 (Dict.fromList [ ( \"a\", 10 ), ( \"b\", 20 ), ( \"c\", 30 ) ])
+    Dict.foldl step 0 (Dict.fromList [ ( "a", 10 ), ( "b", 20 ), ( "c", 30 ) ])
 """
             in
             case Eval.Module.buildProjectEnv [ source ] of
@@ -224,7 +224,7 @@ import Dict
 
 result : List String
 result =
-    Dict.foldl (\\k _ acc -> k :: acc) [] (Dict.fromList [ ( \"a\", 1 ), ( \"c\", 3 ), ( \"b\", 2 ) ])
+    Dict.foldl (\\k _ acc -> k :: acc) [] (Dict.fromList [ ( "a", 1 ), ( "c", 3 ), ( "b", 2 ) ])
 """
             in
             case Eval.Module.buildProjectEnv [ source ] of

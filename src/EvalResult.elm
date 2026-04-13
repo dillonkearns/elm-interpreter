@@ -2,7 +2,7 @@ module EvalResult exposing (andThen, combine, fail, fromResult, map, map2, merge
 
 import Rope exposing (Rope)
 import Set
-import Types exposing (CallTree, EvalErrorData, EvalErrorKind(..), EvalResult(..))
+import Types exposing (CallTree, EvalErrorData, EvalResult(..))
 
 
 {-| Append two call tree ropes, short-circuiting when either is empty.

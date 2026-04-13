@@ -4,7 +4,7 @@ import Elm.Syntax.Expression as Expression
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
-import TestUtils exposing (evalExpect, evalTest, list, maybe, tuple)
+import TestUtils exposing (evalTest, list, maybe, tuple)
 import Types exposing (Value(..))
 
 

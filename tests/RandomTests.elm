@@ -2,11 +2,10 @@ module RandomTests exposing (suite)
 
 import Bitwise
 import Elm.Syntax.Expression as Expression
-import Eval
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
-import TestUtils exposing (evalTest, evalTest_, list)
+import TestUtils exposing (evalTest, list)
 import Types exposing (Value(..))
 
 
@@ -253,7 +252,9 @@ main =
 """
                 ]
                 Int
-                0 -- value doesn't matter; evalProjectTest just checks for Int, not crash
+                0
+
+            -- value doesn't matter; evalProjectTest just checks for Int, not crash
             ]
         ]
 

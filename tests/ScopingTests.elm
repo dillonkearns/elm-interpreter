@@ -1,11 +1,10 @@
 module ScopingTests exposing (suite)
 
 import Elm.Syntax.Expression as Expression
-import Eval
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
-import TestUtils exposing (evalTest, evalTest_, list)
+import TestUtils exposing (list)
 import Types exposing (Error(..), EvalErrorKind(..), Value(..))
 
 
@@ -895,5 +894,3 @@ main =
                     Ok v ->
                         Expect.fail ("expected NameError, got Ok " ++ Debug.toString v)
         ]
-
-

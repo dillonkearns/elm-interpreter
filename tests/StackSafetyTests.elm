@@ -18,7 +18,7 @@ the evaluator trampolines properly (depth 5000+, currently fails).
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
-import Types exposing (Error(..), Value(..))
+import Types exposing (Error, Value(..))
 
 
 suite : Test
@@ -79,6 +79,7 @@ expected to stack-overflow on `evalR`'s direct recursion through
 Depth 5000 is chosen to blow past JS's default stack (~10k frames
 with a few frames per evalR hop) while still being cheap enough
 that a trampolined evaluator finishes quickly.
+
 -}
 nonTailRecursiveDepth5000 : Test
 nonTailRecursiveDepth5000 =
@@ -110,7 +111,6 @@ result =
 
                 Err _ ->
                     Expect.fail "buildProjectEnv failed"
-
 
 
 nonTailRecursiveDepth50000 : Test
@@ -185,11 +185,12 @@ result =
 {-| Mutual recursion between two functions — exercises the cross-body
 trampoline across two different resolved bodies, not just one
 self-recursive function. This is essentially a tail-call chain:
-    isEven N → isOdd (N-1) → isEven (N-2) → ...
+isEven N → isOdd (N-1) → isEven (N-2) → ...
 
 which is exactly the shape that `Recursion.recurse` handles without
 a continuation stack push — ideal for checking whether the
 trampoline's hot path has residual per-iteration allocation cost.
+
 -}
 mutuallyRecursiveDepth10000 : Test
 mutuallyRecursiveDepth10000 =
@@ -275,7 +276,6 @@ result =
 
                 Err _ ->
                     Expect.fail "buildProjectEnv failed"
-
 
 
 {-| Deep recursion via a `case` expression as the dispatch shape —
@@ -368,7 +368,6 @@ result =
 
                 Err _ ->
                     Expect.fail "buildProjectEnv failed"
-
 
 
 

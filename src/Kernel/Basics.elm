@@ -1,7 +1,7 @@
 module Kernel.Basics exposing (idiv, modBy, remainderBy)
 
 import EvalResult
-import Types exposing (Eval, Value)
+import Types exposing (Eval)
 import Value
 
 

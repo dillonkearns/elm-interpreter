@@ -9,9 +9,6 @@ module Kernel.Parser exposing
     )
 
 import Bitwise
-import EvalResult
-import Types exposing (Eval, Value(..))
-import Value
 
 
 charCodeAt : Int -> String -> Maybe Int

@@ -4,7 +4,7 @@ import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression exposing (Expression)
 import Elm.Syntax.Node as Node exposing (Node(..))
-import Eval.ResolvedIR as IR exposing (RExpr(..), RPattern(..))
+import Eval.ResolvedIR exposing (RExpr(..), RPattern(..))
 import Eval.Resolver as Resolver exposing (ResolveError(..), ResolverContext)
 import Expect
 import FastDict
@@ -36,6 +36,7 @@ commonContext =
             , ( ( [ "Basics" ], "or" ), 11 )
             , ( ( [ "List" ], "cons" ), 20 )
             , ( ( [ "List" ], "map" ), 21 )
+
             -- User globals used in tests
             , ( ( [ "Test" ], "helper" ), 100 )
             , ( ( [ "Test" ], "value" ), 101 )

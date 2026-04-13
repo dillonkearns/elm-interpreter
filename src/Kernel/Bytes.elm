@@ -4,7 +4,6 @@ import Array exposing (Array)
 import Bitwise
 import EvalResult
 import Types exposing (Eval, EvalResult(..), Value(..))
-import Value
 
 
 {-| Get the byte width of a Bytes value.
@@ -571,6 +570,7 @@ decode decoderFn bytesVal cfg env =
             EvalResult.succeed
                 (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
 
+
 {-| Wrapper for `encode` that works with the kernel registration's `oneWithError` pattern.
 -}
 encodeKernel : Value -> Eval (Array Int)
@@ -766,7 +766,13 @@ bytesToFloat64 bs =
                         )
 
                 mantissaFloat =
-                    toFloat mantissaHigh * 4294967296 + toFloat (Bitwise.and mantissaLow 0x7FFFFFFF) + (if Bitwise.and mantissaLow 0x80000000 /= 0 then 2147483648 else 0)
+                    toFloat mantissaHigh * 4294967296 + toFloat (Bitwise.and mantissaLow 0x7FFFFFFF)
+                        + (if Bitwise.and mantissaLow 0x80000000 /= 0 then
+                            2147483648
+
+                           else
+                            0
+                          )
 
                 signMul =
                     if sign == 1 then

@@ -26,10 +26,12 @@ tree-walking evaluator. Key comparison is delegated to the host
 String, Int, Tuple, etc.
 
 Dict values at runtime are:
-  - Custom { moduleName = [ "Dict" ], name = "RBEmpty_elm_builtin" } []
-  - Custom { moduleName = [ "Dict" ], name = "RBNode_elm_builtin" } [ color, key, value, left, right ]
+
+  - Custom { moduleName = [ "Dict" ], name = "RBEmpty\_elm\_builtin" } []
+  - Custom { moduleName = [ "Dict" ], name = "RBNode\_elm\_builtin" } [ color, key, value, left, right ]
 
 Color values:
+
   - Custom { moduleName = [ "Dict" ], name = "Red" } []
   - Custom { moduleName = [ "Dict" ], name = "Black" } []
 
@@ -90,16 +92,6 @@ isRed value =
 
         _ ->
             False
-
-
-isBlack : Value -> Bool
-isBlack value =
-    case value of
-        Custom ref _ ->
-            ref.name == "Black"
-
-        _ ->
-            True
 
 
 {-| Kernel Dict.foldl: fold from lowest to highest key.
@@ -830,5 +822,3 @@ valuesHelp dict acc =
 
         _ ->
             acc
-
-

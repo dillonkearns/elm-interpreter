@@ -27,12 +27,13 @@ exposure.
 
 This test reproduces the issue in isolation so we can iterate
 on the fix without re-running the full review-runner bundle.
+
 -}
 
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
-import Types exposing (Error(..), Value(..))
+import Types exposing (Value(..))
 
 
 suite : Test
