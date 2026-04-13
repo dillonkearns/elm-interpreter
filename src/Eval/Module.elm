@@ -503,6 +503,21 @@ resolveProject summaries =
             , errors = []
             }
     in
+    resolveProjectFromSummariesAndInitial initialAcc summaries
+
+
+{-| Second half of `resolveProject` — folds `resolveDeclaration` over every
+user function in `summaries`, inserting successes into `bodies` and failures
+into `errors`. Extracted so `rebuildResolvedFromEnv` can reuse the exact same
+resolution walk.
+-}
+resolveProjectFromSummariesAndInitial : ResolvedProject -> List CachedModuleSummary -> ResolvedProject
+resolveProjectFromSummariesAndInitial initialAcc summaries =
+    let
+        globalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+        globalIds =
+            initialAcc.globalIds
+    in
     summaries
         |> List.foldl
             (\summary outer ->
@@ -586,6 +601,57 @@ resolveProject summaries =
                         outer
             )
             initialAcc
+
+
+{-| Reconstruct a coherent `ResolvedProject` from an `Env`'s current state.
+
+Used by `replaceModuleInEnv` and `extendWithFiles` so the resolved-IR sidecar
+stays in sync with `env.shared.functions` after incremental updates. Walks
+every module recorded in `allInterfaces`, rebuilds `CachedModuleSummary`
+values from `env.shared.functions` and `env.shared.moduleImports`, and
+re-runs `resolveProject` over the reconstructed list.
+
+Modules whose `importedNames` entry is missing from `env.shared.moduleImports`
+are skipped — they cannot be resolved against import context anyway. This
+matches the behaviour of `buildInitialEnv`, which requires imports to be
+present before resolution.
+
+**Perf**: O(modules × decls) per call. For mutation testing's hot loop
+(one `replaceModuleInEnv` per mutant), this is a few tens of ms on small
+projects and should be acceptable; if it becomes a bottleneck, an
+incremental variant can update just the replaced module's decls.
+-}
+rebuildResolvedFromEnv : Env -> ElmDict.Dict ModuleName (List Exposed) -> ResolvedProject
+rebuildResolvedFromEnv env allInterfaces =
+    let
+        reconstructedSummaries : List CachedModuleSummary
+        reconstructedSummaries =
+            allInterfaces
+                |> ElmDict.toList
+                |> List.filterMap
+                    (\( moduleName, interface ) ->
+                        let
+                            key : String
+                            key =
+                                Environment.moduleKey moduleName
+                        in
+                        case Dict.get key env.shared.moduleImports of
+                            Just importedNames ->
+                                Just
+                                    { moduleName = moduleName
+                                    , interface = interface
+                                    , importedNames = importedNames
+                                    , functions =
+                                        Dict.get key env.shared.functions
+                                            |> Maybe.map Dict.values
+                                            |> Maybe.withDefault []
+                                    }
+
+                            Nothing ->
+                                Nothing
+                    )
+    in
+    resolveProject reconstructedSummaries
 
 
 eval : String -> Expression -> Result Error Value
@@ -2181,7 +2247,7 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
                 ProjectEnv
                     { env = env
                     , allInterfaces = updatedInterfaces
-                    , resolved = projectEnv.resolved
+                    , resolved = rebuildResolvedFromEnv env updatedInterfaces
                     }
             )
 
@@ -3868,7 +3934,7 @@ extendWithFiles (ProjectEnv projectEnv) additionalFiles =
                 ProjectEnv
                     { env = env
                     , allInterfaces = allInterfaces
-                    , resolved = projectEnv.resolved
+                    , resolved = rebuildResolvedFromEnv env allInterfaces
                     }
             )
 

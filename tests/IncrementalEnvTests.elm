@@ -29,6 +29,8 @@ suite =
             , replacePreservesImportResolution
             , replaceWithCustomType
             , replaceWithRecordAlias
+            , replaceRefreshesResolvedSidecar
+            , extendWithFilesRefreshesResolvedSidecar
             ]
         , describe "evalWithEnvFromFilesAndValues"
             [ valueInjectionSimple
@@ -58,6 +60,8 @@ suite =
             , yieldInsideListFoldl
             , yieldInsideManualFold
             , yieldInsideListMap
+            , resolvedIRYieldPropagates
+            , resolvedIRMultipleYieldsThroughDrive
             ]
         , describe "runtime memoization"
             [ runtimeMemoReusesCacheAcrossInvocations
@@ -1830,3 +1834,257 @@ codecRoundTripDict =
 
                 Nothing ->
                     Expect.fail "Failed to decode Dict tree"
+
+
+{-| Phase 1a coherence check: after `replaceModuleInEnv`, the `resolved`
+sidecar must describe the same (moduleName, name) entries for the replaced
+module as `env.shared.functions`. Before Phase 1a the sidecar was kept stale
+(`resolved = projectEnv.resolved`), which silently broke the resolved-IR path
+whenever mutation testing used `replaceModuleInEnv` in a hot loop.
+-}
+replaceRefreshesResolvedSidecar : Test
+replaceRefreshesResolvedSidecar =
+    test "replaceModuleInEnv rebuilds resolved sidecar for the replaced module" <|
+        \_ ->
+            let
+                originalA : String
+                originalA =
+                    "module A exposing (..)\n\noldHelper x = x + 1\n"
+
+                mutatedA : String
+                mutatedA =
+                    "module A exposing (..)\n\nnewHelper x = x + 2\n\nanotherHelper y = y * 2\n"
+            in
+            case ( Eval.Module.buildProjectEnv [ originalA ], parseModule mutatedA ) of
+                ( Ok baseEnv, Just replacement ) ->
+                    case Eval.Module.replaceModuleInEnv baseEnv replacement of
+                        Ok updatedEnv ->
+                            let
+                                resolved =
+                                    Eval.Module.projectEnvResolved updatedEnv
+
+                                resolvedNamesForModuleA =
+                                    resolved.globalIds
+                                        |> FastDict.keys
+                                        |> List.filterMap
+                                            (\( mod, name ) ->
+                                                if mod == [ "A" ] then
+                                                    Just name
+
+                                                else
+                                                    Nothing
+                                            )
+                                        |> Set.fromList
+
+                                envNamesForModuleA =
+                                    Eval.Module.getModuleFunctions [ "A" ] updatedEnv
+                                        |> FastDict.keys
+                                        |> Set.fromList
+                            in
+                            -- env has newHelper and anotherHelper; resolved should too, and should NOT have oldHelper
+                            envNamesForModuleA
+                                |> Expect.all
+                                    [ Expect.equal (Set.fromList [ "newHelper", "anotherHelper" ])
+                                    , \_ -> Expect.equal envNamesForModuleA resolvedNamesForModuleA
+                                    ]
+
+                        Err e ->
+                            Expect.fail ("replaceModuleInEnv failed: " ++ Debug.toString e)
+
+                _ ->
+                    Expect.fail "Setup failed: could not build base env or parse replacement"
+
+
+{-| Phase 1a coherence check: after `extendWithFiles`, the `resolved` sidecar
+must describe every module that ended up in `env.shared.functions`. Before
+Phase 1a the sidecar only contained modules present at original
+`buildProjectEnv` time, so newly-extended modules were invisible to the
+resolved-IR path.
+-}
+extendWithFilesRefreshesResolvedSidecar : Test
+extendWithFilesRefreshesResolvedSidecar =
+    test "extendWithFiles rebuilds resolved sidecar to include new modules" <|
+        \_ ->
+            let
+                baseModule : String
+                baseModule =
+                    "module Base exposing (..)\n\nbaseHelper x = x + 1\n"
+
+                extraModule : String
+                extraModule =
+                    "module Extra exposing (..)\n\nextraHelper y = y * 2\n"
+            in
+            case ( Eval.Module.buildProjectEnv [ baseModule ], Elm.Parser.parseToFile extraModule ) of
+                ( Ok baseEnv, Ok extraFile ) ->
+                    case Eval.Module.extendWithFiles baseEnv [ extraFile ] of
+                        Ok extendedEnv ->
+                            let
+                                resolved =
+                                    Eval.Module.projectEnvResolved extendedEnv
+
+                                resolvedModulesAndNames =
+                                    resolved.globalIds
+                                        |> FastDict.keys
+                                        |> List.filter
+                                            (\( mod, _ ) ->
+                                                mod == [ "Base" ] || mod == [ "Extra" ]
+                                            )
+                                        |> Set.fromList
+                            in
+                            -- Both modules should show up in the resolved sidecar after extend
+                            resolvedModulesAndNames
+                                |> Expect.equal
+                                    (Set.fromList
+                                        [ ( [ "Base" ], "baseHelper" )
+                                        , ( [ "Extra" ], "extraHelper" )
+                                        ]
+                                    )
+
+                        Err e ->
+                            Expect.fail ("extendWithFiles failed: " ++ Debug.toString e)
+
+                _ ->
+                    Expect.fail "Setup failed: could not build base env or parse extra module"
+
+
+{-| Phase 1b verification: `evalWithResolvedIRFromFilesAndIntercepts` must
+propagate `EvYield` from a user-land function call through the resolved-IR
+evaluator so that a BackendTask driver can resume it. Before this test the
+resolved-IR entry point was unproven for the intercept/yield flow even
+though the return type is raw `EvalResult Value`.
+-}
+resolvedIRYieldPropagates : Test
+resolvedIRYieldPropagates =
+    test "evalWithResolvedIRFromFilesAndIntercepts propagates EvYield from a yielding intercept" <|
+        \_ ->
+            let
+                helperSource : String
+                helperSource =
+                    "module Helpers exposing (fetch)\n\nfetch key = key\n"
+
+                mainSource : String
+                mainSource =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = Helpers.fetch \"key1\"\n"
+
+                yieldingIntercepts =
+                    FastDict.singleton "Helpers.fetch"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ String key ] ->
+                                        EvYield "cache-lookup"
+                                            (String key)
+                                            (\resumeValue -> EvOk resumeValue)
+
+                                    _ ->
+                                        EvOk (String "error")
+                            )
+                        )
+            in
+            case ( Eval.Module.buildProjectEnv [ helperSource ], Elm.Parser.parseToFile mainSource ) of
+                ( Ok projectEnv, Ok mainFile ) ->
+                    let
+                        evalResult =
+                            Eval.Module.evalWithResolvedIRFromFilesAndIntercepts
+                                projectEnv
+                                [ mainFile ]
+                                FastDict.empty
+                                yieldingIntercepts
+                                (Expression.FunctionOrValue [] "results")
+                    in
+                    case evalResult of
+                        EvYield "cache-lookup" (String "key1") resume ->
+                            case resume (String "resumed-value") of
+                                EvOk (String "resumed-value") ->
+                                    Expect.pass
+
+                                EvOk other ->
+                                    Expect.fail ("Expected resumed-value, got: " ++ Debug.toString other)
+
+                                EvErr e ->
+                                    Expect.fail ("Error after resume: " ++ Debug.toString e)
+
+                                _ ->
+                                    Expect.fail "Unexpected EvalResult variant after resume"
+
+                        EvOk _ ->
+                            Expect.fail "Yield didn't propagate through resolved-IR path (got EvOk)"
+
+                        EvErr e ->
+                            Expect.fail ("Eval error: " ++ Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                        _ ->
+                            Expect.fail ("Unexpected EvalResult variant: " ++ Debug.toString evalResult)
+
+                _ ->
+                    Expect.fail "Setup failed: could not build project env or parse main module"
+
+
+{-| Phase 1b verification: multiple sequential yields through the resolved-IR
+entry point, driven by `driveYieldsSync`. Matches the shape of
+`multipleYieldsFromSequentialCalls` but routes through
+`evalWithResolvedIRFromFilesAndIntercepts` so we can prove the resolved
+path supports the full BackendTask-style yield protocol, not just a single
+top-level yield.
+-}
+resolvedIRMultipleYieldsThroughDrive : Test
+resolvedIRMultipleYieldsThroughDrive =
+    test "evalWithResolvedIRFromFilesAndIntercepts supports multiple yields driven by the sync driver" <|
+        \_ ->
+            let
+                helperSource : String
+                helperSource =
+                    "module Helpers exposing (marker)\n\nmarker n = n\n"
+
+                mainSource : String
+                mainSource =
+                    "module Main exposing (..)\n\nimport Helpers\n\nresults = Helpers.marker 1 + Helpers.marker 2\n"
+
+                yieldingIntercepts =
+                    FastDict.singleton "Helpers.marker"
+                        (Intercept
+                            (\_ args _ _ ->
+                                case args of
+                                    [ Int n ] ->
+                                        EvYield "test-yield" (Int n) (\_ -> EvOk (Int (n * 10)))
+
+                                    _ ->
+                                        EvOk (Int 0)
+                            )
+                        )
+            in
+            case Eval.Module.buildProjectEnv [ helperSource, mainSource ] of
+                Ok projectEnv ->
+                    let
+                        rawResult =
+                            Eval.Module.evalWithResolvedIRFromFilesAndIntercepts
+                                projectEnv
+                                []
+                                FastDict.empty
+                                yieldingIntercepts
+                                (Expression.FunctionOrValue [] "results")
+
+                        driven =
+                            driveYieldsSync rawResult []
+                    in
+                    Expect.all
+                        [ \_ ->
+                            Expect.equal 2 (List.length driven.yields)
+                        , \_ ->
+                            case driven.finalResult of
+                                EvOk (Int 30) ->
+                                    Expect.pass
+
+                                EvOk other ->
+                                    Expect.fail ("Expected Int 30, got: " ++ Debug.toString other ++ ", yields: " ++ Debug.toString driven.yields)
+
+                                EvErr e ->
+                                    Expect.fail ("Error: " ++ Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                                _ ->
+                                    Expect.fail "Unexpected driven final result"
+                        ]
+                        ()
+
+                Err e ->
+                    Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)

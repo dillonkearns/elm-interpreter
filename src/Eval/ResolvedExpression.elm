@@ -350,13 +350,19 @@ evalRStep staticEnv locals expr =
             -- evaluation stays in the same `runRecursion` as the outer
             -- call. Walking the arg list uses direct recursion in Elm
             -- but it's bounded by arg count (typically 1–6), not by
-            -- recursion depth — so no stack issue from that.
+            -- recursion depth — so no stack issue from that. The
+            -- `directK` fallback is used when a yield/memo signal
+            -- escapes the Rec monad; see `threadYieldThroughArgs`.
             evalArgsStep
+                staticEnv
                 locals
                 argExprs
                 []
                 (\argValues ->
                     dispatchGlobalApplyStep staticEnv locals id argValues
+                )
+                (\argValues ->
+                    dispatchGlobalApply (envWithLocals staticEnv locals) id argValues
                 )
 
         RApply headExpr argExprs ->
@@ -369,11 +375,15 @@ evalRStep staticEnv locals expr =
                     case headResult of
                         EvOk headValue ->
                             evalArgsStep
+                                staticEnv
                                 locals
                                 argExprs
                                 []
                                 (\argValues ->
                                     applyClosureStep staticEnv locals headValue argValues
+                                )
+                                (\argValues ->
+                                    applyClosure (envWithLocals staticEnv locals) headValue argValues
                                 )
 
                         _ ->
@@ -715,31 +725,102 @@ outer `evalRStep` call — critical for stack safety, since otherwise
 each arg evaluation would start a fresh `runRecursion` and accumulate
 JS frames across sibling calls.
 
-The `k` continuation receives the fully-evaluated arg list and returns
-the next `Rec` step. Short-circuits on non-`EvOk` intermediate results.
+The `recK` continuation is the fast happy-path continuation that stays
+in the trampoline. The `directK` continuation is the yield-fallback
+continuation that runs at `EvalResult`-level when a yield or memo
+signal forces us to leave the `Rec` monad; typically it wraps the
+non-Rec version of the same dispatcher (e.g. `dispatchGlobalApply`
+instead of `dispatchGlobalApplyStep`).
+
+When a yield/memo result comes back from an argument evaluation, we
+thread it through `andThenValue` so the `resume` closure, when
+eventually called, re-enters argument evaluation at `evalArgsDirect`
+— which walks the remaining args in non-Rec EvalResult mode and then
+invokes `directK`. Without this wrapping a second argument that also
+wants to yield would be silently skipped because the intercept's
+inner `resume` only produces its own synthesized value; it doesn't
+know it needs to re-enter the outer arg loop.
 
 -}
 evalArgsStep :
-    List Value
+    REnv
+    -> List Value
     -> List RExpr
     -> List Value
     -> (List Value -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value))
+    -> (List Value -> EvalResult Value)
     -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
-evalArgsStep locals remaining accRev k =
+evalArgsStep staticEnv locals remaining accRev recK directK =
     case remaining of
         [] ->
-            k (List.reverse accRev)
+            recK (List.reverse accRev)
 
         head :: rest ->
             rRecThen ( locals, head )
                 (\headResult ->
                     case headResult of
                         EvOk value ->
-                            evalArgsStep locals rest (value :: accRev) k
+                            evalArgsStep staticEnv locals rest (value :: accRev) recK directK
+
+                        EvYield _ _ _ ->
+                            rBase (threadYieldThroughArgs staticEnv locals rest accRev directK headResult)
+
+                        EvMemoLookup _ _ ->
+                            rBase (threadYieldThroughArgs staticEnv locals rest accRev directK headResult)
+
+                        EvMemoStore _ _ ->
+                            rBase (threadYieldThroughArgs staticEnv locals rest accRev directK headResult)
 
                         _ ->
                             rBase headResult
                 )
+
+
+{-| Wrap a yielded argument result so that when the framework resumes,
+the remaining arguments are evaluated and the direct continuation is
+invoked. Uses `andThenValue` to thread yield/memo through the
+continuation chain at `EvalResult`-level (non-Rec).
+-}
+threadYieldThroughArgs :
+    REnv
+    -> List Value
+    -> List RExpr
+    -> List Value
+    -> (List Value -> EvalResult Value)
+    -> EvalResult Value
+    -> EvalResult Value
+threadYieldThroughArgs staticEnv locals remaining accRev directK yieldedResult =
+    andThenValue
+        (\value ->
+            evalArgsDirect staticEnv locals remaining (value :: accRev) directK
+        )
+        yieldedResult
+
+
+{-| Non-Rec EvalResult-level argument evaluator used once a yield has
+forced the evaluator out of the `Rec` monad. Walks the remaining
+arguments via `evalR` (which maintains its own internal trampoline)
+and threads further yields via `andThenValue`, then invokes `directK`
+with the fully-evaluated argument list.
+-}
+evalArgsDirect :
+    REnv
+    -> List Value
+    -> List RExpr
+    -> List Value
+    -> (List Value -> EvalResult Value)
+    -> EvalResult Value
+evalArgsDirect staticEnv locals remaining accRev directK =
+    case remaining of
+        [] ->
+            directK (List.reverse accRev)
+
+        head :: rest ->
+            andThenValue
+                (\value ->
+                    evalArgsDirect staticEnv locals rest (value :: accRev) directK
+                )
+                (evalR (envWithLocals staticEnv locals) head)
 
 
 {-| Rec-aware dispatch for `RApply (RGlobal id) args`. Mirrors
