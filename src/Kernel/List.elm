@@ -86,11 +86,11 @@ mapResumeAfterFx f rest acc cfg env fxResult =
             EvMemoStore payload
                 (mapResumeAfterFx f rest acc cfg env next)
 
-        EvOkCoverage mapped _ ->
-            mapHelp f rest (mapped :: acc) cfg env
+        EvOkCoverage mapped coverageSet ->
+            EvalResult.mergeCoverageInto coverageSet (mapHelp f rest (mapped :: acc) cfg env)
 
-        EvErrCoverage e _ ->
-            EvErr e
+        EvErrCoverage e coverageSet ->
+            EvErrCoverage e coverageSet
 
 
 {-| Like `attachTrace` but for `EvalResult (List Value)` — used inside
