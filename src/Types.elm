@@ -91,6 +91,11 @@ type CallTree
         , children : Rope CallTree
         , env : Env
         }
+      -- Consumed by the outer elm-build repo's `Coverage.elm` to record
+      -- covered ranges from a trace run. The interpreter itself never
+      -- constructs these — they come from downstream pipelines.
+    | CoverageRange Range
+    | CoverageSet (Set.Set Int)
 
 
 type Error

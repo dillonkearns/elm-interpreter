@@ -367,6 +367,12 @@ extractFromNode tree =
             in
             range :: extractRangesFromCallTrees node.children
 
+        CoverageRange range ->
+            [ range ]
+
+        CoverageSet packedSet ->
+            Set.toList packedSet |> List.map Types.unpackRange
+
 
 rangeToString : Range -> String
 rangeToString r =
