@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 6, "filePath": "src/Eval/Module.elm" },
+    { "count": 5, "filePath": "src/Kernel/Bytes.elm" },
+    { "count": 2, "filePath": "src/Kernel.elm" },
+    { "count": 2, "filePath": "src/ValueCodec.elm" },
+    { "count": 1, "filePath": "src/Eval/ResolvedExpression.elm" },
+    { "count": 1, "filePath": "src/Kernel/List.elm" },
+    { "count": 1, "filePath": "src/MemoSpec.elm" }
+  ]
+}

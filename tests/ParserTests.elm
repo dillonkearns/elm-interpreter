@@ -637,8 +637,3 @@ parserTest name source expected =
 ok : Value -> Value
 ok value =
     Custom { moduleName = [ "Result" ], name = "Ok" } [ value ]
-
-
-err : Value -> Value
-err value =
-    Custom { moduleName = [ "Result" ], name = "Err" } [ value ]

@@ -142,6 +142,8 @@ functions evalFunction =
         , ( "union", twoWithError anything anything to anything Kernel.Dict.union Core.Dict.union )
         , ( "fromList", oneWithError anything to anything Kernel.Dict.fromList Core.Dict.fromList )
         , ( "toList", oneWithError anything to anything Kernel.Dict.toList Core.Dict.toList )
+        , ( "keys", oneWithError anything to anything Kernel.Dict.keys Core.Dict.keys )
+        , ( "values", oneWithError anything to anything Kernel.Dict.values Core.Dict.values )
         ]
       )
 

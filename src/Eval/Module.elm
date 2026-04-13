@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndMemo, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -9,33 +9,33 @@ import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
 import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation, LetDeclaration(..))
+import Elm.Syntax.File exposing (File)
 import Elm.Syntax.Import
+import Elm.Syntax.Module exposing (Module(..))
+import Elm.Syntax.ModuleName exposing (ModuleName)
+import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..))
 import Elm.Syntax.Range exposing (Range)
 import Elm.Syntax.Type
 import Elm.Syntax.TypeAlias exposing (TypeAlias)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
-import Elm.Syntax.File exposing (File)
-import Elm.Syntax.Module exposing (Module(..))
-import Elm.Syntax.ModuleName exposing (ModuleName)
-import Elm.Syntax.Node as Node exposing (Node(..))
 import Environment
 import Eval.Expression
 import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedExpression as RE
 import Eval.ResolvedIR as IR
 import Eval.Resolver as Resolver
+import EvalResult
 import FastDict as Dict
 import List.Extra
+import ListFusion
 import MemoRuntime
 import MemoSpec
-import ListFusion
 import NormalizationFlags
 import Result.MyExtra
 import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
-import EvalResult
 import Types exposing (CallTree, Config, Env, Error(..), EvalResult(..), ImportedNames, Value)
 import Value exposing (unsupported)
 
@@ -100,18 +100,6 @@ type alias ResolveErrorEntry =
     }
 
 
-emptyResolvedProject : ResolvedProject
-emptyResolvedProject =
-    { globalIds = Dict.empty
-    , bodies = Dict.empty
-    , globalIdToName = Dict.empty
-    , nativeDispatchers = Dict.empty
-    , higherOrderDispatchers = Dict.empty
-    , kernelDispatchers = Dict.empty
-    , errors = []
-    }
-
-
 {-| Accessor for the resolver output attached to a ProjectEnv. Mostly for
 tests and diagnostics — Phase 3's evaluator reaches into this directly
 through its own code path inside this module.
@@ -119,32 +107,6 @@ through its own code path inside this module.
 projectEnvResolved : ProjectEnv -> ResolvedProject
 projectEnvResolved (ProjectEnv projectEnv) =
     projectEnv.resolved
-
-
-{-| Detect the "direct kernel wrapper" pattern in a Core-module
-FunctionImplementation: the body is a bare `FunctionOrValue
-["Elm", "Kernel", ModuleName, ...] name`, with no arguments on the
-wrapper itself. Returns `Just (kernelModuleName, kernelName)` when
-the pattern matches.
-
-This catches most of `Core.Basics.*`, `Core.String.*`, `Core.Char.*`,
-etc. where the wrapper is just a pass-through to the kernel. Core
-functions with non-kernel bodies (like `List.map` implemented as a
-fold in Elm) don't match and are handled via regular delegation.
-
--}
-extractKernelReference : Elm.Syntax.Expression.FunctionImplementation -> Maybe ( ModuleName, String )
-extractKernelReference impl =
-    if List.isEmpty impl.arguments then
-        case Node.value impl.expression of
-            FunctionOrValue (("Elm" :: "Kernel" :: _) as kernelModuleName) kernelName ->
-                Just ( kernelModuleName, kernelName )
-
-            _ ->
-                Nothing
-
-    else
-        Nothing
 
 
 {-| Evaluate a top-level expression via the new resolved-IR evaluator.
@@ -755,7 +717,8 @@ buildCachedModuleSummariesFromParsed parsedModules =
 parseProjectSources :
     List String
     ->
-        Result Error
+        Result
+            Error
             (List
                 { file : File
                 , moduleName : ModuleName
@@ -892,6 +855,7 @@ entirely (cache hit → no normalization cost, just decoding).
 Idempotent: running this twice produces the same result (normalizing an
 already-normalized `Array.fromList [...]` body yields the same expression).
 Safe to call regardless of cache state.
+
 -}
 normalizeSummaries : List CachedModuleSummary -> List CachedModuleSummary
 normalizeSummaries summaries =
@@ -972,14 +936,16 @@ already works well since summaries come out in a sensible order.)
 Functions whose values aren't losslessly representable as expressions (Json,
 Regex, Bytes, PartiallyApplied with captured env) are skipped — they stay as
 AST. Same for functions that fail to eval (Debug.todo, circular refs, etc).
+
 -}
 normalizeTopLevelConstants :
     List CachedModuleSummary
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
     -> Dict.Dict String ImportedNames
-    -> ( Dict.Dict String (Dict.Dict String FunctionImplementation)
-       , Dict.Dict String (Dict.Dict String Value)
-       )
+    ->
+        ( Dict.Dict String (Dict.Dict String FunctionImplementation)
+        , Dict.Dict String (Dict.Dict String Value)
+        )
 normalizeTopLevelConstants summaries initialFunctions sharedImports =
     List.foldl
         (\summary ( currentFunctions, currentPrecomputed ) ->
@@ -1108,7 +1074,15 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
                     )
 
             else
-                Nothing
+                -- Eval succeeded but the value can't round-trip to an
+                -- Expression (e.g., `round (1 / 0) : Int` evaluates to
+                -- `Int Infinity`, which `Expression.Integer Infinity`
+                -- can't Wire3-encode). Return the value anyway so the
+                -- in-memory `precomputedValues` cache still hits at
+                -- runtime — the user-norm on-disk cache filters these
+                -- out before serializing. Keeps the original expression
+                -- so the function body still round-trips.
+                Just ( funcImpl, value )
 
         Err _ ->
             Nothing
@@ -1125,6 +1099,7 @@ lets the second attempt hit the now-populated `precomputedValues`.
 Returns the fully-normalized function dict, the delta (only the
 functions whose bodies changed), and the per-name precomputed `Value`
 dict. All three are keyed on the simple function name.
+
 -}
 runModuleNormalizationToFixpoint :
     ModuleName
@@ -1330,11 +1305,22 @@ isLosslessValue value =
         Types.String _ ->
             True
 
-        Types.Int _ ->
-            True
+        Types.Int i ->
+            -- `round (1 / 0)` and friends produce an `Int Infinity` at the
+            -- JS level; the AstWireCodec's Wire3 integer encoder can't
+            -- round-trip non-finite values, so skip normalization and keep
+            -- the original expression (e.g., `round (1 / 0)` stays as-is).
+            let
+                asFloat : Float
+                asFloat =
+                    toFloat i
+            in
+            not (isInfinite asFloat) && not (isNaN asFloat)
 
-        Types.Float _ ->
-            True
+        Types.Float f ->
+            -- Same concern: `Value.toExpression (Float Infinity)` encodes as
+            -- `Floatable Infinity`, which Wire3 can't serialize cleanly.
+            not (isInfinite f) && not (isNaN f)
 
         Types.Char _ ->
             True
@@ -1384,30 +1370,6 @@ isLosslessValue value =
             False
 
 
-{-| Fold constant sub-expressions in a function body. Walks the AST
-bottom-up: for each sub-expression where all leaves are literals (no
-free variables or function calls), evaluates it and replaces with
-`Value.toExpression`. This extends normalization from "whole zero-arg
-functions" to "constant sub-expressions within any function body."
-
-Only folds expressions that:
-- Contain only literals, constructors, and pure operators
-- Evaluate successfully within a small step budget
-- Produce a lossless Value (survives toExpression round-trip)
-
-The folded AST uses standard Expression nodes, so it caches perfectly
-through AstWireCodec and the user-norm blob pipeline.
--}
-foldConstantSubExpressions :
-    Env
-    -> Config
-    -> Node Expression
-    -> Node Expression
-foldConstantSubExpressions env cfg node =
-    -- Default: none. The AST walk adds ~0.1s normalization cost without
-    foldConstantSubExpressionsHelp 3 NormalizationFlags.none env cfg node
-
-
 foldWithFlags :
     NormalizationFlags.NormalizationFlags
     -> Env
@@ -1430,239 +1392,239 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
         node
 
     else
-    let
-        tryFold : Node Expression -> Node Expression
-        tryFold foldedNode =
-            case Eval.Expression.evalExpression foldedNode cfg env |> EvalResult.toResult of
-                Ok value ->
-                    if isLosslessValue value then
-                        Value.toExpression value
+        let
+            tryFold : Node Expression -> Node Expression
+            tryFold foldedNode =
+                case Eval.Expression.evalExpression foldedNode cfg env |> EvalResult.toResult of
+                    Ok value ->
+                        if isLosslessValue value then
+                            Value.toExpression value
 
-                    else
+                        else
+                            foldedNode
+
+                    Err _ ->
                         foldedNode
 
-                Err _ ->
+            isConstantLeaf : Expression -> Bool
+            isConstantLeaf e =
+                case e of
+                    Integer _ ->
+                        True
+
+                    Hex _ ->
+                        True
+
+                    Floatable _ ->
+                        True
+
+                    Literal _ ->
+                        True
+
+                    CharLiteral _ ->
+                        True
+
+                    UnitExpr ->
+                        True
+
+                    FunctionOrValue [] "True" ->
+                        True
+
+                    FunctionOrValue [] "False" ->
+                        True
+
+                    ListExpr items ->
+                        List.all (\(Node _ ie) -> isConstantLeaf ie) items
+
+                    TupledExpression items ->
+                        List.all (\(Node _ ie) -> isConstantLeaf ie) items
+
+                    Application ((Node _ (FunctionOrValue _ name)) :: args) ->
+                        Eval.Expression.isUpperName name
+                            && List.all (\(Node _ ie) -> isConstantLeaf ie) args
+
+                    RecordExpr fields ->
+                        List.all (\(Node _ ( _, Node _ ie )) -> isConstantLeaf ie) fields
+
+                    _ ->
+                        False
+        in
+        case expr of
+            ListExpr items ->
+                Node range (ListExpr (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
+
+            TupledExpression items ->
+                Node range (TupledExpression (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
+
+            RecordExpr fields ->
+                Node range
+                    (RecordExpr
+                        (List.map
+                            (\(Node fRange ( name, value )) ->
+                                Node fRange ( name, foldConstantSubExpressionsHelp depth flags env cfg value )
+                            )
+                            fields
+                        )
+                    )
+
+            Application ((Node _ (FunctionOrValue moduleName funcName)) :: args) ->
+                let
+                    foldedArgs =
+                        List.map (foldConstantSubExpressionsHelp depth flags env cfg) args
+
+                    foldedNode =
+                        Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs))
+                in
+                if
+                    flags.foldConstantApplications
+                        && List.all (\(Node _ e) -> isConstantLeaf e) foldedArgs
+                        && not (List.isEmpty foldedArgs)
+                then
+                    tryFold foldedNode
+
+                else if flags.inlineFunctions then
+                    case tryInlineFunction env moduleName funcName foldedArgs of
+                        Just inlinedExpr ->
+                            foldConstantSubExpressionsHelp (depth - 1) flags env cfg inlinedExpr
+
+                        Nothing ->
+                            foldedNode
+
+                else
                     foldedNode
 
-        isConstantLeaf : Expression -> Bool
-        isConstantLeaf e =
-            case e of
-                Integer _ ->
-                    True
-
-                Hex _ ->
-                    True
-
-                Floatable _ ->
-                    True
-
-                Literal _ ->
-                    True
-
-                CharLiteral _ ->
-                    True
-
-                UnitExpr ->
-                    True
-
-                FunctionOrValue [] "True" ->
-                    True
-
-                FunctionOrValue [] "False" ->
-                    True
-
-                ListExpr items ->
-                    List.all (\(Node _ ie) -> isConstantLeaf ie) items
-
-                TupledExpression items ->
-                    List.all (\(Node _ ie) -> isConstantLeaf ie) items
-
-                Application ((Node _ (FunctionOrValue _ name)) :: args) ->
-                    Eval.Expression.isUpperName name
-                        && List.all (\(Node _ ie) -> isConstantLeaf ie) args
-
-                RecordExpr fields ->
-                    List.all (\(Node _ ( _, Node _ ie )) -> isConstantLeaf ie) fields
-
-                _ ->
-                    False
-    in
-    case expr of
-        ListExpr items ->
-            Node range (ListExpr (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
-
-        TupledExpression items ->
-            Node range (TupledExpression (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
-
-        RecordExpr fields ->
-            Node range
-                (RecordExpr
-                    (List.map
-                        (\(Node fRange ( name, value )) ->
-                            Node fRange ( name, foldConstantSubExpressionsHelp depth flags env cfg value )
-                        )
-                        fields
+            IfBlock cond thenBranch elseBranch ->
+                Node range
+                    (IfBlock
+                        (foldConstantSubExpressionsHelp depth flags env cfg cond)
+                        (foldConstantSubExpressionsHelp depth flags env cfg thenBranch)
+                        (foldConstantSubExpressionsHelp depth flags env cfg elseBranch)
                     )
-                )
 
-        Application ((Node _ (FunctionOrValue moduleName funcName)) :: args) ->
-            let
-                foldedArgs =
-                    List.map (foldConstantSubExpressionsHelp depth flags env cfg) args
+            CaseExpression { expression, cases } ->
+                Node range
+                    (CaseExpression
+                        { expression = foldConstantSubExpressionsHelp depth flags env cfg expression
+                        , cases =
+                            List.map
+                                (\( pat, body ) -> ( pat, foldConstantSubExpressionsHelp depth flags env cfg body ))
+                                cases
+                        }
+                    )
 
-                foldedNode =
-                    Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs))
-            in
-            if
-                flags.foldConstantApplications
-                    && List.all (\(Node _ e) -> isConstantLeaf e) foldedArgs
-                    && not (List.isEmpty foldedArgs)
-            then
-                tryFold foldedNode
+            LetExpression { declarations, expression } ->
+                Node range
+                    (LetExpression
+                        { declarations =
+                            List.map
+                                (\(Node dRange decl) ->
+                                    Node dRange
+                                        (case decl of
+                                            LetFunction f ->
+                                                LetFunction
+                                                    { f
+                                                        | declaration =
+                                                            let
+                                                                (Node implRange impl) =
+                                                                    f.declaration
+                                                            in
+                                                            Node implRange
+                                                                { impl
+                                                                    | expression = foldConstantSubExpressionsHelp depth flags env cfg impl.expression
+                                                                }
+                                                    }
 
-            else if flags.inlineFunctions then
-                case tryInlineFunction env moduleName funcName foldedArgs of
-                    Just inlinedExpr ->
-                        foldConstantSubExpressionsHelp (depth - 1) flags env cfg inlinedExpr
+                                            LetDestructuring pat val ->
+                                                LetDestructuring pat (foldConstantSubExpressionsHelp depth flags env cfg val)
+                                        )
+                                )
+                                declarations
+                        , expression = foldConstantSubExpressionsHelp depth flags env cfg expression
+                        }
+                    )
 
-                    Nothing ->
-                        foldedNode
-
-            else
-                foldedNode
-
-        IfBlock cond thenBranch elseBranch ->
-            Node range
-                (IfBlock
-                    (foldConstantSubExpressionsHelp depth flags env cfg cond)
-                    (foldConstantSubExpressionsHelp depth flags env cfg thenBranch)
-                    (foldConstantSubExpressionsHelp depth flags env cfg elseBranch)
-                )
-
-        CaseExpression { expression, cases } ->
-            Node range
-                (CaseExpression
-                    { expression = foldConstantSubExpressionsHelp depth flags env cfg expression
-                    , cases =
-                        List.map
-                            (\( pat, body ) -> ( pat, foldConstantSubExpressionsHelp depth flags env cfg body ))
-                            cases
-                    }
-                )
-
-        LetExpression { declarations, expression } ->
-            Node range
-                (LetExpression
-                    { declarations =
-                        List.map
-                            (\(Node dRange decl) ->
-                                Node dRange
-                                    (case decl of
-                                        LetFunction f ->
-                                            LetFunction
-                                                { f
-                                                    | declaration =
-                                                        let
-                                                            (Node implRange impl) =
-                                                                f.declaration
-                                                        in
-                                                        Node implRange
-                                                            { impl
-                                                                | expression = foldConstantSubExpressionsHelp depth flags env cfg impl.expression
-                                                            }
-                                                }
-
-                                        LetDestructuring pat val ->
-                                            LetDestructuring pat (foldConstantSubExpressionsHelp depth flags env cfg val)
-                                    )
-                            )
-                            declarations
-                    , expression = foldConstantSubExpressionsHelp depth flags env cfg expression
-                    }
-                )
-
-        OperatorApplication op dir left right ->
-            let
-                foldedLeft =
-                    foldConstantSubExpressionsHelp depth flags env cfg left
-
-                foldedRight =
-                    foldConstantSubExpressionsHelp depth flags env cfg right
-            in
-            if flags.foldConstantApplications && isConstantLeaf ((\(Node _ e) -> e) foldedLeft) && isConstantLeaf ((\(Node _ e) -> e) foldedRight) then
-                tryFold (Node range (OperatorApplication op dir foldedLeft foldedRight))
-
-            else
-                Node range (OperatorApplication op dir foldedLeft foldedRight)
-
-        Negation inner ->
-            let
-                foldedInner =
-                    foldConstantSubExpressionsHelp depth flags env cfg inner
-            in
-            if isConstantLeaf ((\(Node _ e) -> e) foldedInner) then
-                tryFold (Node range (Negation foldedInner))
-
-            else
-                Node range (Negation foldedInner)
-
-        ParenthesizedExpression inner ->
-            Node range (ParenthesizedExpression (foldConstantSubExpressionsHelp depth flags env cfg inner))
-
-        LambdaExpression lambda ->
-            Node range
-                (LambdaExpression
-                    { lambda | expression = foldConstantSubExpressionsHelp depth flags env cfg lambda.expression }
-                )
-
-        FunctionOrValue [] name ->
-            if not flags.inlinePrecomputedRefs then
-                node
-
-            else
-                case Dict.get env.currentModuleKey env.shared.precomputedValues of
-                    Just modulePrecomputed ->
-                        case Dict.get name modulePrecomputed of
-                            Just value ->
-                                if isLosslessValue value then
-                                    Value.toExpression value
-
-                                else
-                                    node
-
-                            Nothing ->
-                                node
-
-                    Nothing ->
-                        node
-
-        FunctionOrValue ((_ :: _) as moduleName) name ->
-            if not flags.inlinePrecomputedRefs then
-                node
-
-            else
+            OperatorApplication op dir left right ->
                 let
-                    qualifiedKey =
-                        Environment.moduleKey moduleName
-                in
-                case Dict.get qualifiedKey env.shared.precomputedValues of
-                    Just modulePrecomputed ->
-                        case Dict.get name modulePrecomputed of
-                            Just value ->
-                                if isLosslessValue value then
-                                    Value.toExpression value
+                    foldedLeft =
+                        foldConstantSubExpressionsHelp depth flags env cfg left
 
-                                else
+                    foldedRight =
+                        foldConstantSubExpressionsHelp depth flags env cfg right
+                in
+                if flags.foldConstantApplications && isConstantLeaf ((\(Node _ e) -> e) foldedLeft) && isConstantLeaf ((\(Node _ e) -> e) foldedRight) then
+                    tryFold (Node range (OperatorApplication op dir foldedLeft foldedRight))
+
+                else
+                    Node range (OperatorApplication op dir foldedLeft foldedRight)
+
+            Negation inner ->
+                let
+                    foldedInner =
+                        foldConstantSubExpressionsHelp depth flags env cfg inner
+                in
+                if isConstantLeaf ((\(Node _ e) -> e) foldedInner) then
+                    tryFold (Node range (Negation foldedInner))
+
+                else
+                    Node range (Negation foldedInner)
+
+            ParenthesizedExpression inner ->
+                Node range (ParenthesizedExpression (foldConstantSubExpressionsHelp depth flags env cfg inner))
+
+            LambdaExpression lambda ->
+                Node range
+                    (LambdaExpression
+                        { lambda | expression = foldConstantSubExpressionsHelp depth flags env cfg lambda.expression }
+                    )
+
+            FunctionOrValue [] name ->
+                if not flags.inlinePrecomputedRefs then
+                    node
+
+                else
+                    case Dict.get env.currentModuleKey env.shared.precomputedValues of
+                        Just modulePrecomputed ->
+                            case Dict.get name modulePrecomputed of
+                                Just value ->
+                                    if isLosslessValue value then
+                                        Value.toExpression value
+
+                                    else
+                                        node
+
+                                Nothing ->
                                     node
 
-                            Nothing ->
-                                node
+                        Nothing ->
+                            node
 
-                    Nothing ->
-                        node
+            FunctionOrValue ((_ :: _) as moduleName) name ->
+                if not flags.inlinePrecomputedRefs then
+                    node
 
-        _ ->
-            node
+                else
+                    let
+                        qualifiedKey =
+                            Environment.moduleKey moduleName
+                    in
+                    case Dict.get qualifiedKey env.shared.precomputedValues of
+                        Just modulePrecomputed ->
+                            case Dict.get name modulePrecomputed of
+                                Just value ->
+                                    if isLosslessValue value then
+                                        Value.toExpression value
+
+                                    else
+                                        node
+
+                                Nothing ->
+                                    node
+
+                        Nothing ->
+                            node
+
+            _ ->
+                node
 
 
 {-| Try to inline a small non-recursive function at a call site.
@@ -1696,9 +1658,11 @@ tryInlineFunction env moduleName funcName args =
     case maybeFuncImpl of
         Just funcImpl ->
             if
-                List.length funcImpl.arguments == List.length args
+                List.length funcImpl.arguments
+                    == List.length args
                     && not (containsSelfCallInExpr funcName funcImpl.expression)
-                    && expressionSize funcImpl.expression < 30
+                    && expressionSize funcImpl.expression
+                    < 30
                     && not (referencesInternalHelper funcImpl.expression)
             then
                 case extractVarPatternNames funcImpl.arguments of
@@ -2019,7 +1983,8 @@ qualifyUnqualifiedRefs sourceModule moduleFunctions locals ((Node range expr) as
                         List.map
                             (\( pat, body ) ->
                                 ( pat
-                                , qualifyUnqualifiedRefs sourceModule moduleFunctions
+                                , qualifyUnqualifiedRefs sourceModule
+                                    moduleFunctions
                                     (Set.union locals (collectPatternNames pat))
                                     body
                                 )
@@ -2109,7 +2074,7 @@ qualifyUnqualifiedRefs sourceModule moduleFunctions locals ((Node range expr) as
 {-| Check if an expression references functions that resolve via internal
 module helpers (like Basics.lt, Basics.gt) which are defined in the module
 but may not resolve correctly when qualified cross-module. These are
-lowercase functions that call Elm.Kernel.* — safe to skip inlining for.
+lowercase functions that call Elm.Kernel.\* — safe to skip inlining for.
 -}
 referencesInternalHelper : Node Expression -> Bool
 referencesInternalHelper (Node _ expr) =
@@ -2163,46 +2128,6 @@ referencesInternalHelper (Node _ expr) =
 
         _ ->
             False
-
-
-hasNoLocalBindings : Node Expression -> Bool
-hasNoLocalBindings (Node _ expr) =
-    case expr of
-        CaseExpression _ ->
-            False
-
-        LetExpression _ ->
-            False
-
-        LambdaExpression _ ->
-            False
-
-        Application items ->
-            List.all hasNoLocalBindings items
-
-        OperatorApplication _ _ l r ->
-            hasNoLocalBindings l && hasNoLocalBindings r
-
-        IfBlock c t e ->
-            hasNoLocalBindings c && hasNoLocalBindings t && hasNoLocalBindings e
-
-        ListExpr items ->
-            List.all hasNoLocalBindings items
-
-        TupledExpression items ->
-            List.all hasNoLocalBindings items
-
-        ParenthesizedExpression inner ->
-            hasNoLocalBindings inner
-
-        Negation inner ->
-            hasNoLocalBindings inner
-
-        RecordExpr fields ->
-            List.all (\(Node _ ( _, val )) -> hasNoLocalBindings val) fields
-
-        _ ->
-            True
 
 
 collectPatternNames : Node Pattern -> Set.Set String
@@ -2318,7 +2243,8 @@ evalWithEnvAndLimit : Maybe Int -> ProjectEnv -> List String -> Expression -> Re
 evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expression =
     let
         parseResult :
-            Result Error
+            Result
+                Error
                 (List
                     { file : File
                     , moduleName : ModuleName
@@ -2536,7 +2462,8 @@ evalWithEnvFromFilesAndMemo :
     -> Bool
     -> Expression
     ->
-        Result Error
+        Result
+            Error
             { value : Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -2743,7 +2670,8 @@ evalWithEnvFromFilesAndValuesAndMemo :
     -> Bool
     -> Expression
     ->
-        Result Error
+        Result
+            Error
             { value : Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -2857,7 +2785,8 @@ evalWithMemoizedFunctions :
     -> Bool
     -> Expression
     ->
-        Result Error
+        Result
+            Error
             { value : Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -2889,7 +2818,8 @@ evalWithValuesAndMemoizedFunctions :
     -> Bool
     -> Expression
     ->
-        Result Error
+        Result
+            Error
             { value : Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -2917,7 +2847,8 @@ driveInternalMemo :
     -> MemoRuntime.MemoStats
     -> Types.EvalResult Value
     ->
-        Result Error
+        Result
+            Error
             { value : Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -3690,6 +3621,7 @@ intercepts Dict, the intercept function is called instead of the AST.
 
 This is the general-purpose hook for framework callbacks (BackendTask, Test)
 and for memoization/caching (elm-review cache markers).
+
 -}
 evalWithIntercepts :
     ProjectEnv
@@ -3804,6 +3736,7 @@ evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expressi
 
 The framework driver should handle EvYield in a loop (yield → handle effect →
 resume with result → check for more yields).
+
 -}
 evalWithInterceptsRaw :
     ProjectEnv
@@ -3991,6 +3924,7 @@ The implementation does `extendWithFiles` first to get a complete env, then
 post-hoc rewrites the user modules' function bodies in place by walking the
 freshly-added modules and running `tryNormalizeConstant` on each zero-arg
 function. Package bodies are left untouched.
+
 -}
 extendWithFilesNormalized : ProjectEnv -> List File -> Result Error ProjectEnv
 extendWithFilesNormalized projectEnv additionalFiles =
@@ -4014,6 +3948,7 @@ reference to a blocklisted module inside the expression.
 
 We don't try to be clever here — the goal is to avoid obviously-wasted eval
 work on test-heavy files, not to perfectly classify every possible expression.
+
 -}
 isNormalizationCandidate : Node Expression -> Bool
 isNormalizationCandidate (Node.Node _ expr) =
@@ -4126,6 +4061,7 @@ them — the eval would only succeed long enough to produce a lossy value that
 The list is conservative: over-blocking a pure constant wastes optimization
 potential but is always safe; under-blocking wastes eval cycles during
 normalization.
+
 -}
 moduleIsBlocklisted : ModuleName -> Bool
 moduleIsBlocklisted moduleName =
@@ -4288,6 +4224,7 @@ blobs can stay small.
 Uses the existing `ProjectEnv` as both the evaluation context (so package
 functions and previously-normalized sibling modules are visible) and the
 place to install the rewritten bodies.
+
 -}
 normalizeOneModuleInEnv :
     ModuleName
@@ -4757,7 +4694,7 @@ buildInitialEnv file =
                 , precomputedValues = Dict.empty
                 }
             , currentModuleFunctions = Dict.empty
-                        , letFunctions = Dict.empty
+            , letFunctions = Dict.empty
             , values = Dict.empty
             , imports = imports
             , callDepth = 0
@@ -4976,7 +4913,8 @@ evalProject : List String -> Expression -> Result Error Value
 evalProject sources expression =
     let
         parseResult :
-            Result Error
+            Result
+                Error
                 (List
                     { file : File
                     , moduleName : ModuleName
@@ -5037,7 +4975,7 @@ evalProject sources expression =
                                 , callStack = []
                                 , shared = { functions = coreFunctions, moduleImports = Dict.empty, resolveBridge = Types.noResolveBridge, precomputedValues = Dict.empty }
                                 , currentModuleFunctions = Dict.empty
-                        , letFunctions = Dict.empty
+                                , letFunctions = Dict.empty
                                 , values = Dict.empty
                                 , imports = emptyImports
                                 , callDepth = 0
@@ -5203,7 +5141,8 @@ moduleFunctionImplementations moduleName file =
 {-| If a type alias has a record type annotation, register its name as a
 function that constructs a Record value from positional arguments.
 
-    type alias Point = { x : Int, y : Int }
+    type alias Point =
+        { x : Int, y : Int }
 
 registers `Point` as a 2-argument function whose body is
 `RecordExpr [("x", $arg0), ("y", $arg1)]`.

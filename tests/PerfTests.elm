@@ -24,6 +24,259 @@ suite =
         , constantFoldingTests
         , dictInliningTests
         , listFusionTests
+        , normalizationLosslessnessTests
+        , spineCollectionTests
+        , overApplicationTests
+        ]
+
+
+{-| Regression coverage for over-application: a call site supplies
+more arguments than the outer function's arity, and each surplus arg
+has to be applied to the value returned by the preceding call. The
+evaluator's general path handles this by re-entering the application
+machinery after the inner call completes. These tests exist to catch
+any breakage of that re-entry when the over-application path is
+refactored (ZAM task C — replacing AST reconstruction with a direct
+synchronous dispatch).
+-}
+overApplicationTests : Test
+overApplicationTests =
+    describe "over-application re-entry"
+        [ test "outer arity-1 returning inner lambda, called with 2 args" <|
+            \_ ->
+                Eval.Module.eval
+                    "module Temp exposing (main)\n\nmain : Int\nmain = (\\a -> \\b -> a + b) 3 5\n"
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 8))
+        , test "outer arity-1 returning inner lambda, called with 3 args" <|
+            \_ ->
+                Eval.Module.eval
+                    "module Temp exposing (main)\n\nmain : Int\nmain = (\\a -> \\b -> \\c -> a * 100 + b * 10 + c) 1 2 3\n"
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 123))
+        , test "if-returning-function over-applied picks correct branch" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+pickOp : Int -> (Int -> Int)
+pickOp flag =
+    if flag > 0 then
+        \\n -> n + 1
+
+    else
+        \\n -> n - 1
+
+main : Int
+main =
+    pickOp 1 10
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 11))
+        , test "user function returning partial application, over-applied" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+add : Int -> Int -> Int
+add a b =
+    a + b
+
+makeAdder : Int -> (Int -> Int)
+makeAdder k =
+    add k
+
+main : Int
+main =
+    makeAdder 3 7
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 10))
+        , test "deeply over-applied (5 args into arity-1 chain)" <|
+            \_ ->
+                Eval.Module.eval
+                    "module Temp exposing (main)\n\nmain : Int\nmain = (\\a -> \\b -> \\c -> \\d -> \\e -> a + b + c + d + e) 1 2 3 4 5\n"
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 15))
+        ]
+
+
+{-| Regression coverage for the evalApplication spine-collection pass
+that flattens nested `Application` / `ParenthesizedExpression` head
+nodes before dispatch. The optimization is semantically neutral, so
+these tests only assert that the results still match the obvious
+flat-form evaluation — they exist to catch any slip in the flattening
+logic (wrong arg order, dropped args, or an infinite loop on empty
+applications).
+-}
+spineCollectionTests : Test
+spineCollectionTests =
+    describe "application spine collection"
+        [ test "(f a) b returns the same value as f a b" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+add : Int -> Int -> Int
+add a b =
+    a + b
+
+main : Int
+main =
+    ((add 3) 5)
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 8))
+        , test "((f a) b) c is deeply nested and still produces the correct value" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+add3 : Int -> Int -> Int -> Int
+add3 a b c =
+    a + b + c
+
+main : Int
+main =
+    (((add3 1) 2) 3)
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 6))
+        , test "pipeline into nested partial application still binds correctly" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+sub : Int -> Int -> Int
+sub a b =
+    a - b
+
+main : Int
+main =
+    10 |> sub 3
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int -7))
+        , test "nested application inside List.map callback body" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+add : Int -> Int -> Int
+add a b =
+    a + b
+
+main : List Int
+main =
+    List.map ((add 1)) [10, 20, 30]
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (List [ Int 11, Int 21, Int 31 ]))
+        ]
+
+
+{-| Regression: the elm-review package defines `infinity = round (1 / 0)`,
+which evaluated to `Int Infinity` at normalization time. The normalizer
+replaced the body with `Expression.Integer Infinity`, which the Wire3
+codec can't round-trip — making the package summary cache silently
+refuse to persist (package_summary_cache_roundtrip_ok = 0 on every
+warm run, ~500ms wasted on body-edit scenarios).
+
+Fix: `isLosslessValue` rejects non-finite Int/Float values, so the
+normalizer leaves the original expression alone. But
+`tryNormalizeConstant` still returns the evaluated value to the caller,
+so the in-memory `precomputedValues` cache still hits — recovering the
+runtime speedup without re-introducing the cache corruption. The
+on-disk user-norm cache filters non-lossless values at encode time in
+`InterpreterProject.encodeUserNormCacheEntry`.
+-}
+normalizationLosslessnessTests : Test
+normalizationLosslessnessTests =
+    describe "normalization skips non-finite Int/Float"
+        [ test "round (1/0) stays as an Application, not Integer Infinity" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        "module Test exposing (infinity)\n\ninfinity : Int\ninfinity =\n    round (1 / 0)\n"
+                in
+                case Eval.Module.parseProjectSources [ source ] of
+                    Err _ ->
+                        Expect.fail "parse failed"
+
+                    Ok parsedModules ->
+                        let
+                            normalized =
+                                Eval.Module.normalizeSummaries
+                                    (Eval.Module.buildCachedModuleSummariesFromParsed parsedModules)
+
+                            infinityBody =
+                                normalized
+                                    |> List.concatMap .functions
+                                    |> List.filter (\f -> Node.value f.name == "infinity")
+                                    |> List.head
+                                    |> Maybe.map (\f -> Node.value f.expression)
+                        in
+                        case infinityBody of
+                            Just (Integer _) ->
+                                Expect.fail "infinity was normalized to an Integer literal (Infinity cannot round-trip through Wire3)"
+
+                            Just (Application _) ->
+                                Expect.pass
+
+                            Just _ ->
+                                Expect.pass
+
+                            Nothing ->
+                                Expect.fail "infinity function not found in normalized output"
+        , test "1/0 stays as an OperatorApplication, not Floatable Infinity" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        "module Test exposing (inf)\n\ninf : Float\ninf =\n    1 / 0\n"
+                in
+                case Eval.Module.parseProjectSources [ source ] of
+                    Err _ ->
+                        Expect.fail "parse failed"
+
+                    Ok parsedModules ->
+                        let
+                            normalized =
+                                Eval.Module.normalizeSummaries
+                                    (Eval.Module.buildCachedModuleSummariesFromParsed parsedModules)
+
+                            infBody =
+                                normalized
+                                    |> List.concatMap .functions
+                                    |> List.filter (\f -> Node.value f.name == "inf")
+                                    |> List.head
+                                    |> Maybe.map (\f -> Node.value f.expression)
+                        in
+                        case infBody of
+                            Just (Floatable _) ->
+                                Expect.fail "inf was normalized to a Float literal (Infinity cannot round-trip through Wire3)"
+
+                            _ ->
+                                Expect.pass
         ]
 
 

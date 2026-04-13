@@ -14,7 +14,7 @@ concat-map, pipeline style) could be added later.
 
 import Elm.Syntax.Expression exposing (Expression(..), LetDeclaration(..))
 import Elm.Syntax.Infix
-import Elm.Syntax.Node as Node exposing (Node(..))
+import Elm.Syntax.Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..))
 import Elm.Syntax.Range exposing (emptyRange)
 
@@ -58,13 +58,39 @@ normalizePipeline ((Node range expr) as node) =
             node
 
 
+{-| Flatten nested `Application` / `ParenthesizedExpression` wrappers in
+the head position of a function call so the evaluator sees a single
+flat call site. `((f a) b) c` parses as
+`Application [Application [Application [f, a], b], c]`; after this
+rewrite it becomes `Application [f, a, b, c]` and hits the saturated
+fast paths / arity dispatch directly.
+
+Runs at AST-normalization time, so the evaluator's over-application
+bounce-back — which reconstructs `Application [Application [first,
+used], leftover]` at eval time — is untouched and can't trigger a
+re-entry loop.
+
+-}
+flattenApplicationHead : List (Node Expression) -> List (Node Expression)
+flattenApplicationHead items =
+    case items of
+        (Node _ (Application innerItems)) :: rest ->
+            flattenApplicationHead (innerItems ++ rest)
+
+        (Node _ (ParenthesizedExpression inner)) :: rest ->
+            flattenApplicationHead (inner :: rest)
+
+        _ ->
+            items
+
+
 {-| Walk children first (bottom-up), then try to fuse at this level.
 -}
 foldChildren : Node Expression -> Node Expression
 foldChildren ((Node range expr) as node) =
     case expr of
         Application items ->
-            Node range (Application (List.map fuse items))
+            Node range (Application (flattenApplicationHead (List.map fuse items)))
 
         OperatorApplication op dir l r ->
             Node range (OperatorApplication op dir (fuse l) (fuse r))

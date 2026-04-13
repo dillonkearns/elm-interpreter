@@ -6,7 +6,7 @@ import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (Pattern, QualifiedNameRef)
 import FastDict as Dict
 import Syntax exposing (fakeNode)
-import Types exposing (Env, EvalErrorData, EvalErrorKind(..), Implementation(..), JsonDecoder(..), JsonVal(..), Value(..))
+import Types exposing (Env, EvalErrorData, EvalErrorKind(..), Implementation(..), JsonVal(..), Value(..))
 
 
 typeError : Env -> String -> EvalErrorData
@@ -225,7 +225,7 @@ toArray value =
             Nothing
 
 
-{-| Try to interpret a Value as a Dict (RBNode_elm_builtin/RBEmpty_elm_builtin tree).
+{-| Try to interpret a Value as a Dict (RBNode\_elm\_builtin/RBEmpty\_elm\_builtin tree).
 Returns Just a sorted list of (key, value) pairs, or Nothing if not a Dict.
 -}
 toDict : Value -> Maybe (List ( Value, Value ))
@@ -265,7 +265,7 @@ toDictHelp value acc =
             acc
 
 
-{-| Try to interpret a Value as a Set (Set_elm_builtin wrapping a Dict).
+{-| Try to interpret a Value as a Set (Set\_elm\_builtin wrapping a Dict).
 Returns Just a sorted list of elements, or Nothing if not a Set.
 -}
 toSet : Value -> Maybe (List Value)

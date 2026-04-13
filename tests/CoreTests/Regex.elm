@@ -36,11 +36,6 @@ just v =
     Custom { moduleName = [ "Maybe" ], name = "Just" } [ v ]
 
 
-nothing : Value
-nothing =
-    Custom { moduleName = [ "Maybe" ], name = "Nothing" } []
-
-
 fromStringTests : Test
 fromStringTests =
     describe "fromString"

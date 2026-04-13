@@ -1,4 +1,4 @@
-module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseMapThenWithEval, recurseThen, recurseThenWithEval, resolveRecWithStep, succeedPartial)
+module Eval.Types exposing (combineMap, errorToString, evalErrorToString, failPartial, foldl, foldr, recurseMapThen, recurseMapThenWithEval, recurseThen, recurseThenWithEval, resolveRecWithStep, succeedPartial, wrapThenWithEval)
 
 import Elm.Syntax.Expression exposing (Expression)
 import Elm.Syntax.Node exposing (Node)
@@ -162,10 +162,10 @@ foldl f init xs cfg env =
                 EvOk a ->
                     f el a cfg env
 
-                EvOkTrace a _ _ ->
+                EvOkTrace _ _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
-                EvOkCoverage a _ ->
+                EvOkCoverage _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
                 _ ->
@@ -183,10 +183,10 @@ foldr f init xs cfg env =
                 EvOk a ->
                     f el a cfg env
 
-                EvOkTrace a _ _ ->
+                EvOkTrace _ _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
-                EvOkCoverage a _ ->
+                EvOkCoverage _ _ ->
                     EvalResult.andThen (\a2 -> f el a2 cfg env) acc
 
                 _ ->
@@ -236,7 +236,6 @@ evalErrorToString { callStack, error } =
 
                 TailCall _ ->
                     "TailCall (internal TCO signal)"
-
     in
     messageWithType
         ++ "\nCall stack:\n - "
@@ -370,7 +369,7 @@ mergeCoverageInto outerSet er =
             EvErrCoverage e (Set.union outerSet innerSet)
 
 
-recurseMapThen : 
+recurseMapThen :
     ( List (Node Expression), Config, Env )
     -> (List out -> PartialResult out)
     -> PartialResult out
@@ -442,7 +441,8 @@ recurseMapPlainWithEval evalFn items cfg env vacc f =
             f vacc
 
         item :: rest ->
-            recurseThenWithEval evalFn ( item, cfg, env )
+            recurseThenWithEval evalFn
+                ( item, cfg, env )
                 (\v ->
                     recurseMapPlainWithEval evalFn rest cfg env (v :: vacc) f
                 )
@@ -529,27 +529,4 @@ recurseMapCoverage items cfg env vacc sacc f =
 
                         EvErrCoverage e s ->
                             Recursion.base (EvErrCoverage e (Set.union sacc s))
-                )
-
-
-recurseMapTracedWithEval :
-    (Node Expression -> Config -> Env -> EvalResult Value)
-    -> List (Node Expression)
-    -> Config
-    -> Env
-    -> List Value
-    -> Rope Types.CallTree
-    -> Rope String
-    -> (List Value -> PartialResult Value)
-    -> PartialResult Value
-recurseMapTracedWithEval evalFn items cfg env vacc tacc lacc f =
-    case items of
-        [] ->
-            f vacc
-                |> Recursion.map (mergeTraceInto tacc lacc)
-
-        item :: rest ->
-            recurseThenWithEval evalFn ( item, cfg, env )
-                (\v ->
-                    recurseMapTracedWithEval evalFn rest cfg env (v :: vacc) tacc lacc f
                 )

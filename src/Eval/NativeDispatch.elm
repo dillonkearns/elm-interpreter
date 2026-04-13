@@ -2,6 +2,7 @@ module Eval.NativeDispatch exposing
     ( NativeDispatcher
     , buildRegistry
     , tryDispatch
+    , tryDispatchByName
     )
 
 {-| Native core-function dispatchers for the new evaluator's hot path.
@@ -90,6 +91,43 @@ tryDispatch registry id args =
 
         Nothing ->
             Nothing
+
+
+{-| Old-evaluator entry point: look up a native dispatcher by
+`(moduleName, name)` and invoke it. Used from `Eval.Expression`'s
+`evalFullyAppliedWithEnv` KernelImpl branch so hot Basics/List calls
+in `Application` shape (e.g. `List.foldl (+) 0 xs`) bypass the
+`twoWithError` selector/eval-result wrapping on every element.
+
+The linear scan through `dispatcherList` is fine in practice: the
+list is 14 entries, only queried when we've already matched
+`KernelImpl ["Basics"] _ _` or similar, and is further guarded by
+`not cfg.trace` at the call site so interactive debugging still sees
+every kernel invocation in the trace output.
+
+-}
+tryDispatchByName : ModuleName -> String -> List Value -> Maybe Value
+tryDispatchByName moduleName name args =
+    tryDispatchByNameInList dispatcherList moduleName name args
+
+
+tryDispatchByNameInList :
+    List ( ModuleName, String, NativeDispatcher )
+    -> ModuleName
+    -> String
+    -> List Value
+    -> Maybe Value
+tryDispatchByNameInList entries moduleName name args =
+    case entries of
+        [] ->
+            Nothing
+
+        ( entryModuleName, entryName, dispatcher ) :: rest ->
+            if entryName == name && entryModuleName == moduleName then
+                dispatcher args
+
+            else
+                tryDispatchByNameInList rest moduleName name args
 
 
 

@@ -9,9 +9,6 @@ module Kernel.Parser exposing
     )
 
 import Bitwise
-import EvalResult
-import Types exposing (Eval, Value(..))
-import Value
 
 
 charCodeAt : Int -> String -> Maybe Int
@@ -186,6 +183,6 @@ advancePosition offset row col target string =
 so the actual implementation is a stub here. The real logic is in Kernel.elm's
 custom entry function since it needs to call back into the evaluator.
 -}
-isSubChar : () -> ()
-isSubChar _ =
+isSubChar : ()
+isSubChar =
     ()

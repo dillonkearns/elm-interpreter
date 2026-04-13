@@ -7,12 +7,14 @@ module Kernel.Dict exposing
     , get
     , insert
     , isEmpty
+    , keys
     , map
     , member
     , remove
     , size
     , toList
     , union
+    , values
     )
 
 {-| Kernel implementations for Dict operations.
@@ -24,10 +26,12 @@ tree-walking evaluator. Key comparison is delegated to the host
 String, Int, Tuple, etc.
 
 Dict values at runtime are:
-  - Custom { moduleName = [ "Dict" ], name = "RBEmpty_elm_builtin" } []
-  - Custom { moduleName = [ "Dict" ], name = "RBNode_elm_builtin" } [ color, key, value, left, right ]
+
+  - Custom { moduleName = [ "Dict" ], name = "RBEmpty\_elm\_builtin" } []
+  - Custom { moduleName = [ "Dict" ], name = "RBNode\_elm\_builtin" } [ color, key, value, left, right ]
 
 Color values:
+
   - Custom { moduleName = [ "Dict" ], name = "Red" } []
   - Custom { moduleName = [ "Dict" ], name = "Black" } []
 
@@ -90,16 +94,6 @@ isRed value =
             False
 
 
-isBlack : Value -> Bool
-isBlack value =
-    case value of
-        Custom ref _ ->
-            ref.name == "Black"
-
-        _ ->
-            True
-
-
 {-| Kernel Dict.foldl: fold from lowest to highest key.
 Tree traversal in host Elm, user function called via interpreter.
 -}
@@ -109,11 +103,11 @@ foldl func acc dict cfg env =
         innerCfg =
             { cfg | tcoTarget = Nothing }
     in
-    foldlHelp func innerCfg acc dict cfg env
+    foldlHelp func innerCfg acc dict env
 
 
-foldlHelp : (Value -> Eval (Value -> Eval (Value -> Eval Value))) -> Types.Config -> Value -> Value -> Eval Value
-foldlHelp func innerCfg acc dict cfg env =
+foldlHelp : (Value -> Eval (Value -> Eval (Value -> Eval Value))) -> Types.Config -> Value -> Value -> Env -> EvalResult Value
+foldlHelp func innerCfg acc dict env =
     case dict of
         Custom { name } args ->
             if name == "RBEmpty_elm_builtin" then
@@ -124,7 +118,7 @@ foldlHelp func innerCfg acc dict cfg env =
                 case args of
                     [ _, key, value, left, right ] ->
                         -- Fold left subtree first
-                        case EvalResult.toResult (foldlHelp func innerCfg acc left cfg env) of
+                        case EvalResult.toResult (foldlHelp func innerCfg acc left env) of
                             Err e ->
                                 EvErr e
 
@@ -146,7 +140,7 @@ foldlHelp func innerCfg acc dict cfg env =
 
                                                     Ok newAcc ->
                                                         -- Then fold right subtree
-                                                        foldlHelp func innerCfg newAcc right cfg env
+                                                        foldlHelp func innerCfg newAcc right env
 
                     _ ->
                         EvalResult.succeed acc
@@ -163,11 +157,11 @@ foldr func acc dict cfg env =
         innerCfg =
             { cfg | tcoTarget = Nothing }
     in
-    foldrHelp func innerCfg acc dict cfg env
+    foldrHelp func innerCfg acc dict env
 
 
-foldrHelp : (Value -> Eval (Value -> Eval (Value -> Eval Value))) -> Types.Config -> Value -> Value -> Eval Value
-foldrHelp func innerCfg acc dict cfg env =
+foldrHelp : (Value -> Eval (Value -> Eval (Value -> Eval Value))) -> Types.Config -> Value -> Value -> Env -> EvalResult Value
+foldrHelp func innerCfg acc dict env =
     case dict of
         Custom { name } args ->
             if name == "RBEmpty_elm_builtin" then
@@ -177,7 +171,7 @@ foldrHelp func innerCfg acc dict cfg env =
                 case args of
                     [ _, key, value, left, right ] ->
                         -- Fold right subtree first
-                        case EvalResult.toResult (foldrHelp func innerCfg acc right cfg env) of
+                        case EvalResult.toResult (foldrHelp func innerCfg acc right env) of
                             Err e ->
                                 EvErr e
 
@@ -199,7 +193,7 @@ foldrHelp func innerCfg acc dict cfg env =
 
                                                     Ok newAcc ->
                                                         -- Then fold left subtree
-                                                        foldrHelp func innerCfg newAcc left cfg env
+                                                        foldrHelp func innerCfg newAcc left env
 
                     _ ->
                         EvalResult.succeed acc
@@ -216,11 +210,11 @@ map func dict cfg env =
         innerCfg =
             { cfg | tcoTarget = Nothing }
     in
-    mapHelp func innerCfg dict cfg env
+    mapHelp func innerCfg dict env
 
 
-mapHelp : (Value -> Eval (Value -> Eval Value)) -> Types.Config -> Value -> Eval Value
-mapHelp func innerCfg dict cfg env =
+mapHelp : (Value -> Eval (Value -> Eval Value)) -> Types.Config -> Value -> Env -> EvalResult Value
+mapHelp func innerCfg dict env =
     case dict of
         Custom ref args ->
             if ref.name == "RBEmpty_elm_builtin" then
@@ -230,13 +224,13 @@ mapHelp func innerCfg dict cfg env =
                 case args of
                     [ color, key, value, left, right ] ->
                         -- Map left subtree
-                        case EvalResult.toResult (mapHelp func innerCfg left cfg env) of
+                        case EvalResult.toResult (mapHelp func innerCfg left env) of
                             Err e ->
                                 EvErr e
 
                             Ok mappedLeft ->
                                 -- Map right subtree
-                                case EvalResult.toResult (mapHelp func innerCfg right cfg env) of
+                                case EvalResult.toResult (mapHelp func innerCfg right env) of
                                     Err e ->
                                         EvErr e
 
@@ -460,16 +454,16 @@ balance color key value left right =
                                                         (rbNode blackValue rK rV rLeft rRight)
 
                                                 else
-                                                    balanceDefault color key value left right rK rV rLeft rRight
+                                                    balanceDefault color key value left rK rV rLeft rRight
 
                                             _ ->
-                                                balanceDefault color key value left right rK rV rLeft rRight
+                                                balanceDefault color key value left rK rV rLeft rRight
 
                                     else
-                                        balanceDefault color key value left right rK rV rLeft rRight
+                                        balanceDefault color key value left rK rV rLeft rRight
 
                                 _ ->
-                                    balanceDefault color key value left right rK rV rLeft rRight
+                                    balanceDefault color key value left rK rV rLeft rRight
 
                         else
                             balanceLeft color key value left right
@@ -484,8 +478,8 @@ balance color key value left right =
             balanceLeft color key value left right
 
 
-balanceDefault : Value -> Value -> Value -> Value -> Value -> Value -> Value -> Value -> Value -> Value
-balanceDefault color key value left _ rK rV rLeft rRight =
+balanceDefault : Value -> Value -> Value -> Value -> Value -> Value -> Value -> Value -> Value
+balanceDefault color key value left rK rV rLeft rRight =
     rbNode color rK rV (rbNode redValue key value left rLeft) rRight
 
 
@@ -569,7 +563,7 @@ The heavy rules we care about barely call remove, so this trade-off is fine.
 -}
 removeHelp : Value -> Value -> Env -> Result EvalErrorData Value
 removeHelp targetKey dict env =
-    case toSortedAssocList dict env of
+    case toSortedAssocList dict of
         Err e ->
             Err e
 
@@ -586,7 +580,7 @@ union : Value -> Value -> Eval Value
 union left right cfg env =
     -- Insert all of left's bindings into right; left wins on collisions,
     -- matching elm/core's Dict.union semantics.
-    case toSortedAssocList left env of
+    case toSortedAssocList left of
         Err e ->
             EvErr e
 
@@ -638,8 +632,8 @@ fromListHelp items acc cfg env =
 
 
 toList : Value -> Eval Value
-toList dict _ env =
-    case toSortedAssocList dict env of
+toList dict _ _ =
+    case toSortedAssocList dict of
         Err e ->
             EvErr e
 
@@ -647,8 +641,8 @@ toList dict _ env =
             EvalResult.succeed (List (List.map (\( k, v ) -> Tuple k v) pairs))
 
 
-toSortedAssocList : Value -> Env -> Result EvalErrorData (List ( Value, Value ))
-toSortedAssocList dict _ =
+toSortedAssocList : Value -> Result EvalErrorData (List ( Value, Value ))
+toSortedAssocList dict =
     Ok (toSortedAssocListHelp dict [])
 
 
@@ -775,3 +769,56 @@ filterOutKeyHelp targetKey pairs acc env =
 
                 Ok _ ->
                     filterOutKeyHelp targetKey rest (( k, v ) :: acc) env
+
+
+{-| Kernel Dict.keys: walk the tree in-order, accumulating keys into a list.
+Avoids the 3 interpreter trampolines per element that foldr+lambda would pay.
+-}
+keys : Value -> Eval Value
+keys dict _ _ =
+    EvalResult.succeed (List (keysHelp dict []))
+
+
+keysHelp : Value -> List Value -> List Value
+keysHelp dict acc =
+    case dict of
+        Custom ref args ->
+            if ref.name == "RBEmpty_elm_builtin" then
+                acc
+
+            else
+                case args of
+                    [ _, key, _, left, right ] ->
+                        keysHelp left (key :: keysHelp right acc)
+
+                    _ ->
+                        acc
+
+        _ ->
+            acc
+
+
+{-| Kernel Dict.values: walk the tree in-order, accumulating values into a list.
+-}
+values : Value -> Eval Value
+values dict _ _ =
+    EvalResult.succeed (List (valuesHelp dict []))
+
+
+valuesHelp : Value -> List Value -> List Value
+valuesHelp dict acc =
+    case dict of
+        Custom ref args ->
+            if ref.name == "RBEmpty_elm_builtin" then
+                acc
+
+            else
+                case args of
+                    [ _, _, value, left, right ] ->
+                        valuesHelp left (value :: valuesHelp right acc)
+
+                    _ ->
+                        acc
+
+        _ ->
+            acc

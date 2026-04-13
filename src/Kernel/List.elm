@@ -12,7 +12,6 @@ import EvalResult
 import Kernel.Utils
 import Rope
 import Types exposing (Eval, EvalResult(..), Value(..))
-import Value
 
 
 {-| Kernel List.map: applies a function to every element.
@@ -75,7 +74,8 @@ mapResumeAfterFx f rest acc cfg env fxResult =
             EvErrTrace e calls logs
 
         EvYield tag payload resume ->
-            EvYield tag payload
+            EvYield tag
+                payload
                 (\v -> mapResumeAfterFx f rest acc cfg env (resume v))
 
         EvMemoLookup payload resume ->
@@ -218,7 +218,8 @@ foldlResumeAfterFx f acc rest cfg env fxResult =
             EvErrTrace e calls logs
 
         EvYield tag payload resume ->
-            EvYield tag payload
+            EvYield tag
+                payload
                 (\v -> foldlResumeAfterFx f acc rest cfg env (resume v))
 
         EvMemoLookup payload resume ->
@@ -273,7 +274,8 @@ foldlResumeAfterAcc f rest cfg env accResult =
             EvErrTrace e calls logs
 
         EvYield tag payload resume ->
-            EvYield tag payload
+            EvYield tag
+                payload
                 (\v -> foldlResumeAfterAcc f rest cfg env (resume v))
 
         EvMemoLookup payload resume ->
@@ -550,7 +552,8 @@ concatMapHelp f remaining acc cfg env =
         x :: rest ->
             case f x innerCfg env of
                 EvYield tag payload resume ->
-                    EvYield tag payload
+                    EvYield tag
+                        payload
                         (\v ->
                             case EvalResult.toResult (resume v) of
                                 Ok mapped ->

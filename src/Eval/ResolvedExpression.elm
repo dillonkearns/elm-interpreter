@@ -36,7 +36,7 @@ supported here never produce those.
 
 import Elm.Syntax.Expression as Expression
 import Elm.Syntax.ModuleName exposing (ModuleName)
-import Elm.Syntax.Node as Node exposing (Node)
+import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (QualifiedNameRef)
 import Environment
 import Eval.Expression
@@ -50,7 +50,6 @@ import Types
     exposing
         ( Config
         , Env
-        , EvalErrorData
         , EvalErrorKind(..)
         , EvalResult(..)
         , Implementation(..)
@@ -87,7 +86,8 @@ type alias REnv =
     , nativeDispatchers : FastDict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
     , higherOrderDispatchers : FastDict.Dict IR.GlobalId HigherOrderDispatcher
     , kernelDispatchers :
-        FastDict.Dict IR.GlobalId
+        FastDict.Dict
+            IR.GlobalId
             { arity : Int
             , kernelFn : List Value -> Config -> Env -> EvalResult Value
             }
@@ -120,6 +120,7 @@ Yield / memo / error propagation is handled automatically by threading
 Wrapped in a one-constructor `type` (not `type alias`) because Elm
 forbids recursive type aliases, and this type is (indirectly)
 self-referential via `REnv`.
+
 -}
 type HigherOrderDispatcher
     = HigherOrderDispatcher (REnv -> List Value -> Maybe (EvalResult Value))
@@ -166,6 +167,7 @@ stack modification.
 
 `RecThen` carries a continuation for non-tail calls, matching the
 behavior of `rRecThen`.
+
 -}
 type Rec r t a
     = RBase a
@@ -208,6 +210,7 @@ structure — fewer arguments per iteration), but adds a fast path for
 `Rec` is restricted to `t = a` here (mirroring `runRecursion`'s
 `Rec r t t`), which matches every use site in the trampolined
 evaluator.
+
 -}
 runRec : (r -> Rec r t t) -> r -> t
 runRec project init =
@@ -307,6 +310,7 @@ Most cases wrap the direct evaluator's result in `rBase`;
 only the cases that may lead to cross-body recursion route through
 `rTail` / `recurseThen` so that cross-body transitions
 don't accumulate JS stack frames.
+
 -}
 evalRStep : REnv -> List Value -> RExpr -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
 evalRStep staticEnv locals expr =
@@ -347,7 +351,10 @@ evalRStep staticEnv locals expr =
             -- call. Walking the arg list uses direct recursion in Elm
             -- but it's bounded by arg count (typically 1–6), not by
             -- recursion depth — so no stack issue from that.
-            evalArgsStep staticEnv locals argExprs []
+            evalArgsStep
+                locals
+                argExprs
+                []
                 (\argValues ->
                     dispatchGlobalApplyStep staticEnv locals id argValues
                 )
@@ -361,7 +368,10 @@ evalRStep staticEnv locals expr =
                 (\headResult ->
                     case headResult of
                         EvOk headValue ->
-                            evalArgsStep staticEnv locals argExprs []
+                            evalArgsStep
+                                locals
+                                argExprs
+                                []
                                 (\argValues ->
                                     applyClosureStep staticEnv locals headValue argValues
                                 )
@@ -391,7 +401,9 @@ evalRStep staticEnv locals expr =
         RLet bindings letBody ->
             -- Evaluate bindings sequentially through the trampoline,
             -- then evaluate the body with the extended locals.
-            evalLetBindingsStep staticEnv locals bindings
+            evalLetBindingsStep staticEnv
+                locals
+                bindings
                 (\newLocals ->
                     rTail ( newLocals, letBody )
                 )
@@ -498,6 +510,7 @@ outer trampoline.
 Function bindings (arity > 0) build their closure directly without
 needing to evaluate the body (it's an `RLambda` that only constructs a
 `PartiallyApplied`), so they bypass the trampoline.
+
 -}
 evalLetBindingsStep :
     REnv
@@ -704,15 +717,15 @@ JS frames across sibling calls.
 
 The `k` continuation receives the fully-evaluated arg list and returns
 the next `Rec` step. Short-circuits on non-`EvOk` intermediate results.
+
 -}
 evalArgsStep :
-    REnv
-    -> List Value
+    List Value
     -> List RExpr
     -> List Value
     -> (List Value -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value))
     -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
-evalArgsStep staticEnv locals remaining accRev k =
+evalArgsStep locals remaining accRev k =
     case remaining of
         [] ->
             k (List.reverse accRev)
@@ -722,7 +735,7 @@ evalArgsStep staticEnv locals remaining accRev k =
                 (\headResult ->
                     case headResult of
                         EvOk value ->
-                            evalArgsStep staticEnv locals rest (value :: accRev) k
+                            evalArgsStep locals rest (value :: accRev) k
 
                         _ ->
                             rBase headResult
@@ -738,6 +751,7 @@ stack.
 Intercepts still go through the direct path (they're uncommon enough
 that the one-level stack frame doesn't matter, and their callbacks
 are arbitrary framework code that isn't ready to return `Rec`).
+
 -}
 dispatchGlobalApplyStep :
     REnv
@@ -842,42 +856,6 @@ fallbackDispatch env id argValues =
 
                 Nothing ->
                     delegateCoreApply env id argValues
-
-
-{-| Helper: lift a non-`EvOk` `EvalResult (List Value)` to `EvalResult Value`
-for the fall-through propagation in the trampolined `RApply` branch.
--}
-mapListResultToValue : EvalResult (List Value) -> EvalResult Value
-mapListResultToValue result =
-    case result of
-        EvOk _ ->
-            -- Shouldn't happen — the caller checks for EvOk before
-            -- dispatching to this helper.
-            evErrBlank "mapListResultToValue: unexpected EvOk"
-
-        EvErr e ->
-            EvErr e
-
-        EvYield tag payload resume ->
-            EvYield tag payload (\value -> mapListResultToValue (resume value))
-
-        EvMemoLookup payload resume ->
-            EvMemoLookup payload (\maybeValue -> mapListResultToValue (resume maybeValue))
-
-        EvMemoStore payload inner ->
-            EvMemoStore payload (mapListResultToValue inner)
-
-        EvOkTrace _ _ _ ->
-            evErrBlank "mapListResultToValue: EvOkTrace not supported in trampolined evalR"
-
-        EvErrTrace e tree logs ->
-            EvErrTrace e tree logs
-
-        EvOkCoverage _ _ ->
-            evErrBlank "mapListResultToValue: EvOkCoverage not supported in trampolined evalR"
-
-        EvErrCoverage _ _ ->
-            evErrBlank "mapListResultToValue: EvErrCoverage not supported in trampolined evalR"
 
 
 {-| Direct-style step evaluator — the pre-trampolining implementation,
@@ -1182,7 +1160,7 @@ evalRDirect env expr =
         RGlobal id ->
             evalGlobal env id
 
-        RGLSL _ ->
+        RGLSL ->
             evErr env (Unsupported "RGLSL (not supported)")
 
 
@@ -1456,16 +1434,16 @@ evalGlobal env id =
 {-| Dispatch an RGlobal being called with the given (already-evaluated)
 argument Values. Order of precedence:
 
-1. **Intercepts.** If the GlobalId has a registered intercept, call its
-   callback with the args + fallback Config/Env. Matches the old
-   evaluator's intercept check in `Eval.Expression` around line 1892.
-2. **User declarations.** If the global has an `RExpr` body in
-   `env.resolvedBodies`, evaluate it to a Value (which produces a
-   closure for arity > 0) and apply args.
-3. **Native dispatch.** Hot operators like `+`, `-`, `==` go directly
-   through `NativeDispatch.tryDispatch`.
-4. **Delegation fallback.** Synthesize a Core call and hand it to the
-   old evaluator.
+1.  **Intercepts.** If the GlobalId has a registered intercept, call its
+    callback with the args + fallback Config/Env. Matches the old
+    evaluator's intercept check in `Eval.Expression` around line 1892.
+2.  **User declarations.** If the global has an `RExpr` body in
+    `env.resolvedBodies`, evaluate it to a Value (which produces a
+    closure for arity > 0) and apply args.
+3.  **Native dispatch.** Hot operators like `+`, `-`, `==` go directly
+    through `NativeDispatch.tryDispatch`.
+4.  **Delegation fallback.** Synthesize a Core call and hand it to the
+    old evaluator.
 
 The intercept check happens **first** because intercepts are how the
 framework short-circuits dispatch at specific qualified names — they
@@ -1562,6 +1540,7 @@ Chosen empirically so that `small-12` / `elm-spa-parity` workloads
 stay under the budget on their normal call depth while still tripping
 on the pathological chains that were crashing the resolver-widened
 configuration.
+
 -}
 evalRCallDepthBudget : Int
 evalRCallDepthBudget =
@@ -1637,6 +1616,7 @@ round-tripped through `Value.toExpression`. That avoids the
 `RExprImpl` closures, which previously crashed the old evaluator inside
 kernel callbacks. Literal args go through injection too — it's cheaper
 than a `Value.toExpression` round trip.
+
 -}
 delegateByName : REnv -> ModuleName -> String -> List Value -> EvalResult Value
 delegateByName env moduleName name args =
@@ -2463,6 +2443,7 @@ The resolved callback is invoked via `applyClosure env f [ x, acc ]`.
 continuations automatically — the loop only stays hot on the `EvOk`
 path, which Elm's compiler emits as a host-Elm `while` loop due to
 tail-recursion on `foldlHelper`.
+
 -}
 foldlDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
 foldlDispatcher env args =
@@ -2505,6 +2486,7 @@ and invoke the callback via `applyClosure env f [ k, v, acc ]` for
 each node. Same callback dispatch path as `foldlDispatcher`, which is
 specifically what the old kernel's `Kernel.function3` marshaling
 layer mis-handles for `RExprImpl` closures.
+
 -}
 dictFoldlDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
 dictFoldlDispatcher env args =
@@ -2577,7 +2559,8 @@ foldrDispatcher env args =
             Nothing
 
 
-{-| `List.map : (a -> b) -> List a -> List b` -}
+{-| `List.map : (a -> b) -> List a -> List b`
+-}
 listMapDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
 listMapDispatcher env args =
     case args of
@@ -2608,7 +2591,8 @@ listMapHelper env f remaining accRev =
                         otherResult
 
 
-{-| `List.filter : (a -> Bool) -> List a -> List a` -}
+{-| `List.filter : (a -> Bool) -> List a -> List a`
+-}
 listFilterDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
 listFilterDispatcher env args =
     case args of
@@ -2652,7 +2636,8 @@ listFilterHelper env pred remaining accRev =
                         otherResult
 
 
-{-| `List.filterMap : (a -> Maybe b) -> List a -> List b` -}
+{-| `List.filterMap : (a -> Maybe b) -> List a -> List b`
+-}
 listFilterMapDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
 listFilterMapDispatcher env args =
     case args of
@@ -2701,7 +2686,8 @@ listFilterMapHelper env f remaining accRev =
                         otherResult
 
 
-{-| `List.concatMap : (a -> List b) -> List a -> List b` -}
+{-| `List.concatMap : (a -> List b) -> List a -> List b`
+-}
 listConcatMapDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
 listConcatMapDispatcher env args =
     case args of
@@ -2742,7 +2728,8 @@ listConcatMapHelper env f remaining accRev =
                         otherResult
 
 
-{-| `List.any : (a -> Bool) -> List a -> Bool` -}
+{-| `List.any : (a -> Bool) -> List a -> Bool`
+-}
 listAnyDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
 listAnyDispatcher env args =
     case args of
@@ -2783,7 +2770,8 @@ listAnyHelper env pred remaining =
                         otherResult
 
 
-{-| `List.all : (a -> Bool) -> List a -> Bool` -}
+{-| `List.all : (a -> Bool) -> List a -> Bool`
+-}
 listAllDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
 listAllDispatcher env args =
     case args of
@@ -2935,5 +2923,3 @@ dictMapHelper env f node =
 
         _ ->
             EvOk node
-
-

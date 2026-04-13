@@ -180,7 +180,7 @@ emptyImports =
     }
 
 
-{-| Optimized call for kernel functions. Kernel modules (Elm.Kernel.*)
+{-| Optimized call for kernel functions. Kernel modules (Elm.Kernel.\*)
 are never the current user module, so we skip the equality check and
 the moduleImports lookup (kernel modules have no user imports).
 -}
@@ -223,7 +223,7 @@ call moduleName name env =
                 :: env.callStack
         , shared = env.shared
         , currentModuleFunctions = env.currentModuleFunctions
-    , letFunctions = env.letFunctions
+        , letFunctions = env.letFunctions
         , values = env.values
         , imports = env.imports
         , callDepth = env.callDepth + 1
@@ -277,12 +277,13 @@ callKernelNoStack moduleName _ env =
 {-| Flat-closure variant of `call` for **top-level module function** lookups.
 
 A top-level module function's body can only reference:
-  * its own parameters
-  * its own let bindings
-  * module-level names (`currentModuleFunctions` / `shared.functions`)
-  * imports
 
-It *never* legitimately references the caller's local bindings, so the
+  - its own parameters
+  - its own let bindings
+  - module-level names (`currentModuleFunctions` / `shared.functions`)
+  - imports
+
+It _never_ legitimately references the caller's local bindings, so the
 caller's `env.values` is dead weight when stored on the `PartiallyApplied`
 that represents the bare function reference. This variant clears `values`
 to `Dict.empty` at the point where we build the closure env, keeping
@@ -292,6 +293,7 @@ own argument count instead of the caller's scope size.
 
 **Do not** use this for let-defined functions — those genuinely close
 over their enclosing scope's `values`.
+
 -}
 callModuleFn : ModuleName -> String -> Env -> Env
 callModuleFn moduleName name env =
@@ -339,7 +341,7 @@ callModuleFn moduleName name env =
 is off. See `callModuleFn` for the flat-closure rationale.
 -}
 callModuleFnNoStack : ModuleName -> String -> Env -> Env
-callModuleFnNoStack moduleName name env =
+callModuleFnNoStack moduleName _ env =
     let
         key : String
         key =

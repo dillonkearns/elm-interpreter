@@ -9,12 +9,13 @@ arity > 0) under the `initContextWithImports` resolver widening.
 Each test goes through `Eval.Module.evalWithResolvedIR`, which is the
 new-evaluator entry point. The dispatchers receive pre-evaluated args
 and should produce results that match the host-Elm implementations.
+
 -}
 
 import Eval.Module
 import Expect
 import Test exposing (Test, describe, test)
-import Types exposing (Error(..), Value(..))
+import Types exposing (Error, Value(..))
 
 
 suite : Test
@@ -31,6 +32,12 @@ suite =
             [ dictFoldlCountKeys
             , dictFoldlLetBound3ArgCallback
             , dictFoldlReverseBuild
+            ]
+        , describe "Dict.keys / values kernels"
+            [ dictKeysSortedOrder
+            , dictKeysEmpty
+            , dictValuesSortedOrder
+            , dictValuesEmpty
             ]
         ]
 
@@ -149,7 +156,6 @@ result =
                     Expect.fail "buildProjectEnv failed"
 
 
-
 dictFoldlCountKeys : Test
 dictFoldlCountKeys =
     test "Dict.foldl counts keys with a KernelImpl callback" <|
@@ -163,7 +169,7 @@ import Dict
 
 result : Int
 result =
-    Dict.foldl (\\_ _ acc -> acc + 1) 0 (Dict.fromList [ ( \"a\", 1 ), ( \"b\", 2 ), ( \"c\", 3 ) ])
+    Dict.foldl (\\_ _ acc -> acc + 1) 0 (Dict.fromList [ ( "a", 1 ), ( "b", 2 ), ( "c", 3 ) ])
 """
             in
             case Eval.Module.buildProjectEnv [ source ] of
@@ -193,7 +199,7 @@ result =
         step key value acc =
             acc + value
     in
-    Dict.foldl step 0 (Dict.fromList [ ( \"a\", 10 ), ( \"b\", 20 ), ( \"c\", 30 ) ])
+    Dict.foldl step 0 (Dict.fromList [ ( "a", 10 ), ( "b", 20 ), ( "c", 30 ) ])
 """
             in
             case Eval.Module.buildProjectEnv [ source ] of
@@ -218,7 +224,7 @@ import Dict
 
 result : List String
 result =
-    Dict.foldl (\\k _ acc -> k :: acc) [] (Dict.fromList [ ( \"a\", 1 ), ( \"c\", 3 ), ( \"b\", 2 ) ])
+    Dict.foldl (\\k _ acc -> k :: acc) [] (Dict.fromList [ ( "a", 1 ), ( "c", 3 ), ( "b", 2 ) ])
 """
             in
             case Eval.Module.buildProjectEnv [ source ] of
@@ -226,6 +232,60 @@ result =
                     Eval.Module.evalWithResolvedIR projectEnv "Foo.result"
                         -- foldl in-order visits a,b,c. Cons prepends → c,b,a.
                         |> expectValue (List [ String "c", String "b", String "a" ])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictKeysSortedOrder : Test
+dictKeysSortedOrder =
+    test "Dict.keys returns keys in sorted order" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv
+                        "Dict.keys (Dict.fromList [ ( \"c\", 3 ), ( \"a\", 1 ), ( \"b\", 2 ) ])"
+                        |> expectValue (List [ String "a", String "b", String "c" ])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictKeysEmpty : Test
+dictKeysEmpty =
+    test "Dict.keys on empty dict == []" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Dict.keys Dict.empty"
+                        |> expectValue (List [])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictValuesSortedOrder : Test
+dictValuesSortedOrder =
+    test "Dict.values returns values in sorted-key order" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv
+                        "Dict.values (Dict.fromList [ ( \"c\", 3 ), ( \"a\", 1 ), ( \"b\", 2 ) ])"
+                        |> expectValue (List [ Int 1, Int 2, Int 3 ])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+dictValuesEmpty : Test
+dictValuesEmpty =
+    test "Dict.values on empty dict == []" <|
+        \_ ->
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Dict.values Dict.empty"
+                        |> expectValue (List [])
 
                 Err _ ->
                     Expect.fail "buildProjectEnv failed"

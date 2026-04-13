@@ -3,12 +3,12 @@ module CoverageTests exposing (suite)
 import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
-import Set
 import Eval.Module
 import Expect
 import Rope
+import Set
 import Test exposing (Test, describe, test)
-import Types exposing (CallTree(..), Error(..), Value(..))
+import Types exposing (CallTree(..), Value(..))
 
 
 suite : Test

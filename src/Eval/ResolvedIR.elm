@@ -92,9 +92,9 @@ type RExpr
       -- Record update targets a local slot because Elm's record update syntax
       -- is `{ name | field = ... }` where `name` must be a variable reference.
     | RRecordUpdate Int (List ( String, RExpr ))
-      -- GLSL literals: content preserved as a raw string. The evaluator never
-      -- inspects this — it's an opaque payload ferried to the runtime.
-    | RGLSL String
+      -- GLSL literals: the evaluator treats these as Unsupported, so we
+      -- don't carry the raw source through the IR.
+    | RGLSL
 
 
 {-| A single binding inside an `RLet`.

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 131, "filePath": "src/Eval/Module.elm" },
+    { "count": 131, "filePath": "tests/IncrementalEnvTests.elm" },
+    { "count": 62, "filePath": "src/Kernel/Bytes.elm" },
+    { "count": 48, "filePath": "src/Eval/Expression.elm" },
+    { "count": 25, "filePath": "tests/PerfTests.elm" },
+    { "count": 19, "filePath": "tests/CoverageTests.elm" },
+    { "count": 16, "filePath": "src/Kernel/Json.elm" },
+    { "count": 14, "filePath": "tests/ResolvedExpressionTests.elm" },
+    { "count": 12, "filePath": "tests/ResolvedIRTests.elm" },
+    { "count": 12, "filePath": "tests/ResolvedProjectTests.elm" },
+    { "count": 10, "filePath": "src/Types.elm" },
+    { "count": 8, "filePath": "src/Kernel/Regex.elm" },
+    { "count": 8, "filePath": "tests/EndToEnd.elm" },
+    { "count": 6, "filePath": "src/Kernel/List.elm" },
+    { "count": 6, "filePath": "src/Kernel/Parser.elm" },
+    { "count": 5, "filePath": "src/ListFusion.elm" },
+    { "count": 5, "filePath": "tests/RandomTests.elm" },
+    { "count": 4, "filePath": "tests/CoreTests/Array.elm" },
+    { "count": 4, "filePath": "tests/ImportTests.elm" },
+    { "count": 3, "filePath": "src/Kernel/Dict.elm" },
+    { "count": 3, "filePath": "src/MemoRuntime.elm" },
+    { "count": 3, "filePath": "src/TcoAnalysis.elm" },
+    { "count": 2, "filePath": "src/Kernel.elm" },
+    { "count": 2, "filePath": "src/Recursion.elm" },
+    { "count": 2, "filePath": "src/UI.elm" },
+    { "count": 2, "filePath": "tests/ReviewRuleBugTest.elm" }
+  ]
+}

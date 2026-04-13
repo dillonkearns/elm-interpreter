@@ -723,7 +723,7 @@ unsupportedTests =
                 expectUnsupported (RGlobal 42)
         , test "RGLSL returns Unsupported (never supported)" <|
             \_ ->
-                expectUnsupported (RGLSL "opaque glsl")
+                expectUnsupported RGLSL
         ]
 
 
