@@ -2580,13 +2580,14 @@ This is tail-recursive in Elm, compiled to a while loop by the host compiler.
 -}
 tcoLoop : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
 tcoLoop funcName body remaining cfg env =
-    -- Build the per-iteration innerCfg ONCE, outside the loop. The loop
-    -- body only differs from cfg in `maxSteps = Nothing` (the TCO loop
-    -- manages its own step budget via `remaining`), and that difference
-    -- is constant across iterations. Previously this record was rebuilt
-    -- on every single iteration, allocating a fresh 7-field Config
-    -- record per interpreted step inside a tail-recursive function.
     let
+        -- Build the per-iteration `innerCfg` ONCE, outside the loop.
+        -- `innerCfg` only differs from `cfg` in `maxSteps = Nothing`
+        -- (the TCO loop manages its own step budget via `remaining`),
+        -- and that difference is constant across iterations. Previously
+        -- this record was rebuilt per iteration, allocating a fresh
+        -- multi-field Config per interpreted step inside a tail-
+        -- recursive function.
         innerCfg : Config
         innerCfg =
             { trace = cfg.trace
@@ -2601,26 +2602,16 @@ tcoLoop funcName body remaining cfg env =
             , useResolvedIR = cfg.useResolvedIR
             }
 
-        paramNames : List String
-        paramNames =
-            env.values
-                |> Dict.keys
-    in
-    -- Item 2a (surgical): for statically-safe shapes, skip the
-    -- fingerprint / bounded-progress cycle probe by starting the
-    -- amortized-check interval beyond the remaining step budget.
-    -- `tcoLoopHelp` won't enter the probe branch on this run, but
-    -- its env handling, Yield/Memo plumbing, and cfg threading are
-    -- unchanged — avoiding the regressions that replacing the whole
-    -- loop body with `tcoLoopSafe` / `tcoLoopListDrain` caused in
-    -- Parser.Advanced and Review.Rule tests.
-    --
-    -- `TcoGeneral` uses the default interval=16 with adaptive growth.
-    -- `maxSteps` absolute cap still applies via `remaining`.
-    let
+        -- For statically-safe shapes (`TcoSafe` / `TcoListDrain`),
+        -- skip `tcoLoopHelp`'s fingerprint / bounded-progress cycle
+        -- probe by starting the amortized-check interval beyond the
+        -- remaining step budget — so the probe branch is never
+        -- reached. `maxSteps` absolute cap still applies via
+        -- `remaining`. `TcoGeneral` keeps the default interval=16
+        -- with adaptive growth.
         initialInterval : Int
         initialInterval =
-            case TcoAnalysis.analyze funcName paramNames body of
+            case TcoAnalysis.analyze funcName (Dict.keys env.values) body of
                 TcoAnalysis.TcoListDrain _ ->
                     remaining + 1
 
@@ -2631,114 +2622,6 @@ tcoLoop funcName body remaining cfg env =
                     16
     in
     tcoLoopHelp funcName body remaining 0 initialInterval 0 0 0 innerCfg cfg env
-
-
-tcoLoopListDrain : String -> TcoAnalysis.ListDrainInfo -> Int -> Config -> Env -> EvalResult Value
-tcoLoopListDrain funcName info remaining innerCfg env =
-    if remaining <= 0 then
-        EvErr { currentModule = env.currentModule, callStack = env.callStack, error = Unsupported "Step limit exceeded" }
-
-    else
-        case Dict.get info.listArgName env.values of
-            Just (List []) ->
-                evalExpression info.baseCaseBody innerCfg env
-
-            Just (List (head :: tail)) ->
-                let
-                    envWithBindings =
-                        (case info.headBindingName of
-                            Just hName ->
-                                Environment.addValue hName head env
-
-                            Nothing ->
-                                env
-                        )
-                            |> Environment.addValue info.tailBindingName (List tail)
-                in
-                case evalExpression info.consCaseBody innerCfg envWithBindings of
-                    EvErr errData ->
-                        case errData.error of
-                            TailCall newValues ->
-                                tcoLoopListDrain funcName info (remaining - 1) innerCfg (Environment.replaceValues newValues env)
-
-                            _ ->
-                                EvErr errData
-
-                    other ->
-                        other
-
-            _ ->
-                evalExpression info.baseCaseBody innerCfg env
-
-
-{-| Fast TCO loop for provably-terminating patterns (e.g. list drain).
-No cycle detection, no fingerprinting, no size measurement. Just
-eval → extract TailCall → replace values → loop.
--}
-tcoLoopSafe : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
-tcoLoopSafe funcName body remaining innerCfg env =
-    if remaining <= 0 then
-        EvErr
-            { currentModule = env.currentModule
-            , callStack = env.callStack
-            , error = Unsupported "Step limit exceeded"
-            }
-
-    else
-        case evalExpression body innerCfg env of
-            EvYield tag payload resume ->
-                EvYield tag payload
-                    (\resumeValue ->
-                        case resume resumeValue of
-                            EvErr { error } ->
-                                case error of
-                                    TailCall newValues ->
-                                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
-
-                                    _ ->
-                                        resume resumeValue
-
-                            other ->
-                                other
-                    )
-
-            EvMemoLookup payload resume ->
-                EvMemoLookup payload
-                    (\maybeValue ->
-                        case resume maybeValue of
-                            EvErr { error } ->
-                                case error of
-                                    TailCall newValues ->
-                                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
-
-                                    _ ->
-                                        resume maybeValue
-
-                            other ->
-                                other
-                    )
-
-            EvMemoStore payload next ->
-                case next of
-                    EvErr { error } ->
-                        case error of
-                            TailCall newValues ->
-                                EvMemoStore payload
-                                    (tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env))
-
-                            _ ->
-                                EvMemoStore payload next
-
-                    _ ->
-                        EvMemoStore payload next
-
-            other ->
-                case tcoExtractTailCall other of
-                    Just newValues ->
-                        tcoLoopSafe funcName body (remaining - 1) innerCfg (Environment.replaceValues newValues env)
-
-                    Nothing ->
-                        other
 
 
 tcoLoopHelp : String -> Node Expression -> Int -> Int -> Int -> Int -> Int -> Int -> Config -> Config -> Env -> EvalResult Value
