@@ -10,6 +10,7 @@ import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..), QualifiedNameRef)
 import Elm.Syntax.Range as Range
 import Environment
+import Eval.NativeDispatch
 import Eval.Types as Types
 import EvalResult
 import FastDict as Dict exposing (Dict)
@@ -2034,7 +2035,19 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                     |> Recursion.base
 
             else
-                Recursion.base (f args cfg env)
+                -- Native-dispatch fast path: for the hottest Basics/List
+                -- calls (`+`, `-`, `*`, `/=`, `==`, `<`, ..., `::`, `++`),
+                -- skip the `twoWithError`-style selector/EvalResult wrapping
+                -- and return the result directly. When `Application` form
+                -- is used (`List.foldl (+) 0 xs`), this is the inner loop
+                -- for every element, so dropping per-call constant overhead
+                -- compounds into a real speedup on fold/map/filter bodies.
+                case Eval.NativeDispatch.tryDispatchByName moduleName name args of
+                    Just v ->
+                        Recursion.base (EvOk v)
+
+                    Nothing ->
+                        Recursion.base (f args cfg env)
 
         AstImpl (Node range (FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name)) ->
             -- Fallback for AST-based kernel references (shouldn't happen often with KernelImpl)
