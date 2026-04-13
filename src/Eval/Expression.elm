@@ -3317,7 +3317,23 @@ evalNonVariant moduleName name cfg env =
                         env.currentModuleKey
 
                     else
-                        Environment.moduleKey moduleName
+                        let
+                            rawKey : String
+                            rawKey =
+                                Environment.moduleKey moduleName
+                        in
+                        -- `import String.Diacritics as Diacritics` puts the
+                        -- raw key `"Diacritics"` in the AST but the cache is
+                        -- keyed on the canonical `"String.Diacritics"`.
+                        -- Resolve the alias before the cache lookup so
+                        -- aliased cross-module refs to heavy 0-arg constants
+                        -- don't silently re-walk the original AST.
+                        case Dict.get rawKey env.imports.aliases of
+                            Just ( _, canonicalKey ) ->
+                                canonicalKey
+
+                            Nothing ->
+                                rawKey
             in
             case
                 Dict.get precomputedModuleKey env.shared.precomputedValues

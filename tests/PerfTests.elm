@@ -3,6 +3,7 @@ module PerfTests exposing (suite)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression as Expression exposing (Expression(..))
+import Elm.Syntax.File
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Eval
 import Eval.Module
@@ -27,6 +28,7 @@ suite =
         , normalizationLosslessnessTests
         , spineCollectionTests
         , overApplicationTests
+        , aliasedPrecomputedLookupTests
         ]
 
 
@@ -277,6 +279,99 @@ normalizationLosslessnessTests =
 
                             _ ->
                                 Expect.pass
+        ]
+
+
+{-| Regression: cross-module qualified references via a module alias
+(e.g. `import String.Diacritics as Diacritics`, then
+`Diacritics.lookupArray`) must resolve to the canonical module's
+entry in `precomputedValues`, not re-walk the original AST. Before
+the fix, `evalNonVariant` keyed the cache lookup on the raw alias
+(`"Diacritics"`) which never matched the canonical key
+(`"String.Diacritics"`), so every aliased reference to an expensive
+0-arg constant silently re-evaluated it from scratch —
+`removeDiacritics` was paying the 65K-element `Array.initialize`
+cost on every character iteration.
+
+The test uses `round (1 / 0)` so the precomputed value is
+non-lossless (`Int Infinity`), which means normalization keeps the
+original expression around instead of rewriting it to a literal.
+The `recurse 50 acc` wrapper makes that re-eval cost hundreds of
+interpreter steps, so a low `maxSteps` budget distinguishes the two
+paths: a cache hit uses ~5 steps and succeeds, a cache miss walks
+the recursion and runs out of budget.
+-}
+aliasedPrecomputedLookupTests : Test
+aliasedPrecomputedLookupTests =
+    describe "aliased cross-module precomputed-value lookup"
+        [ test "aliased qualified ref hits precomputedValues cache" <|
+            \_ ->
+                let
+                    innerSource : String
+                    innerSource =
+                        """module Inner exposing (slow)
+
+slow : Int
+slow =
+    recurse 50 (round (1 / 0))
+
+
+recurse : Int -> Int -> Int
+recurse n acc =
+    if n <= 0 then
+        acc
+
+    else
+        recurse (n - 1) acc
+"""
+
+                    -- `Probe` has the `import Inner as I` alias we want
+                    -- to exercise, but we DON'T normalize it — that would
+                    -- precompute `main` to `Int Infinity` and short-circuit
+                    -- the top-level lookup before we ever hit the aliased
+                    -- `I.slow` path we're trying to test.
+                    probeSource : String
+                    probeSource =
+                        """module Probe exposing (main)
+
+import Inner as I
+
+
+main : Int
+main =
+    0
+"""
+
+                    parseFile : String -> Result String Elm.Syntax.File.File
+                    parseFile src =
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError (\_ -> "parse error")
+                in
+                case ( Eval.Module.buildProjectEnv [], parseFile innerSource ) of
+                    ( Ok baseEnv, Ok innerFile ) ->
+                        case Eval.Module.extendWithFilesNormalized baseEnv [ innerFile ] of
+                            Err _ ->
+                                Expect.fail "extendWithFilesNormalized failed"
+
+                            Ok projectEnvWithInner ->
+                                case
+                                    Eval.Module.evalWithEnvAndLimit
+                                        (Just 30)
+                                        projectEnvWithInner
+                                        [ probeSource ]
+                                        (Expression.FunctionOrValue [ "I" ] "slow")
+                                of
+                                    Ok _ ->
+                                        Expect.pass
+
+                                    Err e ->
+                                        Expect.fail
+                                            ("I.slow eval ran out of step budget — the aliased cross-module ref to Inner.slow is not hitting the precomputedValues cache. Error: "
+                                                ++ Debug.toString e
+                                            )
+
+                    _ ->
+                        Expect.fail "setup failed (parse or buildProjectEnv)"
         ]
 
 
