@@ -3,6 +3,8 @@ module Eval.ResolvedIR exposing
     , RExpr(..)
     , RLetBinding
     , RPattern(..)
+    , freeVars
+    , mkLambda
     , slotCount
     )
 
@@ -77,7 +79,11 @@ type RExpr
     | ROr RExpr RExpr
     | RCase RExpr (List ( RPattern, RExpr ))
       -- Binding forms
-    | RLambda { arity : Int, body : RExpr }
+    | RLambda
+        { arity : Int
+        , body : RExpr
+        , captureSlots : List Int
+        }
     | RLet (List RLetBinding) RExpr
       -- Applications
     | RApply RExpr (List RExpr)
@@ -232,3 +238,297 @@ and reused across runs. Until then the id is an in-process handle only.
 -}
 type alias GlobalId =
     Int
+
+
+
+-- SMART CONSTRUCTOR + FREE-VAR ANALYSIS FOR RLambda (PHASE 2)
+
+
+{-| Smart constructor for `RLambda`. Computes `captureSlots` from the body's
+free variables so the runtime can build a copy-on-capture closure containing
+only the values the body actually references, rather than the entire
+enclosing locals list.
+
+The Phase 2 runtime ignores `captureSlots` — it still captures the whole
+locals list like it always has. Phase 3 will consume the field: at
+`RLambda` eval time it will slice the current locals by `captureSlots` and
+store the fresh slice on the closure, giving the Perconti/Ahmed safe-for-
+space property without changing the storage layer from `List`.
+
+-}
+mkLambda : Int -> RExpr -> RExpr
+mkLambda arity body =
+    RLambda
+        { arity = arity
+        , body = body
+        , captureSlots = freeVarIndicesSorted arity body
+        }
+
+
+{-| Public free-var helper. Returns the set of de Bruijn indices that
+reference OUTER-SCOPE locals from the given expression, assuming the
+expression is evaluated with `binderDepth` innermost locals already bound
+by enclosing binders (lambda params, let bindings, case patterns).
+
+Indices in the returned set are re-expressed in the outer-scope frame
+(i.e. `i - binderDepth` for each `RLocal i ≥ binderDepth` in the body).
+Useful for reasoning about closure capture and for property-test
+verification.
+
+-}
+freeVars : Int -> RExpr -> List Int
+freeVars binderDepth expr =
+    collectFreeVars binderDepth expr []
+        |> dedupSortedAsc
+
+
+{-| Internal: same as `freeVars` but returns a sorted List for storing on
+`RLambda.captureSlots`. Exactly equivalent to `freeVars arity body` — the
+Phase 2 runtime uses the sorted-list form.
+-}
+freeVarIndicesSorted : Int -> RExpr -> List Int
+freeVarIndicesSorted =
+    freeVars
+
+
+{-| Collect outer-scope de Bruijn indices referenced by `expr`, assuming
+`binderDepth` innermost locals are already bound. Accumulates into `acc`
+and returns the extended list (unsorted, may contain duplicates).
+
+The algorithm is a one-pass syntactic walk. No fixpoint. For each binder
+form we recurse with a `binderDepth` shifted by the number of slots the
+binder introduces for its sub-expression:
+
+  - `RLocal i` — one entry iff `i >= binderDepth`, re-expressed as
+    `i - binderDepth` (now relative to the outer scope).
+
+  - `RLambda { arity, body }` — nested regular lambda. Its body runs with
+    `arity` extra slots bound (the nested lambda's params). `selfSlots`
+    for regular lambdas is `0`, so no self-reference offset.
+
+  - `RLet bindings body` — sequential Elm let. Walk each binding body with
+    depth shifted by the count of PRIOR binding slots. Function bindings
+    (`arity > 0`, body is an `RLambda`) see themselves inside the body at
+    slot `innerArity`, so we add `+ 1` on top of the nested lambda's
+    arity shift to account for the self-reference slot that the
+    evaluator's `selfSlots = 1` mechanism prepends at call time. The let
+    body itself runs with depth shifted by the full `totalLetSlots`.
+
+  - `RCase scrutinee branches` — scrutinee at current depth, each branch
+    body at depth shifted by the branch pattern's `slotCount`.
+
+All other forms just walk children at the current `binderDepth`.
+
+-}
+collectFreeVars : Int -> RExpr -> List Int -> List Int
+collectFreeVars binderDepth expr acc =
+    case expr of
+        RLocal i ->
+            if i >= binderDepth then
+                (i - binderDepth) :: acc
+
+            else
+                acc
+
+        RLambda lambda ->
+            -- Regular nested lambda: selfSlots = 0, so the body runs
+            -- with just `arity` additional bindings. No self-ref offset.
+            collectFreeVars (binderDepth + lambda.arity) lambda.body acc
+
+        RLet bindings letBody ->
+            let
+                totalLetSlots : Int
+                totalLetSlots =
+                    bindings
+                        |> List.foldl (\b n -> n + slotCount b.pattern) 0
+
+                walkBindings : Int -> List RLetBinding -> List Int -> List Int
+                walkBindings depth bs inner =
+                    case bs of
+                        [] ->
+                            inner
+
+                        b :: rest ->
+                            let
+                                bindingAcc : List Int
+                                bindingAcc =
+                                    case b.body of
+                                        RLambda nestedLambda ->
+                                            if b.arity > 0 then
+                                                -- let-bound recursive function:
+                                                -- selfSlots = 1 for this RLambda,
+                                                -- so walk the nested body with an
+                                                -- extra +1 on top of the nested
+                                                -- lambda's arity shift.
+                                                collectFreeVars
+                                                    (depth + nestedLambda.arity + 1)
+                                                    nestedLambda.body
+                                                    inner
+
+                                            else
+                                                -- Value binding that happens to
+                                                -- evaluate to a lambda value; no
+                                                -- self-ref (resolver never emits
+                                                -- this shape today, but handle it
+                                                -- uniformly).
+                                                collectFreeVars depth b.body inner
+
+                                        _ ->
+                                            collectFreeVars depth b.body inner
+
+                                -- Subsequent bindings see this binding's slots.
+                                newDepth : Int
+                                newDepth =
+                                    depth + slotCount b.pattern
+                            in
+                            walkBindings newDepth rest bindingAcc
+
+                bindingsAcc : List Int
+                bindingsAcc =
+                    walkBindings binderDepth bindings acc
+
+                bodyAcc : List Int
+                bodyAcc =
+                    collectFreeVars (binderDepth + totalLetSlots) letBody bindingsAcc
+            in
+            bodyAcc
+
+        RCase scrutinee branches ->
+            let
+                scrutAcc : List Int
+                scrutAcc =
+                    collectFreeVars binderDepth scrutinee acc
+            in
+            branches
+                |> List.foldl
+                    (\( pat, branchBody ) inner ->
+                        collectFreeVars (binderDepth + slotCount pat) branchBody inner
+                    )
+                    scrutAcc
+
+        RIf cond t f ->
+            acc
+                |> collectFreeVars binderDepth cond
+                |> collectFreeVars binderDepth t
+                |> collectFreeVars binderDepth f
+
+        RAnd a b ->
+            acc
+                |> collectFreeVars binderDepth a
+                |> collectFreeVars binderDepth b
+
+        ROr a b ->
+            acc
+                |> collectFreeVars binderDepth a
+                |> collectFreeVars binderDepth b
+
+        RApply head args ->
+            let
+                headAcc : List Int
+                headAcc =
+                    collectFreeVars binderDepth head acc
+            in
+            args
+                |> List.foldl (collectFreeVars binderDepth) headAcc
+
+        RNegate inner ->
+            collectFreeVars binderDepth inner acc
+
+        RList items ->
+            items
+                |> List.foldl (collectFreeVars binderDepth) acc
+
+        RTuple2 a b ->
+            acc
+                |> collectFreeVars binderDepth a
+                |> collectFreeVars binderDepth b
+
+        RTuple3 a b c ->
+            acc
+                |> collectFreeVars binderDepth a
+                |> collectFreeVars binderDepth b
+                |> collectFreeVars binderDepth c
+
+        RRecord fields ->
+            fields
+                |> List.foldl (\( _, e ) inner -> collectFreeVars binderDepth e inner) acc
+
+        RRecordAccess inner _ ->
+            collectFreeVars binderDepth inner acc
+
+        RRecordUpdate i fields ->
+            let
+                base : List Int
+                base =
+                    if i >= binderDepth then
+                        (i - binderDepth) :: acc
+
+                    else
+                        acc
+            in
+            fields
+                |> List.foldl (\( _, e ) inner -> collectFreeVars binderDepth e inner) base
+
+        -- Leaf forms: no free vars
+        RGlobal _ ->
+            acc
+
+        RInt _ ->
+            acc
+
+        RFloat _ ->
+            acc
+
+        RString _ ->
+            acc
+
+        RChar _ ->
+            acc
+
+        RUnit ->
+            acc
+
+        RCtor _ ->
+            acc
+
+        RRecordAccessFunction _ ->
+            acc
+
+        RGLSL ->
+            acc
+
+
+{-| Sort ascending and dedupe a list of ints. Produces a canonical form so
+`captureSlots` is stable across resolver runs (Phase 5 content-addressing
+will care). Uses `List.sort` + a linear pass rather than a Set for small
+lists — typical lambda free-var sets are 0–5 elements.
+-}
+dedupSortedAsc : List Int -> List Int
+dedupSortedAsc xs =
+    xs
+        |> List.sort
+        |> dedupeSortedList
+
+
+dedupeSortedList : List Int -> List Int
+dedupeSortedList sorted =
+    case sorted of
+        [] ->
+            []
+
+        x :: rest ->
+            x :: dedupeHelp x rest
+
+
+dedupeHelp : Int -> List Int -> List Int
+dedupeHelp prev remaining =
+    case remaining of
+        [] ->
+            []
+
+        x :: rest ->
+            if x == prev then
+                dedupeHelp prev rest
+
+            else
+                x :: dedupeHelp x rest

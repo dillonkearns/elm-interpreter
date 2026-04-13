@@ -10,6 +10,7 @@ suite =
     describe "Eval.ResolvedIR"
         [ slotCountTests
         , constructionTests
+        , freeVarsTests
         ]
 
 
@@ -115,7 +116,7 @@ constructionTests =
             \_ ->
                 let
                     identityLambda =
-                        IR.RLambda { arity = 1, body = IR.RLocal 0 }
+                        IR.mkLambda 1 (IR.RLocal 0)
                 in
                 case identityLambda of
                     IR.RLambda { arity, body } ->
@@ -131,10 +132,10 @@ constructionTests =
                 -- be structurally identical.
                 let
                     lamX =
-                        IR.RLambda { arity = 1, body = IR.RLocal 0 }
+                        IR.mkLambda 1 (IR.RLocal 0)
 
                     lamY =
-                        IR.RLambda { arity = 1, body = IR.RLocal 0 }
+                        IR.mkLambda 1 (IR.RLocal 0)
                 in
                 lamX |> Expect.equal lamY
         , test "const lambda (\\x y -> x) has arity 2 and body RLocal 1" <|
@@ -144,10 +145,7 @@ constructionTests =
                 -- body is `RLocal 1`.
                 let
                     constLambda =
-                        IR.RLambda
-                            { arity = 2
-                            , body = IR.RLocal 1
-                            }
+                        IR.mkLambda 2 (IR.RLocal 1)
                 in
                 case constLambda of
                     IR.RLambda { arity, body } ->
@@ -243,4 +241,248 @@ constructionTests =
 
                     _ ->
                         Expect.fail "expected RApply"
+        ]
+
+
+freeVarsTests : Test
+freeVarsTests =
+    describe "freeVars and mkLambda captureSlots"
+        [ test "closed lambda: identity has no free vars" <|
+            \_ ->
+                -- \x -> x
+                -- Body is RLocal 0; arity is 1. Body's slot 0 is the param,
+                -- so no outer-scope references.
+                case IR.mkLambda 1 (IR.RLocal 0) of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal []
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "closed lambda: const has no free vars" <|
+            \_ ->
+                -- \x y -> x
+                -- Body is RLocal 1; arity is 2. Slot 1 is the outer param,
+                -- still bound, so no captures.
+                case IR.mkLambda 2 (IR.RLocal 1) of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal []
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "single capture: \\y -> outer" <|
+            \_ ->
+                -- In an outer scope with one local [outer], the lambda
+                -- `\y -> outer` has body = RLocal 1. arity = 1. Slot 1 is
+                -- beyond the lambda's params, so it's a capture of outer
+                -- slot 0.
+                case IR.mkLambda 1 (IR.RLocal 1) of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal [ 0 ]
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "sorted deduplicated captures" <|
+            \_ ->
+                -- \x -> (outer0, outer2, outer0, outer1)
+                -- Body references outer slots 0, 2, 0, 1 (duplicates and
+                -- out of order). After dedup + sort, captureSlots should
+                -- be [0, 1, 2].
+                let
+                    body =
+                        IR.RList
+                            [ IR.RLocal 1 -- outer 0 (skipped by arity=1)
+                            , IR.RLocal 3 -- outer 2
+                            , IR.RLocal 1 -- outer 0 (dup)
+                            , IR.RLocal 2 -- outer 1
+                            ]
+                in
+                case IR.mkLambda 1 body of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal [ 0, 1, 2 ]
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "nested lambda: captures are in outermost-relative coordinates" <|
+            \_ ->
+                -- Outer = \a -> \b -> (a, b, outerCaptured)
+                -- Inner body references RLocal 0 (= b), RLocal 1 (= a,
+                -- still bound by the outer), and RLocal 2 (= outer
+                -- captured slot 0). For the INNER lambda with arity 1,
+                -- captureSlots = [ 0, 1 ] — it captures a from outer
+                -- plus outerCaptured from outside the outer.
+                --
+                -- For the OUTER lambda with arity 1 (just param a), the
+                -- inner lambda references outer slot 2 (= outerCaptured),
+                -- which is outer-scope slot 1 from the outer lambda's POV
+                -- (after a is bound). So outer captureSlots = [ 0 ].
+                let
+                    inner =
+                        IR.mkLambda 1
+                            (IR.RList
+                                [ IR.RLocal 0 -- b (inner param)
+                                , IR.RLocal 1 -- a (outer param, bound by outer)
+                                , IR.RLocal 2 -- outer captured (slot 0 from inner view)
+                                ]
+                            )
+
+                    outer =
+                        IR.mkLambda 1 inner
+                in
+                case ( inner, outer ) of
+                    ( IR.RLambda innerLambda, IR.RLambda outerLambda ) ->
+                        Expect.all
+                            [ \_ -> innerLambda.captureSlots |> Expect.equal [ 0, 1 ]
+                            , \_ -> outerLambda.captureSlots |> Expect.equal [ 0 ]
+                            ]
+                            ()
+
+                    _ ->
+                        Expect.fail "expected two RLambdas"
+        , test "let binding: body sees let slots as bound" <|
+            \_ ->
+                -- \x -> let y = x in y
+                -- body = RLet [{pat=RPVar, arity=0, body=RLocal 0, ...}] (RLocal 0)
+                -- The let binding body "RLocal 0" is x (outer) — bound within
+                -- the lambda. The let result body "RLocal 0" is y (the let's
+                -- own binding, also bound). So outer captureSlots = [].
+                let
+                    body =
+                        IR.RLet
+                            [ { pattern = IR.RPVar
+                              , arity = 0
+                              , body = IR.RLocal 0
+                              , debugName = "y"
+                              }
+                            ]
+                            (IR.RLocal 0)
+                in
+                case IR.mkLambda 1 body of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal []
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "let binding: captures from binding body propagate" <|
+            \_ ->
+                -- Lambda with arity 0 + let body references outer slot 1
+                -- inside the let value binding.
+                --
+                -- mkLambda 0 (RLet [{pat=RPVar, arity=0, body=RLocal 1, ...}] (RLocal 0))
+                -- arity = 0 → outer binderDepth starts at 0.
+                -- binding body RLocal 1 at depth 0 (pre-binding) → captures
+                -- outer slot 1. Let body RLocal 0 at depth 1 (post-binding)
+                -- → refers to the let binding itself, no capture.
+                -- Expected captureSlots = [ 1 ].
+                let
+                    body =
+                        IR.RLet
+                            [ { pattern = IR.RPVar
+                              , arity = 0
+                              , body = IR.RLocal 1
+                              , debugName = "y"
+                              }
+                            ]
+                            (IR.RLocal 0)
+                in
+                case IR.mkLambda 0 body of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal [ 1 ]
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "case pattern: branches see pattern slots as bound" <|
+            \_ ->
+                -- \x -> case x of (a, b) -> a
+                -- The case scrutinee is RLocal 0 (x), bound. The branch
+                -- body RLocal 1 refers to `a` which is the innermost
+                -- pattern binding after (a, b) is destructured. The slot
+                -- layout inside the branch: locals = [b, a, x, ...outer].
+                -- RLocal 1 = a, bound. No captures.
+                let
+                    body =
+                        IR.RCase (IR.RLocal 0)
+                            [ ( IR.RPTuple2 IR.RPVar IR.RPVar, IR.RLocal 1 )
+                            ]
+                in
+                case IR.mkLambda 1 body of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal []
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "case pattern: branch body capture propagates" <|
+            \_ ->
+                -- \x -> case x of (a, b) -> outerCaptured
+                -- Lambda arity = 1. Scrutinee RLocal 0 is x (param, bound).
+                -- Branch body is RLocal 3: inside the branch locals =
+                -- [b, a, x, outerCaptured, ...], slot 3 = outerCaptured.
+                -- From the lambda's outer scope perspective, that's slot 0.
+                let
+                    body =
+                        IR.RCase (IR.RLocal 0)
+                            [ ( IR.RPTuple2 IR.RPVar IR.RPVar, IR.RLocal 3 )
+                            ]
+                in
+                case IR.mkLambda 1 body of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal [ 0 ]
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "let-bound recursive function: self-ref is not a capture" <|
+            \_ ->
+                -- Lambda arity = 0 containing:
+                --   let f x = f in f
+                --
+                -- The let binding's body is an RLambda with arity = 1 and
+                -- binding.arity = 1 (function binding → selfSlots = 1 at
+                -- call time). Inside the inner lambda body, RLocal 1 is
+                -- `f` (the self slot). That's NOT a capture from outside
+                -- the outer lambda — it's the let-bound self-ref.
+                --
+                -- Expected: captureSlots = [].
+                let
+                    innerLambda =
+                        IR.mkLambda 1 (IR.RLocal 1)
+
+                    body =
+                        IR.RLet
+                            [ { pattern = IR.RPVar
+                              , arity = 1
+                              , body = innerLambda
+                              , debugName = "f"
+                              }
+                            ]
+                            (IR.RLocal 0)
+                in
+                case IR.mkLambda 0 body of
+                    IR.RLambda lambda ->
+                        lambda.captureSlots |> Expect.equal []
+
+                    _ ->
+                        Expect.fail "expected RLambda"
+        , test "freeVars on closed expression returns []" <|
+            \_ ->
+                -- \x y -> x + y (where + is some RGlobal). Arity 2, body
+                -- references slots 0 and 1 (both bound). No captures.
+                let
+                    body =
+                        IR.RApply (IR.RGlobal 1) [ IR.RLocal 0, IR.RLocal 1 ]
+                in
+                IR.freeVars 2 body |> Expect.equal []
+        , test "freeVars is sorted and deduped" <|
+            \_ ->
+                -- RList with out-of-order duplicate captures. freeVars
+                -- returns sorted ascending with no duplicates.
+                let
+                    body =
+                        IR.RList
+                            [ IR.RLocal 5
+                            , IR.RLocal 2
+                            , IR.RLocal 5
+                            , IR.RLocal 3
+                            , IR.RLocal 2
+                            ]
+                in
+                IR.freeVars 0 body |> Expect.equal [ 2, 3, 5 ]
         ]

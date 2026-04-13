@@ -393,7 +393,7 @@ letTests =
                 -- let f x = x in f 42
                 let
                     identityLambda =
-                        RLambda { arity = 1, body = RLocal 0 }
+                        IR.mkLambda 1 (RLocal 0)
 
                     program =
                         RLet
@@ -418,7 +418,7 @@ lambdaTests =
                 -- (\x -> x) 7
                 RE.evalR RE.emptyREnv
                     (RApply
-                        (RLambda { arity = 1, body = RLocal 0 })
+                        (IR.mkLambda 1 (RLocal 0))
                         [ RInt 7 ]
                     )
                     |> expectValue (Int 7)
@@ -428,7 +428,7 @@ lambdaTests =
                 -- Body is RLocal 1 (outer x, after y gets pushed)
                 RE.evalR RE.emptyREnv
                     (RApply
-                        (RLambda { arity = 2, body = RLocal 1 })
+                        (IR.mkLambda 2 (RLocal 1))
                         [ RInt 1, RInt 2 ]
                     )
                     |> expectValue (Int 1)
@@ -438,7 +438,7 @@ lambdaTests =
                 case
                     RE.evalR RE.emptyREnv
                         (RApply
-                            (RLambda { arity = 2, body = RLocal 1 })
+                            (IR.mkLambda 2 (RLocal 1))
                             [ RInt 1 ]
                         )
                 of
@@ -457,7 +457,7 @@ lambdaTests =
                 case
                     RE.evalR RE.emptyREnv
                         (RApply
-                            (RLambda { arity = 2, body = RLocal 1 })
+                            (IR.mkLambda 2 (RLocal 1))
                             [ RInt 1 ]
                         )
                 of
@@ -503,10 +503,7 @@ lambdaTests =
                         withLocals [ Int 100 ]
 
                     lambda =
-                        RLambda
-                            { arity = 1
-                            , body = RTuple2 (RLocal 0) (RLocal 1)
-                            }
+                        IR.mkLambda 1 (RTuple2 (RLocal 0) (RLocal 1))
                 in
                 RE.evalR env (RApply lambda [ RInt 7 ])
                     |> expectValue (Tuple (Int 7) (Int 100))
@@ -523,7 +520,7 @@ applyTests =
                 -- a no-op rather than a crash.
                 let
                     lambda =
-                        RLambda { arity = 1, body = RLocal 0 }
+                        IR.mkLambda 1 (RLocal 0)
                 in
                 case RE.evalR RE.emptyREnv (RApply lambda []) of
                     EvOk (PartiallyApplied _ [] _ _ _ 1) ->

@@ -166,10 +166,7 @@ resolveDeclaration ctx impl =
                         resolveExpression innerCtx rewrittenBody
                             |> Result.map
                                 (\body ->
-                                    RLambda
-                                        { arity = List.length rewrittenArgs
-                                        , body = body
-                                        }
+                                    IR.mkLambda (List.length rewrittenArgs) body
                                 )
                     )
 
@@ -531,10 +528,7 @@ resolveLambda ctx lambda =
                 resolveExpression innerCtx rewrittenBody
                     |> Result.map
                         (\body ->
-                            RLambda
-                                { arity = List.length rewrittenArgs
-                                , body = body
-                                }
+                            IR.mkLambda (List.length rewrittenArgs) body
                         )
             )
 
@@ -798,11 +792,7 @@ resolveLetFunction ctx state impl =
                                     { bindings =
                                         { pattern = RPVar
                                         , arity = List.length rewrittenArgs
-                                        , body =
-                                            RLambda
-                                                { arity = List.length rewrittenArgs
-                                                , body = body
-                                                }
+                                        , body = IR.mkLambda (List.length rewrittenArgs) body
                                         , debugName = name
                                         }
                                             :: state.bindings

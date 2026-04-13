@@ -92,11 +92,11 @@ answer =
                         [ \_ ->
                             bodiesFor "identity"
                                 |> Expect.equal
-                                    (Just (IR.RLambda { arity = 1, body = IR.RLocal 0 }))
+                                    (Just (IR.mkLambda 1 (IR.RLocal 0)))
                         , \_ ->
                             bodiesFor "constant"
                                 |> Expect.equal
-                                    (Just (IR.RLambda { arity = 2, body = IR.RLocal 1 }))
+                                    (Just (IR.mkLambda 2 (IR.RLocal 1)))
                         , \_ ->
                             bodiesFor "answer"
                                 |> Expect.equal (Just (IR.RInt 42))

@@ -4,7 +4,7 @@ import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression exposing (Expression)
 import Elm.Syntax.Node as Node exposing (Node(..))
-import Eval.ResolvedIR exposing (RExpr(..), RPattern(..))
+import Eval.ResolvedIR as IR exposing (RExpr(..), RPattern(..))
 import Eval.Resolver as Resolver exposing (ResolveError(..), ResolverContext)
 import Expect
 import FastDict
@@ -178,8 +178,8 @@ stripDebugNames expr =
             RCase (stripDebugNames scrut)
                 (List.map (\( p, b ) -> ( p, stripDebugNames b )) branches)
 
-        RLambda { arity, body } ->
-            RLambda { arity = arity, body = stripDebugNames body }
+        RLambda lambda ->
+            IR.mkLambda lambda.arity (stripDebugNames lambda.body)
 
         RLet bindings body ->
             RLet
@@ -288,19 +288,19 @@ lambdaTests =
         [ test "identity: \\x -> x" <|
             \_ ->
                 expectResolvesTo "\\x -> x"
-                    (RLambda { arity = 1, body = RLocal 0 })
+                    (IR.mkLambda 1 (RLocal 0))
         , test "const: \\x y -> x (outer var is RLocal 1)" <|
             \_ ->
                 expectResolvesTo "\\x y -> x"
-                    (RLambda { arity = 2, body = RLocal 1 })
+                    (IR.mkLambda 2 (RLocal 1))
         , test "flip: \\x y -> y (inner var is RLocal 0)" <|
             \_ ->
                 expectResolvesTo "\\x y -> y"
-                    (RLambda { arity = 2, body = RLocal 0 })
+                    (IR.mkLambda 2 (RLocal 0))
         , test "wildcard parameter" <|
             \_ ->
                 expectResolvesTo "\\_ -> 42"
-                    (RLambda { arity = 1, body = RInt 42 })
+                    (IR.mkLambda 1 (RInt 42))
         , test "destructuring parameter desugars to let" <|
             \_ ->
                 -- `\(a, b) -> a` desugars to `\$_arg0 -> let (a, b) = $_arg0 in a`.
@@ -315,34 +315,30 @@ lambdaTests =
                 -- evaluating each binding's RHS and prepending the
                 -- pattern's bindings to the locals stack in order.
                 expectResolvesTo "\\( a, b ) -> a"
-                    (RLambda
-                        { arity = 1
-                        , body =
-                            RLet
-                                [ { pattern = RPTuple2 RPVar RPVar
-                                  , arity = 0
-                                  , body = RLocal 0
-                                  , debugName = "a"
-                                  }
-                                ]
-                                (RLocal 1)
-                        }
+                    (IR.mkLambda 1
+                        (RLet
+                            [ { pattern = RPTuple2 RPVar RPVar
+                              , arity = 0
+                              , body = RLocal 0
+                              , debugName = "a"
+                              }
+                            ]
+                            (RLocal 1)
+                        )
                     )
         , test "destructuring with reference to second var" <|
             \_ ->
                 expectResolvesTo "\\( a, b ) -> b"
-                    (RLambda
-                        { arity = 1
-                        , body =
-                            RLet
-                                [ { pattern = RPTuple2 RPVar RPVar
-                                  , arity = 0
-                                  , body = RLocal 0
-                                  , debugName = "a"
-                                  }
-                                ]
-                                (RLocal 0)
-                        }
+                    (IR.mkLambda 1
+                        (RLet
+                            [ { pattern = RPTuple2 RPVar RPVar
+                              , arity = 0
+                              , body = RLocal 0
+                              , debugName = "a"
+                              }
+                            ]
+                            (RLocal 0)
+                        )
                     )
         ]
 
@@ -361,31 +357,23 @@ applicationTests =
         , test "applying a local to a global" <|
             \_ ->
                 expectResolvesTo "\\f -> f helper"
-                    (RLambda
-                        { arity = 1
-                        , body = RApply (RLocal 0) [ RGlobal 100 ]
-                        }
-                    )
+                    (IR.mkLambda 1 (RApply (RLocal 0) [ RGlobal 100 ]))
         , test "lambda passed as an argument (List.map idiom)" <|
             \_ ->
                 -- The classic `List.map (\x -> x * 2) xs` idiom. Verifies
                 -- that nested scopes compose correctly through applications.
                 expectResolvesTo "\\xs -> List.map (\\x -> x * 2) xs"
-                    (RLambda
-                        { arity = 1
-                        , body =
-                            RApply (RGlobal 21)
-                                [ RLambda
-                                    { arity = 1
-                                    , body =
-                                        RApply (RGlobal 3)
-                                            [ RLocal 0
-                                            , RInt 2
-                                            ]
-                                    }
-                                , RLocal 0
-                                ]
-                        }
+                    (IR.mkLambda 1
+                        (RApply (RGlobal 21)
+                            [ IR.mkLambda 1
+                                (RApply (RGlobal 3)
+                                    [ RLocal 0
+                                    , RInt 2
+                                    ]
+                                )
+                            , RLocal 0
+                            ]
+                        )
                     )
         ]
 
@@ -412,19 +400,11 @@ operatorTests =
         , test "&& stays as RAnd (short-circuit preserved)" <|
             \_ ->
                 expectResolvesTo "\\a b -> a && b"
-                    (RLambda
-                        { arity = 2
-                        , body = RAnd (RLocal 1) (RLocal 0)
-                        }
-                    )
+                    (IR.mkLambda 2 (RAnd (RLocal 1) (RLocal 0)))
         , test "|| stays as ROr" <|
             \_ ->
                 expectResolvesTo "\\a b -> a || b"
-                    (RLambda
-                        { arity = 2
-                        , body = ROr (RLocal 1) (RLocal 0)
-                        }
-                    )
+                    (IR.mkLambda 2 (ROr (RLocal 1) (RLocal 0)))
         , test "|> desugars to direct RApply (no Basics.apR indirection)" <|
             \_ ->
                 -- `1 |> helper` should become `helper 1`, i.e., RApply helper [1]
@@ -452,11 +432,7 @@ controlFlowTests =
         , test "nested if in lambda" <|
             \_ ->
                 expectResolvesTo "\\x -> if x then 1 else 2"
-                    (RLambda
-                        { arity = 1
-                        , body = RIf (RLocal 0) (RInt 1) (RInt 2)
-                        }
-                    )
+                    (IR.mkLambda 1 (RIf (RLocal 0) (RInt 1) (RInt 2)))
         ]
 
 
@@ -481,7 +457,7 @@ letTests =
                     (RLet
                         [ { pattern = RPVar
                           , arity = 1
-                          , body = RLambda { arity = 1, body = RLocal 0 }
+                          , body = IR.mkLambda 1 (RLocal 0)
                           , debugName = "f"
                           }
                         ]
@@ -614,22 +590,16 @@ recordTests =
                 -- \r -> { r | x = 1 }
                 -- r is the only local (RLocal 0), update targets it
                 expectResolvesTo "\\r -> { r | x = 1 }"
-                    (RLambda
-                        { arity = 1
-                        , body = RRecordUpdate 0 [ ( "x", RInt 1 ) ]
-                        }
-                    )
+                    (IR.mkLambda 1 (RRecordUpdate 0 [ ( "x", RInt 1 ) ]))
         , test "record update sorts fields" <|
             \_ ->
                 expectResolvesTo "\\r -> { r | b = 2, a = 1 }"
-                    (RLambda
-                        { arity = 1
-                        , body =
-                            RRecordUpdate 0
-                                [ ( "a", RInt 1 )
-                                , ( "b", RInt 2 )
-                                ]
-                        }
+                    (IR.mkLambda 1
+                        (RRecordUpdate 0
+                            [ ( "a", RInt 1 )
+                            , ( "b", RInt 2 )
+                            ]
+                        )
                     )
         ]
 
@@ -689,29 +659,22 @@ shadowingTests =
                 -- Outer x is at slot 1, inner x is at slot 0.
                 -- Reference resolves to the innermost (slot 0).
                 expectResolvesTo "\\x -> \\x -> x"
-                    (RLambda
-                        { arity = 1
-                        , body =
-                            RLambda { arity = 1, body = RLocal 0 }
-                        }
-                    )
+                    (IR.mkLambda 1 (IR.mkLambda 1 (RLocal 0)))
         , test "let binding shadows outer lambda parameter" <|
             \_ ->
                 -- \x -> let x = 1 in x
                 -- Outer x at slot 1, let x at slot 0.
                 expectResolvesTo "\\x -> let y = 1 in y"
-                    (RLambda
-                        { arity = 1
-                        , body =
-                            RLet
-                                [ { pattern = RPVar
-                                  , arity = 0
-                                  , body = RInt 1
-                                  , debugName = "y"
-                                  }
-                                ]
-                                (RLocal 0)
-                        }
+                    (IR.mkLambda 1
+                        (RLet
+                            [ { pattern = RPVar
+                              , arity = 0
+                              , body = RInt 1
+                              , debugName = "y"
+                              }
+                            ]
+                            (RLocal 0)
+                        )
                     )
         ]
 
