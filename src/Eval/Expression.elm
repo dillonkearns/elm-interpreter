@@ -1771,106 +1771,92 @@ kernelAppend args cfg env =
             EvalResult.fail <| typeError env "Append needs exactly two arguments"
 
 
+{-| Compare a list's length to `n` without walking the whole list when
+one side clearly dominates. Short-circuits the moment we know the
+result, so for a length-3 list against arity 2 we stop after 2 cons
+cells. Used by `evalApplication`'s saturated fast path to pick
+between exact-match (run the body), under-applied (build one
+`PartiallyApplied`), and over-applied (fall to the general path).
+-}
+compareListLength : List a -> Int -> Order
+compareListLength list n =
+    case list of
+        [] ->
+            if n == 0 then
+                EQ
+
+            else
+                LT
+
+        _ :: rest ->
+            if n <= 0 then
+                GT
+
+            else
+                compareListLength rest (n - 1)
+
+
+{-| Walk a list of argument expressions, evaluating each via the hot
+`evalOrRecurse` path (so simple args — literals, refs — never
+trampoline), accumulating values in reverse, then hand the reversed
+list to the continuation. Shared by `evalApplication`'s saturated
+path for any arity; replaces the old hand-unrolled 1/2/3/4-arg fast
+paths.
+-}
+evalArgsThen : List (Node Expression) -> Config -> Env -> (List Value -> PartialResult Value) -> PartialResult Value
+evalArgsThen args cfg env k =
+    evalArgsThenHelp args cfg env [] k
+
+
+evalArgsThenHelp : List (Node Expression) -> Config -> Env -> List Value -> (List Value -> PartialResult Value) -> PartialResult Value
+evalArgsThenHelp args cfg env accRev k =
+    case args of
+        [] ->
+            k (List.reverse accRev)
+
+        arg :: rest ->
+            evalOrRecurse ( arg, cfg, env )
+                (\value ->
+                    evalArgsThenHelp rest cfg env (value :: accRev) k
+                )
+
+
 evalApplication : Node Expression -> List (Node Expression) -> PartialEval Value
 evalApplication first rest cfg env =
     let
         inner : Env -> List Value -> List (Node Pattern) -> Maybe QualifiedNameRef -> Implementation -> Int -> PartialResult Value
         inner localEnv oldArgs patterns maybeQualifiedName implementation patternsLength =
-            case ( oldArgs, rest ) of
-                ( [], [ singleArg ] ) ->
-                    -- Fast path: single argument, no oldArgs, exactly 1 new arg
-                    -- Pattern match on patterns list to avoid List.length
-                    case patterns of
-                        [ _ ] ->
-                            -- Exactly 1 pattern: fully applied
-                            evalOrRecurse ( singleArg, cfg, env )
-                                (\argValue ->
-                                    evalFullyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation cfg env
-                                )
+            if List.isEmpty oldArgs then
+                case compareListLength rest patternsLength of
+                    EQ ->
+                        -- Saturated call: arg count matches arity exactly.
+                        -- Eval all args via the hot path, then run the body.
+                        evalArgsThen rest cfg env
+                            (\args ->
+                                evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env
+                            )
 
-                        _ :: _ :: _ ->
-                            -- 2+ patterns: still partially applied after 1 arg
-                            evalOrRecurse ( singleArg, cfg, env )
-                                (\argValue ->
-                                    Types.succeedPartial <| Value.mkPartiallyApplied localEnv [ argValue ] patterns maybeQualifiedName implementation
-                                )
+                    LT ->
+                        -- Under-application: fewer args than patterns.
+                        -- Eval all args and build one PartiallyApplied with
+                        -- the accumulated args; no closure chain.
+                        evalArgsThen rest cfg env
+                            (\args ->
+                                Types.succeedPartial <| Value.mkPartiallyApplied localEnv args patterns maybeQualifiedName implementation
+                            )
 
-                        [] ->
-                            -- 0 patterns with 1 arg: need general path (splitting)
-                            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+                    GT ->
+                        -- Over-application: fall through to the general
+                        -- path, which splits rest into (used, leftover)
+                        -- and chains the inner result into
+                        -- applyValueToExprs for the leftover.
+                        evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
-                ( [], [ arg1, arg2 ] ) ->
-                    -- Fast path: two arguments, no oldArgs
-                    case patterns of
-                        [ _, _ ] ->
-                            -- Exactly 2 patterns: fully applied
-                            evalOrRecurse ( arg1, cfg, env )
-                                (\val1 ->
-                                    evalOrRecurse ( arg2, cfg, env )
-                                        (\val2 ->
-                                            evalFullyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation cfg env
-                                        )
-                                )
-
-                        _ :: _ :: _ :: _ ->
-                            -- 3+ patterns: still partially applied after 2 args
-                            evalOrRecurse ( arg1, cfg, env )
-                                (\val1 ->
-                                    evalOrRecurse ( arg2, cfg, env )
-                                        (\val2 ->
-                                            Types.succeedPartial <| Value.mkPartiallyApplied localEnv [ val1, val2 ] patterns maybeQualifiedName implementation
-                                        )
-                                )
-
-                        _ ->
-                            -- 0 or 1 pattern with 2 args: need general path (splitting)
-                            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
-
-                ( [], [ arg1, arg2, arg3 ] ) ->
-                    -- Fast path: three arguments, no oldArgs (A3 shape).
-                    -- Extends Item 4's saturated-call fast path beyond the
-                    -- existing 1- and 2-arg cases. For `foo a b c` where
-                    -- `foo` is an arity-3 AstImpl / KernelImpl, skip the
-                    -- splitAt / List.length dance in `evalApplicationGeneral`.
-                    case patterns of
-                        [ _, _, _ ] ->
-                            evalOrRecurse ( arg1, cfg, env )
-                                (\val1 ->
-                                    evalOrRecurse ( arg2, cfg, env )
-                                        (\val2 ->
-                                            evalOrRecurse ( arg3, cfg, env )
-                                                (\val3 ->
-                                                    evalFullyApplied localEnv [ val1, val2, val3 ] patterns maybeQualifiedName implementation cfg env
-                                                )
-                                        )
-                                )
-
-                        _ ->
-                            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
-
-                ( [], [ arg1, arg2, arg3, arg4 ] ) ->
-                    -- Fast path: four arguments, no oldArgs (A4 shape).
-                    case patterns of
-                        [ _, _, _, _ ] ->
-                            evalOrRecurse ( arg1, cfg, env )
-                                (\val1 ->
-                                    evalOrRecurse ( arg2, cfg, env )
-                                        (\val2 ->
-                                            evalOrRecurse ( arg3, cfg, env )
-                                                (\val3 ->
-                                                    evalOrRecurse ( arg4, cfg, env )
-                                                        (\val4 ->
-                                                            evalFullyApplied localEnv [ val1, val2, val3, val4 ] patterns maybeQualifiedName implementation cfg env
-                                                        )
-                                                )
-                                        )
-                                )
-
-                        _ ->
-                            evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
-
-                _ ->
-                    evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+            else
+                -- Pre-accumulated args from a curried partial application:
+                -- the general path knows how to combine oldArgs with rest
+                -- before dispatching.
+                evalApplicationGeneralCompute rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
     in
     evalOrRecurse ( first, cfg, env )
         (\firstValue ->
