@@ -86,11 +86,11 @@ mapResumeAfterFx f rest acc cfg env fxResult =
             EvMemoStore payload
                 (mapResumeAfterFx f rest acc cfg env next)
 
-        EvOkCoverage mapped _ ->
-            mapHelp f rest (mapped :: acc) cfg env
+        EvOkCoverage mapped coverageSet ->
+            EvalResult.mergeCoverageInto coverageSet (mapHelp f rest (mapped :: acc) cfg env)
 
-        EvErrCoverage e _ ->
-            EvErr e
+        EvErrCoverage e coverageSet ->
+            EvErrCoverage e coverageSet
 
 
 {-| Like `attachTrace` but for `EvalResult (List Value)` — used inside
@@ -428,6 +428,12 @@ Elements are inserted one at a time (left-to-right) from the input list into
 the sorted accumulator. For equal elements, the new element is placed after
 existing equal elements, preserving original order.
 
+Tail-recursive in the `EvOk` happy path so Elm TCO compiles to a `while`
+loop — sorting N-element lists uses O(1) JS stack frames rather than O(N).
+This matters when the interpreter drives large sorts like
+`Fuzz.Float.exponentMapping` (2048 elements): the old continuation-wrapped
+form blew the JS stack during normalization-time eval.
+
 -}
 insertionSort : (Value -> Eval (Value -> Eval Order)) -> List Value -> List Value -> Eval (List Value)
 insertionSort compare sorted unsorted cfg env =
@@ -436,37 +442,92 @@ insertionSort compare sorted unsorted cfg env =
             EvalResult.succeed sorted
 
         x :: rest ->
-            insert compare x sorted cfg env
-                |> EvalResult.andThen (\newSorted -> insertionSort compare newSorted rest cfg env)
+            case insertHelp compare x [] sorted cfg env of
+                EvOk newSorted ->
+                    insertionSort compare newSorted rest cfg env
+
+                EvErr e ->
+                    EvErr e
+
+                other ->
+                    -- Cold path: yields/traces/coverage — fall back to
+                    -- andThen so EvalResult helpers handle propagation.
+                    other
+                        |> EvalResult.andThen
+                            (\newSorted -> insertionSort compare newSorted rest cfg env)
 
 
-{-| Insert a value into a sorted list at the correct position.
+{-| Insert a value into a sorted list at the correct position using an
+explicit `prefix` accumulator (reversed "already walked past" elements),
+so the happy path is directly tail-recursive and Elm can TCO it.
 
   - LT: place x before y (x is smaller)
   - EQ or GT: skip past y and keep looking (preserves stability for EQ)
 
 -}
-insert : (Value -> Eval (Value -> Eval Order)) -> Value -> List Value -> Eval (List Value)
-insert compare x sorted cfg env =
+insertHelp : (Value -> Eval (Value -> Eval Order)) -> Value -> List Value -> List Value -> Eval (List Value)
+insertHelp compare x prefix sorted cfg env =
     case sorted of
         [] ->
-            EvalResult.succeed [ x ]
+            EvalResult.succeed (reverseAppend prefix [ x ])
 
         y :: rest ->
-            compare x cfg env
-                |> EvalResult.andThen (\compareWithY -> compareWithY y cfg env)
-                |> EvalResult.andThen
-                    (\ord ->
-                        case ord of
-                            LT ->
-                                -- x < y: x goes before y
-                                EvalResult.succeed (x :: y :: rest)
+            case compare x cfg env of
+                EvOk compareWithY ->
+                    case compareWithY y cfg env of
+                        EvOk LT ->
+                            EvalResult.succeed (reverseAppend prefix (x :: y :: rest))
 
-                            _ ->
-                                -- EQ or GT: skip past y, keep looking
-                                insert compare x rest cfg env
-                                    |> EvalResult.map (\inserted -> y :: inserted)
-                    )
+                        EvOk _ ->
+                            insertHelp compare x (y :: prefix) rest cfg env
+
+                        EvErr e ->
+                            EvErr e
+
+                        other ->
+                            other
+                                |> EvalResult.andThen
+                                    (\ord ->
+                                        case ord of
+                                            LT ->
+                                                EvalResult.succeed (reverseAppend prefix (x :: y :: rest))
+
+                                            _ ->
+                                                insertHelp compare x (y :: prefix) rest cfg env
+                                    )
+
+                EvErr e ->
+                    EvErr e
+
+                other ->
+                    other
+                        |> EvalResult.andThen
+                            (\compareWithY ->
+                                compareWithY y cfg env
+                                    |> EvalResult.andThen
+                                        (\ord ->
+                                            case ord of
+                                                LT ->
+                                                    EvalResult.succeed (reverseAppend prefix (x :: y :: rest))
+
+                                                _ ->
+                                                    insertHelp compare x (y :: prefix) rest cfg env
+                                        )
+                            )
+
+
+{-| `reverseAppend xs ys` is `List.reverse xs ++ ys`, done in one pass.
+Used by `insertHelp` to reconstruct the sorted list from a reversed prefix
+accumulator plus the remaining tail.
+-}
+reverseAppend : List a -> List a -> List a
+reverseAppend xs ys =
+    case xs of
+        [] ->
+            ys
+
+        x :: rest ->
+            reverseAppend rest (x :: ys)
 
 
 {-| Kernel List.concatMap: map then flatten. Iterates in host Elm.
