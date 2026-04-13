@@ -1074,15 +1074,7 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
                     )
 
             else
-                -- Eval succeeded but the value can't round-trip to an
-                -- Expression (e.g., `round (1 / 0) : Int` evaluates to
-                -- `Int Infinity`, which `Expression.Integer Infinity`
-                -- can't Wire3-encode). Return the value anyway so the
-                -- in-memory `precomputedValues` cache still hits at
-                -- runtime — the user-norm on-disk cache filters these
-                -- out before serializing. Keeps the original expression
-                -- so the function body still round-trips.
-                Just ( funcImpl, value )
+                Nothing
 
         Err _ ->
             Nothing
