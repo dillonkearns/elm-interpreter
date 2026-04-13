@@ -1050,7 +1050,7 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
             { trace = False
             , coverage = False
             , coverageProbeLines = Set.empty
-            , maxSteps = Just 10000000
+            , maxSteps = Just NormalizationFlags.experimental.tryNormalizeMaxSteps
             , tcoTarget = Nothing
             , callCounts = Nothing
             , intercepts = Dict.empty
@@ -1109,6 +1109,12 @@ runModuleNormalizationToFixpoint :
         )
 runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
     let
+        -- Flags read from the single `NormalizationFlags.experimental`
+        -- knob. Edit that value + rebuild to run a new A/B experiment.
+        flags : NormalizationFlags.NormalizationFlags
+        flags =
+            NormalizationFlags.experimental
+
         step :
             Dict.Dict String FunctionImplementation
             -> Dict.Dict String FunctionImplementation
@@ -1190,71 +1196,33 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
     -- when no progress was made in the previous one.
     let
         ( fixpointFns, fixpointDelta, fixpointPrecomputed ) =
-            loop 3 originalModuleFns Dict.empty originalPrecomputedFns
+            if flags.runFixpoint then
+                loop flags.fixpointPasses originalModuleFns Dict.empty originalPrecomputedFns
 
-        foldEnv : Env
-        foldEnv =
-            { currentModule = moduleName
-            , currentModuleKey = moduleKey
-            , callStack = []
-            , shared =
-                { functions = Dict.insert moduleKey fixpointFns sharedFunctions
-                , moduleImports = sharedImports
-                , resolveBridge = Types.noResolveBridge
-                , precomputedValues = Dict.insert moduleKey fixpointPrecomputed sharedPrecomputedValues
-                }
-            , currentModuleFunctions = fixpointFns
-            , letFunctions = Dict.empty
-            , values = Dict.empty
-            , imports = moduleImports
-            , callDepth = 0
-            , recursionCheck = Nothing
-            }
+            else
+                ( originalModuleFns, Dict.empty, originalPrecomputedFns )
 
-        foldCfg : Config
-        foldCfg =
-            { trace = False
-            , coverage = False
-            , coverageProbeLines = Set.empty
-            , maxSteps = Just 100000
-            , tcoTarget = Nothing
-            , callCounts = Nothing
-            , intercepts = Dict.empty
-            , memoizedFunctions = MemoSpec.emptyRegistry
-            , collectMemoStats = False
-            , useResolvedIR = False
-            }
-
-        activeFlags : NormalizationFlags.NormalizationFlags
-        activeFlags =
-            { foldConstantApplications = False
-            , inlinePrecomputedRefs = False
-            , inlineFunctions = False
-            , fuseListMaps = True
-            }
-
+        -- Run `ListFusion.fuse` on every multi-arg function body. This is the
+        -- pass that flattens nested Application heads (ZAM task B's
+        -- spine-collection) and folds `List.map (map g xs)` chains. It walks
+        -- the AST once per function regardless of whether a fusion
+        -- opportunity is found — so on modules with no List.map chains, this
+        -- is mostly overhead plus the spine-collection rewrite.
         foldedFns : Dict.Dict String FunctionImplementation
         foldedFns =
-            fixpointFns
-                |> Dict.map
-                    (\_ funcImpl ->
-                        if not (List.isEmpty funcImpl.arguments) then
-                            let
-                                afterFold =
-                                    foldWithFlags activeFlags foldEnv foldCfg funcImpl.expression
+            if flags.runListFusion then
+                fixpointFns
+                    |> Dict.map
+                        (\_ funcImpl ->
+                            if List.isEmpty funcImpl.arguments then
+                                funcImpl
 
-                                afterFusion =
-                                    if activeFlags.fuseListMaps then
-                                        ListFusion.fuse afterFold
+                            else
+                                { funcImpl | expression = ListFusion.fuse funcImpl.expression }
+                        )
 
-                                    else
-                                        afterFold
-                            in
-                            { funcImpl | expression = afterFusion }
-
-                        else
-                            funcImpl
-                    )
+            else
+                fixpointFns
 
         foldedDelta : Dict.Dict String FunctionImplementation
         foldedDelta =
