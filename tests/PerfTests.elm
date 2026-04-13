@@ -25,6 +25,93 @@ suite =
         , dictInliningTests
         , listFusionTests
         , normalizationLosslessnessTests
+        , spineCollectionTests
+        ]
+
+
+{-| Regression coverage for the evalApplication spine-collection pass
+that flattens nested `Application` / `ParenthesizedExpression` head
+nodes before dispatch. The optimization is semantically neutral, so
+these tests only assert that the results still match the obvious
+flat-form evaluation — they exist to catch any slip in the flattening
+logic (wrong arg order, dropped args, or an infinite loop on empty
+applications).
+-}
+spineCollectionTests : Test
+spineCollectionTests =
+    describe "application spine collection"
+        [ test "(f a) b returns the same value as f a b" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+add : Int -> Int -> Int
+add a b =
+    a + b
+
+main : Int
+main =
+    ((add 3) 5)
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 8))
+        , test "((f a) b) c is deeply nested and still produces the correct value" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+add3 : Int -> Int -> Int -> Int
+add3 a b c =
+    a + b + c
+
+main : Int
+main =
+    (((add3 1) 2) 3)
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 6))
+        , test "pipeline into nested partial application still binds correctly" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+sub : Int -> Int -> Int
+sub a b =
+    a - b
+
+main : Int
+main =
+    10 |> sub 3
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int -7))
+        , test "nested application inside List.map callback body" <|
+            \_ ->
+                let
+                    source : String
+                    source =
+                        """module Temp exposing (main)
+
+add : Int -> Int -> Int
+add a b =
+    a + b
+
+main : List Int
+main =
+    List.map ((add 1)) [10, 20, 30]
+"""
+                in
+                Eval.Module.eval source (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (List [ Int 11, Int 21, Int 31 ]))
         ]
 
 
