@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 14, "filePath": "tests/CoverageTests.elm" },
+    { "count": 13, "filePath": "tests/IncrementalEnvTests.elm" },
+    { "count": 12, "filePath": "tests/PerfTests.elm" },
+    { "count": 9, "filePath": "src/Eval/Module.elm" },
+    { "count": 6, "filePath": "src/Kernel/Bytes.elm" },
+    { "count": 6, "filePath": "src/Kernel/List.elm" },
+    { "count": 4, "filePath": "tests/EndToEnd.elm" },
+    { "count": 3, "filePath": "src/Eval/Expression.elm" },
+    { "count": 2, "filePath": "src/Eval/ResolvedExpression.elm" },
+    { "count": 1, "filePath": "src/Eval/Resolver.elm" },
+    { "count": 1, "filePath": "src/Kernel.elm" },
+    { "count": 1, "filePath": "src/Kernel/Json.elm" },
+    { "count": 1, "filePath": "tests/ResolvedProjectTests.elm" },
+    { "count": 1, "filePath": "tests/ReviewRuleBugTest.elm" }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 22, "filePath": "src/Eval/Module.elm" },
+    { "count": 4, "filePath": "src/UI.elm" },
+    { "count": 3, "filePath": "tests/IncrementalEnvTests.elm" },
+    { "count": 2, "filePath": "src/Eval/Expression.elm" },
+    { "count": 2, "filePath": "src/Kernel/Json.elm" },
+    { "count": 2, "filePath": "tests/EndToEnd.elm" },
+    { "count": 1, "filePath": "src/Eval/Resolver.elm" },
+    { "count": 1, "filePath": "src/Kernel.elm" },
+    { "count": 1, "filePath": "src/Kernel/Regex.elm" }
+  ]
+}

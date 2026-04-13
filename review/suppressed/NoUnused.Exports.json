@@ -3,7 +3,21 @@
   "automatically created by": "elm-review suppress",
   "learn more": "elm-review suppress --help",
   "suppressions": [
+    { "count": 25, "filePath": "src/Eval/Module.elm" },
+    { "count": 10, "filePath": "src/MemoRuntime.elm" },
+    { "count": 4, "filePath": "src/Kernel/Json.elm" },
+    { "count": 2, "filePath": "src/Environment.elm" },
+    { "count": 2, "filePath": "src/EvalResult.elm" },
+    { "count": 2, "filePath": "src/Kernel/Utils.elm" },
+    { "count": 2, "filePath": "src/NormalizationFlags.elm" },
     { "count": 1, "filePath": "src/Eval.elm" },
-    { "count": 1, "filePath": "src/Eval/Module.elm" }
+    { "count": 1, "filePath": "src/Eval/Resolver.elm" },
+    { "count": 1, "filePath": "src/Eval/Types.elm" },
+    { "count": 1, "filePath": "src/Kernel/Bytes.elm" },
+    { "count": 1, "filePath": "src/Kernel/Dict.elm" },
+    { "count": 1, "filePath": "src/Kernel/Parser.elm" },
+    { "count": 1, "filePath": "src/Kernel/Set.elm" },
+    { "count": 1, "filePath": "src/MemoSpec.elm" },
+    { "count": 1, "filePath": "src/Recursion.elm" }
   ]
 }
