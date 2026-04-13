@@ -1201,68 +1201,30 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
         ( fixpointFns, fixpointDelta, fixpointPrecomputed ) =
             loop 3 originalModuleFns Dict.empty originalPrecomputedFns
 
-        foldEnv : Env
-        foldEnv =
-            { currentModule = moduleName
-            , currentModuleKey = moduleKey
-            , callStack = []
-            , shared =
-                { functions = Dict.insert moduleKey fixpointFns sharedFunctions
-                , moduleImports = sharedImports
-                , resolveBridge = Types.noResolveBridge
-                , precomputedValues = Dict.insert moduleKey fixpointPrecomputed sharedPrecomputedValues
-                }
-            , currentModuleFunctions = fixpointFns
-            , letFunctions = Dict.empty
-            , values = Dict.empty
-            , imports = moduleImports
-            , callDepth = 0
-            , recursionCheck = Nothing
-            }
-
-        foldCfg : Config
-        foldCfg =
-            { trace = False
-            , coverage = False
-            , coverageProbeLines = Set.empty
-            , maxSteps = Just 100000
-            , tcoTarget = Nothing
-            , callCounts = Nothing
-            , intercepts = Dict.empty
-            , memoizedFunctions = MemoSpec.emptyRegistry
-            , collectMemoStats = False
-            , useResolvedIR = False
-            }
-
-        activeFlags : NormalizationFlags.NormalizationFlags
-        activeFlags =
-            { foldConstantApplications = False
-            , inlinePrecomputedRefs = False
-            , inlineFunctions = False
-            , fuseListMaps = True
-            }
-
+        -- Run `ListFusion.fuse` on every multi-arg function body. This is the
+        -- pass that flattens nested Application heads (ZAM task B's
+        -- spine-collection) and folds `List.map (map g xs)` chains. It walks
+        -- the AST once per function regardless of whether a fusion
+        -- opportunity is found.
+        --
+        -- Previously this was also preceded by a `foldWithFlags` call, but
+        -- `activeFlags.foldConstantApplications` / `inlinePrecomputedRefs` /
+        -- `inlineFunctions` are all `False` here, so `foldWithFlags` was a
+        -- pure identity traversal — rebuilding the AST node-for-node without
+        -- changing anything. Dropping that call saves ~1× the AST size per
+        -- user-module function body, which is the bulk of the user-norm
+        -- cold-load cost on test-heavy projects (no normalization
+        -- candidates, but hundreds of multi-arg test bodies to walk).
         foldedFns : Dict.Dict String FunctionImplementation
         foldedFns =
             fixpointFns
                 |> Dict.map
                     (\_ funcImpl ->
-                        if not (List.isEmpty funcImpl.arguments) then
-                            let
-                                afterFold =
-                                    foldWithFlags activeFlags foldEnv foldCfg funcImpl.expression
-
-                                afterFusion =
-                                    if activeFlags.fuseListMaps then
-                                        ListFusion.fuse afterFold
-
-                                    else
-                                        afterFold
-                            in
-                            { funcImpl | expression = afterFusion }
+                        if List.isEmpty funcImpl.arguments then
+                            funcImpl
 
                         else
-                            funcImpl
+                            { funcImpl | expression = ListFusion.fuse funcImpl.expression }
                     )
 
         foldedDelta : Dict.Dict String FunctionImplementation
