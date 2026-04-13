@@ -1821,6 +1821,49 @@ evalApplication first rest cfg env =
                             -- 0 or 1 pattern with 2 args: need general path (splitting)
                             evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
 
+                ( [], [ arg1, arg2, arg3 ] ) ->
+                    -- Fast path: three arguments, no oldArgs (A3 shape).
+                    -- Extends Item 4's saturated-call fast path beyond the
+                    -- existing 1- and 2-arg cases. For `foo a b c` where
+                    -- `foo` is an arity-3 AstImpl / KernelImpl, skip the
+                    -- splitAt / List.length dance in `evalApplicationGeneral`.
+                    case patterns of
+                        [ _, _, _ ] ->
+                            evalOrRecurse ( arg1, cfg, env )
+                                (\val1 ->
+                                    evalOrRecurse ( arg2, cfg, env )
+                                        (\val2 ->
+                                            evalOrRecurse ( arg3, cfg, env )
+                                                (\val3 ->
+                                                    evalFullyApplied localEnv [ val1, val2, val3 ] patterns maybeQualifiedName implementation cfg env
+                                                )
+                                        )
+                                )
+
+                        _ ->
+                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+
+                ( [], [ arg1, arg2, arg3, arg4 ] ) ->
+                    -- Fast path: four arguments, no oldArgs (A4 shape).
+                    case patterns of
+                        [ _, _, _, _ ] ->
+                            evalOrRecurse ( arg1, cfg, env )
+                                (\val1 ->
+                                    evalOrRecurse ( arg2, cfg, env )
+                                        (\val2 ->
+                                            evalOrRecurse ( arg3, cfg, env )
+                                                (\val3 ->
+                                                    evalOrRecurse ( arg4, cfg, env )
+                                                        (\val4 ->
+                                                            evalFullyApplied localEnv [ val1, val2, val3, val4 ] patterns maybeQualifiedName implementation cfg env
+                                                        )
+                                                )
+                                        )
+                                )
+
+                        _ ->
+                            evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
+
                 _ ->
                     evalApplicationGeneralCompute first rest oldArgs localEnv patterns maybeQualifiedName implementation patternsLength cfg env
     in
