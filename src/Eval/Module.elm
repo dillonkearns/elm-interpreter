@@ -1198,15 +1198,24 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
                 else
                     loop (remaining - 1) result.fns result.delta result.precomputed
     in
-    -- Cap at a small number of passes to bound worst-case time. For any
-    -- realistic module this converges in 1-2 passes: the second pass picks
-    -- up constants whose alphabetical order placed them before their own
-    -- dependencies. The third pass is an "all done" check that short-circuits
-    -- when no progress was made in the previous one.
+    -- When `runFixpoint` is on we now prefer `normalizeInDepOrder`
+    -- (topological DFS, processes each constant's intra-module deps
+    -- before itself, single pass, no wasted eager evals). The legacy
+    -- `loop`-based fixpoint is kept as a fallback for
+    -- `fixpointPasses > 1` in case we need to re-enable it for a
+    -- future experiment, but all A/B runs today use topo order.
     let
         ( fixpointFns, fixpointDelta, fixpointPrecomputed ) =
             if flags.runFixpoint then
-                loop flags.fixpointPasses originalModuleFns Dict.empty originalPrecomputedFns
+                normalizeInDepOrder
+                    moduleName
+                    moduleKey
+                    moduleImports
+                    sharedFunctions
+                    sharedImports
+                    sharedPrecomputedValues
+                    originalModuleFns
+                    originalPrecomputedFns
 
             else
                 ( originalModuleFns, Dict.empty, originalPrecomputedFns )
@@ -1261,6 +1270,180 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
                     foldedDelta
     in
     ( foldedFns, newDelta, fixpointPrecomputed )
+
+
+{-| Topological-order single-pass normalization. For each 0-arg
+candidate in the module, process its intra-module dependencies first
+(recursively via DFS), then try `tryNormalizeConstant` on it. By the
+time we eval `lookupArray`, its `lookupTable` / `maxCode` deps are
+already in `precomputed`, so the eval sees them in O(1) instead of
+walking the full dependency chain on every iteration.
+
+Single pass, no wasted work. Replaces the earlier "loop 3 times and
+hope alphabetical order pays off" fixpoint, which was costing ~1.3 s
+on the core-extra 8-file subset because pass 2 had to re-run every
+expensive eval that pass 1 bailed on.
+
+Cycle detection via an `onPath` set — if a candidate references
+itself (directly or transitively), we bail on that chain rather than
+recurse forever. Elm's semantics forbid mutual recursion between
+zero-arg values so this should never trigger in well-formed source,
+but the guard keeps the pass safe on malformed input.
+
+-}
+normalizeInDepOrder :
+    ModuleName
+    -> String
+    -> ImportedNames
+    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> Dict.Dict String ImportedNames
+    -> Dict.Dict String (Dict.Dict String Value)
+    -> Dict.Dict String FunctionImplementation
+    -> Dict.Dict String Value
+    ->
+        ( Dict.Dict String FunctionImplementation
+        , Dict.Dict String FunctionImplementation
+        , Dict.Dict String Value
+        )
+normalizeInDepOrder moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
+    let
+        candidateNames : Set String
+        candidateNames =
+            originalModuleFns
+                |> Dict.foldl
+                    (\name funcImpl acc ->
+                        if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
+                            Set.insert name acc
+
+                        else
+                            acc
+                    )
+                    Set.empty
+
+        -- For each candidate, collect the subset of its body's free
+        -- variables that reference other candidates in this module.
+        depGraph : Dict.Dict String (Set String)
+        depGraph =
+            candidateNames
+                |> Set.foldl
+                    (\name acc ->
+                        case Dict.get name originalModuleFns of
+                            Just funcImpl ->
+                                let
+                                    refs : Set String
+                                    refs =
+                                        Eval.Expression.freeVariables funcImpl.expression
+
+                                    deps : Set String
+                                    deps =
+                                        Set.intersect refs candidateNames
+                                            |> Set.remove name
+                                in
+                                Dict.insert name deps acc
+
+                            Nothing ->
+                                acc
+                    )
+                    Dict.empty
+
+        initialState : NormalizeDepState
+        initialState =
+            { fns = originalModuleFns
+            , delta = Dict.empty
+            , precomputed = originalPrecomputedFns
+            , visited = Set.empty
+            , onPath = Set.empty
+            }
+
+        finalState : NormalizeDepState
+        finalState =
+            candidateNames
+                |> Set.foldl
+                    (\name state -> processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state)
+                    initialState
+    in
+    ( finalState.fns, finalState.delta, finalState.precomputed )
+
+
+type alias NormalizeDepState =
+    { fns : Dict.Dict String FunctionImplementation
+    , delta : Dict.Dict String FunctionImplementation
+    , precomputed : Dict.Dict String Value
+    , visited : Set String
+    , onPath : Set String
+    }
+
+
+processCandidate :
+    ModuleName
+    -> String
+    -> ImportedNames
+    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> Dict.Dict String ImportedNames
+    -> Dict.Dict String (Dict.Dict String Value)
+    -> Dict.Dict String FunctionImplementation
+    -> Dict.Dict String (Set String)
+    -> String
+    -> NormalizeDepState
+    -> NormalizeDepState
+processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state =
+    if Set.member name state.visited then
+        state
+
+    else if Set.member name state.onPath then
+        -- Cycle — bail on this node, leave original body unchanged.
+        state
+
+    else
+        let
+            deps : Set String
+            deps =
+                Dict.get name depGraph
+                    |> Maybe.withDefault Set.empty
+
+            withPath : NormalizeDepState
+            withPath =
+                { state | onPath = Set.insert name state.onPath }
+
+            afterDeps : NormalizeDepState
+            afterDeps =
+                Set.foldl
+                    (\dep s -> processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph dep s)
+                    withPath
+                    deps
+
+            markVisited : NormalizeDepState -> NormalizeDepState
+            markVisited s =
+                { s | visited = Set.insert name s.visited, onPath = Set.remove name s.onPath }
+        in
+        case Dict.get name afterDeps.fns of
+            Nothing ->
+                -- Should never happen: `name` came from iterating
+                -- originalModuleFns, and afterDeps.fns is initialized
+                -- from that same map.
+                markVisited afterDeps
+
+            Just priorFn ->
+                case
+                    tryNormalizeConstant
+                        moduleName
+                        moduleKey
+                        moduleImports
+                        priorFn
+                        (Dict.insert moduleKey afterDeps.fns sharedFunctions)
+                        sharedImports
+                        (Dict.insert moduleKey afterDeps.precomputed sharedPrecomputedValues)
+                of
+                    Just ( normalized, value ) ->
+                        { fns = Dict.insert name normalized afterDeps.fns
+                        , delta = Dict.insert name normalized afterDeps.delta
+                        , precomputed = Dict.insert name value afterDeps.precomputed
+                        , visited = Set.insert name afterDeps.visited
+                        , onPath = Set.remove name afterDeps.onPath
+                        }
+
+                    Nothing ->
+                        markVisited afterDeps
 
 
 {-| Determine whether a `Value` can be losslessly round-tripped through
