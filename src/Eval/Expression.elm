@@ -1358,7 +1358,7 @@ evalSimpleConstructor : List String -> String -> List (Node Expression) -> Env -
 evalSimpleConstructor moduleName name args env =
     case ( moduleName, name, args ) of
         ( [], "Nothing", [] ) ->
-            Just (Custom { moduleName = [ "Maybe" ], name = "Nothing" } [])
+            Just Value.nothingValue
 
         ( [], "Just", [ arg ] ) ->
             evalSimple arg env
@@ -3231,7 +3231,14 @@ fixModuleName moduleName env =
 evalVariant : ModuleName -> Env -> String -> PartialResult Value
 evalVariant moduleName env name =
     -- True/False must remain as Bool values (not Custom) because
-    -- the evaluator's if/then/else, &&, || depend on matching Bool
+    -- the evaluator's if/then/else, &&, || depend on matching Bool.
+    --
+    -- Known-singleton nullary ctors (Nothing, LT, EQ, GT) bypass the
+    -- Custom allocation by returning the pre-built values in
+    -- `Value.elm`. Every reference in the interpreter's hot paths
+    -- (Maybe-chain walks, comparisons) used to allocate a fresh
+    -- `Custom { moduleName = [ "Maybe" ], name = "Nothing" } []` — now
+    -- they share one.
     case ( moduleName, name ) of
         ( [], "True" ) ->
             Types.succeedPartial <| Bool True
@@ -3244,6 +3251,30 @@ evalVariant moduleName env name =
 
         ( "Basics" :: _, "False" ) ->
             Types.succeedPartial <| Bool False
+
+        ( [], "Nothing" ) ->
+            Types.succeedPartial Value.nothingValue
+
+        ( "Maybe" :: _, "Nothing" ) ->
+            Types.succeedPartial Value.nothingValue
+
+        ( [], "LT" ) ->
+            Types.succeedPartial Value.ltValue
+
+        ( [], "EQ" ) ->
+            Types.succeedPartial Value.eqValue
+
+        ( [], "GT" ) ->
+            Types.succeedPartial Value.gtValue
+
+        ( "Basics" :: _, "LT" ) ->
+            Types.succeedPartial Value.ltValue
+
+        ( "Basics" :: _, "EQ" ) ->
+            Types.succeedPartial Value.eqValue
+
+        ( "Basics" :: _, "GT" ) ->
+            Types.succeedPartial Value.gtValue
 
         _ ->
             let
