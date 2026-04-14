@@ -3312,9 +3312,13 @@ deepHashArgs args =
         args
 
 
-{-| Combined: injected Values + intercepts + raw EvalResult.
-Used by the BackendTask yield driver when both Value injection and
-intercept handling are needed in the same evaluation.
+{-| Combined: injected Values + intercepts + raw EvalResult. Used by
+the BackendTask yield driver when both Value injection and intercept
+handling are needed in the same evaluation.
+
+**Phase 6 status:** stays on OLD eval for the same reason
+`evalWithInterceptsRaw` does — see that function's docstring.
+
 -}
 evalWithEnvFromFilesAndValuesAndInterceptsRaw :
     ProjectEnv
@@ -3922,6 +3926,22 @@ intercepts Dict, the intercept function is called instead of the AST.
 This is the general-purpose hook for framework callbacks (BackendTask, Test)
 and for memoization/caching (elm-review cache markers).
 
+**Phase 6 status:** stays on OLD eval. A Phase 6 attempt routed this
+through `evalWithResolvedIRFromFilesAndIntercepts`, but the bridge
+function runs a full `resolveProject` pass 2 on the additional files
+**every call**, resolving every user-module body into `RExpr`. For the
+test-runner workload (one call per test module), that fixed per-call
+cost dominates the per-iteration eval savings and regresses the bench
+(`bench/testrunner-ab.sh` 1088 ms → 1220 ms on the 8-file subset;
+`bench/core-extra-full.sh` 8.04 s → 8.69 s on the 11-file suite).
+
+A future phase will need to make the resolved-project-extension cost
+amortize across repeated `evalWithIntercepts` calls — e.g. by caching
+the resolved view of the additional files keyed by content hash, or
+by letting the caller pre-extend once via `extendResolvedWithFiles`
+and pass an already-resolved `ProjectEnv` in. Until then, this entry
+point stays on OLD eval.
+
 -}
 evalWithIntercepts :
     ProjectEnv
@@ -4036,6 +4056,25 @@ evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expressi
 
 The framework driver should handle EvYield in a loop (yield → handle effect →
 resume with result → check for more yields).
+
+**Phase 6 status:** stays on the OLD-evaluator path. A direct pass-
+through to `evalWithResolvedIRFromFilesAndIntercepts` would return
+only the first yield from an expression that yields multiple times
+(e.g. `myMap (\\n -> Helpers.marker n) [1, 2, 3]` with a yielding
+intercept on `Helpers.marker`). RE's `runRec` trampoline collapses
+`EvYield` up through `andThenValue` but doesn't re-enter the
+suspended computation when the driver resumes — the continuation
+captured at yield time only covers the innermost sub-expression, not
+the outer `List.map` / `myMap` loop. OLD eval's `evalExpression`
+propagates yields correctly because the whole recursion is
+`runRecursion`-based and each step re-enters at the right point.
+
+A future phase (likely alongside the `tcoLoop`-equivalent work that
+blocks Phases 3/4's entry-point migrations) will need to thread
+`EvYield` through `runRec`'s continuation stack so that a resumed
+yield re-enters the outer loop. Until then, `evalWithInterceptsRaw`
+must stay on OLD eval — all 10 yield-sequence tests in
+`tests/IncrementalEnvTests.elm` regress otherwise.
 
 -}
 evalWithInterceptsRaw :
