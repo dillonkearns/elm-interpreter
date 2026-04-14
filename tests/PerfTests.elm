@@ -597,6 +597,35 @@ tcoAnalysisTests =
                     "countdown"
                     [ "n" ]
                     |> Expect.equal TcoAnalysis.TcoGeneral
+        , test "isPrefixOf-like tuple-scrutinee is TcoSafe" <|
+            \_ ->
+                -- Idiomatic Elm: dispatch on two list args via a tuple
+                -- case. Every tail call passes strict sublists of BOTH
+                -- args (`ps`, `xs`), so the cycle-probe is provably
+                -- redundant. Classified as TcoGeneral before extending
+                -- `collectConsTailBindings` to walk tuple scrutinees.
+                analyzeModule
+                    """module T exposing (..)
+
+
+isPrefixOf prefix list =
+    case ( prefix, list ) of
+        ( [], _ ) ->
+            True
+
+        ( _ :: _, [] ) ->
+            False
+
+        ( p :: ps, x :: xs ) ->
+            if p == x then
+                isPrefixOf ps xs
+
+            else
+                False
+"""
+                    "isPrefixOf"
+                    [ "prefix", "list" ]
+                    |> Expect.equal TcoAnalysis.TcoSafe
         ]
 
 

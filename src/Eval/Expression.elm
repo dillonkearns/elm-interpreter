@@ -1,4 +1,4 @@
-module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs, freeVariables, isUpperName, kernelFunctions)
+module Eval.Expression exposing (deepHashValue, evalExpression, evalFunction, fingerprintArgs, freeVariables, isTailRecursive, isUpperName, kernelFunctions)
 
 import Array
 import Bitwise
@@ -2280,6 +2280,20 @@ call maybeQualifiedName implementation cfg env =
                         newEnv =
                             callFn qualifiedName.moduleName qualifiedName.name env
                     in
+                    let
+                        cachedTcoMeta : Maybe TcoAnalysis.TcoMetadata
+                        cachedTcoMeta =
+                            lookupTcoMetadata qualifiedName newEnv
+
+                        callIsTailRec : Bool
+                        callIsTailRec =
+                            case cachedTcoMeta of
+                                Just meta ->
+                                    meta.isTailRec
+
+                                Nothing ->
+                                    isTailRecursive qualifiedName.name expr
+                    in
                     case cfg.tcoTarget of
                         Just target ->
                             let
@@ -2296,7 +2310,7 @@ call maybeQualifiedName implementation cfg env =
                                         }
                                     )
 
-                            else if isTailRecursive qualifiedName.name expr then
+                            else if callIsTailRec then
                                 let
                                     limit =
                                         case cfg.maxSteps of
@@ -2305,8 +2319,17 @@ call maybeQualifiedName implementation cfg env =
 
                                             Nothing ->
                                                 500000
+
+                                    strategy : TcoAnalysis.TcoStrategy
+                                    strategy =
+                                        case cachedTcoMeta of
+                                            Just meta ->
+                                                meta.strategy
+
+                                            Nothing ->
+                                                TcoAnalysis.analyze qualifiedName.name (Dict.keys newEnv.values) expr
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr strategy limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
 
                             else
                                 -- Not tail-recursive: clear tcoTarget
@@ -2314,7 +2337,7 @@ call maybeQualifiedName implementation cfg env =
 
                         Nothing ->
                             -- No tcoTarget: skip qualifiedNameToString for tcoKey
-                            if isTailRecursive qualifiedName.name expr then
+                            if callIsTailRec then
                                 let
                                     tcoKey =
                                         Syntax.qualifiedNameToString qualifiedName
@@ -2326,8 +2349,17 @@ call maybeQualifiedName implementation cfg env =
 
                                             Nothing ->
                                                 500000
+
+                                    strategy : TcoAnalysis.TcoStrategy
+                                    strategy =
+                                        case cachedTcoMeta of
+                                            Just meta ->
+                                                meta.strategy
+
+                                            Nothing ->
+                                                TcoAnalysis.analyze qualifiedName.name (Dict.keys newEnv.values) expr
                                 in
-                                Recursion.base (tcoLoop tcoKey expr limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr strategy limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
 
                             else
                                 -- Common case: not TCO, no tcoTarget — pass cfg as-is
@@ -2599,6 +2631,18 @@ letDeclarationsContainSelfCall funcName declarations =
         declarations
 
 
+{-| Look up the precomputed TCO metadata for a qualified-name function
+in `SharedContext.tcoAnalyses`. Returns `Nothing` for functions that
+weren't precomputed at project load — let-bound functions, anonymous
+lambdas, etc. — in which case the caller falls back to a live
+`isTailRecursive` / `TcoAnalysis.analyze` walk of the body.
+-}
+lookupTcoMetadata : QualifiedNameRef -> Env -> Maybe TcoAnalysis.TcoMetadata
+lookupTcoMetadata qualifiedName env =
+    Dict.get (Environment.moduleKey qualifiedName.moduleName) env.shared.tcoAnalyses
+        |> Maybe.andThen (Dict.get qualifiedName.name)
+
+
 {-| TCO loop: evaluates body expression in a tight loop using nested
 evalExpression calls. Each iteration is a complete evaluation; self-calls
 are detected and caught as TailCall errors, then rebound and looped.
@@ -2611,8 +2655,8 @@ Cycle detection:
 This is tail-recursive in Elm, compiled to a while loop by the host compiler.
 
 -}
-tcoLoop : String -> Node Expression -> Int -> Config -> Env -> EvalResult Value
-tcoLoop funcName body remaining cfg env =
+tcoLoop : String -> Node Expression -> TcoAnalysis.TcoStrategy -> Int -> Config -> Env -> EvalResult Value
+tcoLoop funcName body strategy remaining cfg env =
     let
         -- Build the per-iteration `innerCfg` ONCE, outside the loop.
         -- `innerCfg` only differs from `cfg` in `maxSteps = Nothing`
@@ -2642,9 +2686,15 @@ tcoLoop funcName body remaining cfg env =
         -- reached. `maxSteps` absolute cap still applies via
         -- `remaining`. `TcoGeneral` keeps the default interval=16
         -- with adaptive growth.
+        --
+        -- The strategy is supplied by the caller (`evalApplication`'s
+        -- function-call dispatch), which looks it up in the
+        -- `SharedContext.tcoAnalyses` cache populated at project load.
+        -- That avoids re-running the body walk that
+        -- `TcoAnalysis.analyze` performs on every invocation.
         initialInterval : Int
         initialInterval =
-            case TcoAnalysis.analyze funcName (Dict.keys env.values) body of
+            case strategy of
                 TcoAnalysis.TcoListDrain _ ->
                     remaining + 1
 

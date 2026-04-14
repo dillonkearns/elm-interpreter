@@ -36,6 +36,7 @@ import Result.MyExtra
 import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
+import TcoAnalysis
 import Types exposing (CallTree, Config, Env, Error(..), EvalResult(..), ImportedNames, Value)
 import Value exposing (unsupported)
 
@@ -828,6 +829,7 @@ buildProjectEnvFromSummaries summaries =
                 , moduleImports = sharedModuleImports
                 , resolveBridge = Types.noResolveBridge
                 , precomputedValues = Dict.empty
+                , tcoAnalyses = precomputeTcoAnalyses sharedFunctions
                 }
             , currentModuleFunctions = Dict.empty
             , letFunctions = Dict.empty
@@ -1035,6 +1037,7 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
                 , moduleImports = sharedModuleImports
                 , resolveBridge = Types.noResolveBridge
                 , precomputedValues = sharedPrecomputedValues
+                , tcoAnalyses = Dict.empty
                 }
             , currentModuleFunctions =
                 Dict.get moduleKey sharedFunctions
@@ -2353,6 +2356,7 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
                 , moduleImports = Dict.remove modKey projectEnv.env.shared.moduleImports
                 , resolveBridge = projectEnv.env.shared.resolveBridge
                 , precomputedValues = Dict.remove modKey projectEnv.env.shared.precomputedValues
+                , tcoAnalyses = Dict.remove modKey projectEnv.env.shared.tcoAnalyses
                 }
             , currentModuleFunctions = projectEnv.env.currentModuleFunctions
             , letFunctions = Dict.empty
@@ -4283,6 +4287,72 @@ precomputedValuesCount (ProjectEnv projectEnv) =
         |> Dict.foldl (\_ inner acc -> acc + Dict.size inner) 0
 
 
+{-| Precompute the TCO analysis (`TcoStrategy` + `isTailRecursive`) for
+every function in every module of the given function dict. Stored on
+`SharedContext.tcoAnalyses` so that `Eval.Expression.tcoLoop` and the
+call-dispatch path can look up the result in O(1) instead of walking
+the body's AST on every invocation.
+
+The full analysis runs in O(total AST size). Without this side table,
+the same analysis ran on every tail-recursive function call — a per-
+invocation tax dominated by the body walk in
+`TcoAnalysis.collectTailCalls` and `Eval.Expression.containsSelfCall`.
+On fuzz-heavy workloads (~100K+ calls) that adds up to hundreds of ms
+of pure repeated work.
+-}
+precomputeTcoAnalyses :
+    Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> Dict.Dict String (Dict.Dict String TcoAnalysis.TcoMetadata)
+precomputeTcoAnalyses moduleFunctions =
+    Dict.foldl
+        (\moduleKey funcs acc ->
+            Dict.insert moduleKey (precomputeOneModule funcs) acc
+        )
+        Dict.empty
+        moduleFunctions
+
+
+{-| Precompute TCO metadata for a single module's function dict.
+Used both by the global precompute pass and by the in-place per-module
+updaters (`replaceModuleFunctionsInEnv`, `normalizeOneModuleInEnv`,
+`mergeModuleFunctionsIntoEnv`) that rewrite a module's bodies and
+need to refresh the cache for that module without rebuilding the
+whole side table.
+-}
+precomputeOneModule :
+    Dict.Dict String FunctionImplementation
+    -> Dict.Dict String TcoAnalysis.TcoMetadata
+precomputeOneModule funcs =
+    Dict.foldl
+        (\name impl acc ->
+            let
+                body : Node Expression
+                body =
+                    impl.expression
+
+                paramNames : List String
+                paramNames =
+                    impl.arguments
+                        |> List.filterMap
+                            (\(Node _ pat) ->
+                                case pat of
+                                    Elm.Syntax.Pattern.VarPattern p ->
+                                        Just p
+
+                                    _ ->
+                                        Nothing
+                            )
+            in
+            Dict.insert name
+                { strategy = TcoAnalysis.analyze name paramNames body
+                , isTailRec = Eval.Expression.isTailRecursive name body
+                }
+                acc
+        )
+        Dict.empty
+        funcs
+
+
 {-| For diagnostics: list the (moduleKey, count) pairs sorted by count.
 -}
 precomputedValuesByModule : ProjectEnv -> List ( String, Int )
@@ -4317,6 +4387,7 @@ setModulePrecomputedValues moduleName values (ProjectEnv projectEnv) =
                         , moduleImports = env.shared.moduleImports
                         , resolveBridge = env.shared.resolveBridge
                         , precomputedValues = Dict.insert key values env.shared.precomputedValues
+                        , tcoAnalyses = env.shared.tcoAnalyses
                         }
                 }
         }
@@ -4363,6 +4434,10 @@ replaceModuleFunctionsInEnv moduleName newFunctions (ProjectEnv projectEnv) =
                     , moduleImports = env.shared.moduleImports
                     , resolveBridge = env.shared.resolveBridge
                     , precomputedValues = env.shared.precomputedValues
+                    , tcoAnalyses =
+                        Dict.insert moduleKey
+                            (precomputeOneModule newFunctions)
+                            env.shared.tcoAnalyses
                     }
             }
     in
@@ -4444,6 +4519,10 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
                     , moduleImports = sharedImports
                     , resolveBridge = env.shared.resolveBridge
                     , precomputedValues = updatedPrecomputed
+                    , tcoAnalyses =
+                        Dict.insert moduleKey
+                            (precomputeOneModule normalizedModuleFns)
+                            env.shared.tcoAnalyses
                     }
             }
     in
@@ -4491,6 +4570,10 @@ mergeModuleFunctionsIntoEnv moduleName deltaFns (ProjectEnv projectEnv) =
                     , moduleImports = env.shared.moduleImports
                     , resolveBridge = env.shared.resolveBridge
                     , precomputedValues = env.shared.precomputedValues
+                    , tcoAnalyses =
+                        Dict.insert moduleKey
+                            (precomputeOneModule merged)
+                            env.shared.tcoAnalyses
                     }
             }
     in
@@ -4578,6 +4661,7 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                     , moduleImports = env.shared.moduleImports
                     , resolveBridge = env.shared.resolveBridge
                     , precomputedValues = updatedPrecomputed
+                    , tcoAnalyses = env.shared.tcoAnalyses
                     }
             }
     in
@@ -4846,6 +4930,7 @@ buildInitialEnv file =
                         |> Dict.insert (Environment.moduleKey moduleName) imports
                 , resolveBridge = Types.noResolveBridge
                 , precomputedValues = Dict.empty
+                , tcoAnalyses = Dict.empty
                 }
             , currentModuleFunctions = Dict.empty
             , letFunctions = Dict.empty
@@ -5127,7 +5212,7 @@ evalProject sources expression =
                                 { currentModule = []
                                 , currentModuleKey = ""
                                 , callStack = []
-                                , shared = { functions = coreFunctions, moduleImports = Dict.empty, resolveBridge = Types.noResolveBridge, precomputedValues = Dict.empty }
+                                , shared = { functions = coreFunctions, moduleImports = Dict.empty, resolveBridge = Types.noResolveBridge, precomputedValues = Dict.empty, tcoAnalyses = Dict.empty }
                                 , currentModuleFunctions = Dict.empty
                                 , letFunctions = Dict.empty
                                 , values = Dict.empty
@@ -5215,7 +5300,7 @@ buildModuleEnv allInterfaces { file, moduleName } env =
 
         envWithModuleImports : Env
         envWithModuleImports =
-            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports, resolveBridge = env.shared.resolveBridge, precomputedValues = env.shared.precomputedValues } }
+            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports, resolveBridge = env.shared.resolveBridge, precomputedValues = env.shared.precomputedValues, tcoAnalyses = env.shared.tcoAnalyses } }
 
         addDeclaration : Node Declaration -> Env -> Result Error Env
         addDeclaration (Node _ decl) envAcc =

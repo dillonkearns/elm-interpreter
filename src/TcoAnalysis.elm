@@ -1,4 +1,4 @@
-module TcoAnalysis exposing (ListDrainInfo, TcoStrategy(..), analyze)
+module TcoAnalysis exposing (ListDrainInfo, TcoMetadata, TcoStrategy(..), analyze)
 
 {-| Static analysis of tail-recursive function bodies to determine
 whether cycle detection can be safely skipped at runtime, and to
@@ -23,6 +23,17 @@ type alias ListDrainInfo =
     , tailBindingName : String
     , baseCaseBody : Node Expression
     , consCaseBody : Node Expression
+    }
+
+
+{-| Per-function metadata cached on `SharedContext.tcoAnalyses` so that
+`tcoLoop` and the call-dispatch path can look up tail-recursion shape
+info in O(1) instead of walking the body's AST on every call.
+Populated once during project load by `Eval.Module.precomputeTcoAnalyses`.
+-}
+type alias TcoMetadata =
+    { strategy : TcoStrategy
+    , isTailRec : Bool
     }
 
 
@@ -218,6 +229,28 @@ collectConsTailBindings (Node _ expr) =
                         Set.empty
                         cases
 
+                Node _ (TupledExpression tupleParts) ->
+                    -- Idiomatic multi-list recursion dispatches via a
+                    -- tuple scrutinee: `case ( prefix, list ) of
+                    -- ( p :: ps, x :: xs ) -> ...`. Extract each
+                    -- component's scrutinee variable (Nothing for
+                    -- non-var components — function calls, literals,
+                    -- etc.) and walk each case branch's tuple pattern
+                    -- component-wise. Cheap to skip when this never
+                    -- fires because the cache lookup happens at project
+                    -- load, not per-call.
+                    let
+                        tupleVars : List (Maybe String)
+                        tupleVars =
+                            List.map tupleComponentVar tupleParts
+                    in
+                    List.foldl
+                        (\( Node _ pattern, branchBody ) acc ->
+                            Set.union (Set.union (extractConsTailTuple tupleVars pattern) (collectConsTailBindings branchBody)) acc
+                        )
+                        Set.empty
+                        cases
+
                 _ ->
                     List.foldl (\( _, branchBody ) acc -> Set.union (collectConsTailBindings branchBody) acc) Set.empty cases
 
@@ -226,6 +259,46 @@ collectConsTailBindings (Node _ expr) =
 
         LetExpression { expression } ->
             collectConsTailBindings expression
+
+        _ ->
+            Set.empty
+
+
+tupleComponentVar : Node Expression -> Maybe String
+tupleComponentVar (Node _ expr) =
+    case expr of
+        FunctionOrValue [] v ->
+            Just v
+
+        _ ->
+            Nothing
+
+
+{-| Match a `TuplePattern` against the flattened scrutinee variable
+names and pull every `(scrutineeVar, tailVarName)` pair where the
+corresponding component is a `x :: tail` destructure. Returns empty
+if the pattern isn't a `TuplePattern` or the arities don't match.
+-}
+extractConsTailTuple : List (Maybe String) -> Pattern -> Set ( String, String )
+extractConsTailTuple tupleVars pattern =
+    case pattern of
+        TuplePattern subPatterns ->
+            if List.length tupleVars == List.length subPatterns then
+                List.map2
+                    (\maybeVar (Node _ subPattern) ->
+                        case maybeVar of
+                            Just sVar ->
+                                extractConsTail sVar subPattern
+
+                            Nothing ->
+                                Set.empty
+                    )
+                    tupleVars
+                    subPatterns
+                    |> List.foldl Set.union Set.empty
+
+            else
+                Set.empty
 
         _ ->
             Set.empty
