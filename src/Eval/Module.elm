@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -4350,6 +4350,161 @@ extendWithFilesNormalized projectEnv additionalFiles =
                 in
                 normalizeUserModulesInEnv userModuleNames extendedProjectEnv
             )
+
+
+{-| Resolve every function in `additionalFiles` into the resolved-IR
+representation and merge the new bodies + GlobalIds into the project
+env's `ResolvedProject`. Use this when extending a project with user
+modules at load time so that subsequent eval calls through the
+resolved-IR evaluator can find the user functions natively, instead
+of falling back to the old string-keyed evaluator on every call.
+
+Without this, `extendWithFiles` only adds the modules to
+`shared.functions` (the old evaluator's view). The resolved-IR
+evaluator's `dispatchGlobalApplyStep` then misses on the user
+functions and falls through to `delegateCoreApply`, which routes
+back to the old evaluator's hot path. For fuzz-heavy workloads with
+many user-defined callbacks, that fallback dominates the cold-eval
+profile.
+
+This helper does the same id-allocation + body-resolution as
+`evalWithResolvedIRFromFilesAndIntercepts`'s internal mergedBodies
+pass, but at project-load time (one-shot) instead of per-eval-call
+(amortized to zero).
+
+Resolver errors are silently dropped — the function stays in
+`shared.functions` and the old evaluator's fallback continues to
+handle it. This matches the existing behavior of `resolveProject`
+during initial package load.
+
+-}
+extendResolvedWithFiles : List File -> ProjectEnv -> ProjectEnv
+extendResolvedWithFiles additionalFiles (ProjectEnv projectEnv) =
+    let
+        parsedModules :
+            List
+                { file : File
+                , moduleName : ModuleName
+                , interface : List Exposed
+                }
+        parsedModules =
+            additionalFiles
+                |> List.map
+                    (\file ->
+                        { file = file
+                        , moduleName = fileModuleName file
+                        , interface = buildInterfaceFromFile file
+                        }
+                    )
+
+        summaries : List CachedModuleSummary
+        summaries =
+            buildCachedModuleSummariesFromParsed parsedModules
+
+        baseResolved : ResolvedProject
+        baseResolved =
+            projectEnv.resolved
+
+        nextInitialId : IR.GlobalId
+        nextInitialId =
+            (baseResolved.globalIdToName
+                |> Dict.keys
+                |> List.maximum
+                |> Maybe.withDefault -1
+            )
+                + 1
+
+        idAssignment : { next : Int, ids : Dict.Dict ( ModuleName, String ) IR.GlobalId, reverseIds : Dict.Dict IR.GlobalId ( ModuleName, String ) }
+        idAssignment =
+            summaries
+                |> List.foldl
+                    (\summary outer ->
+                        summary.functions
+                            |> List.foldl
+                                (\impl inner ->
+                                    if isCustomTypeConstructor impl then
+                                        inner
+
+                                    else
+                                        let
+                                            name : String
+                                            name =
+                                                Node.value impl.name
+                                        in
+                                        case Dict.get ( summary.moduleName, name ) inner.ids of
+                                            Just _ ->
+                                                inner
+
+                                            Nothing ->
+                                                { next = inner.next + 1
+                                                , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
+                                                , reverseIds = Dict.insert inner.next ( summary.moduleName, name ) inner.reverseIds
+                                                }
+                                )
+                                outer
+                    )
+                    { next = nextInitialId
+                    , ids = baseResolved.globalIds
+                    , reverseIds = baseResolved.globalIdToName
+                    }
+
+        mergedGlobalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+        mergedGlobalIds =
+            idAssignment.ids
+
+        mergedGlobalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
+        mergedGlobalIdToName =
+            idAssignment.reverseIds
+
+        mergedBodies : Dict.Dict IR.GlobalId IR.RExpr
+        mergedBodies =
+            summaries
+                |> List.foldl
+                    (\summary outer ->
+                        summary.functions
+                            |> List.foldl
+                                (\impl inner ->
+                                    if isCustomTypeConstructor impl then
+                                        inner
+
+                                    else
+                                        let
+                                            name : String
+                                            name =
+                                                Node.value impl.name
+
+                                            ctx : Resolver.ResolverContext
+                                            ctx =
+                                                Resolver.initContextWithImports
+                                                    summary.moduleName
+                                                    mergedGlobalIds
+                                                    summary.importedNames
+                                        in
+                                        case Resolver.resolveDeclaration ctx impl of
+                                            Ok rexpr ->
+                                                case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                    Just id ->
+                                                        Dict.insert id rexpr inner
+
+                                                    Nothing ->
+                                                        inner
+
+                                            Err _ ->
+                                                inner
+                                )
+                                outer
+                    )
+                    baseResolved.bodies
+
+        newResolved : ResolvedProject
+        newResolved =
+            { baseResolved
+                | globalIds = mergedGlobalIds
+                , globalIdToName = mergedGlobalIdToName
+                , bodies = mergedBodies
+            }
+    in
+    ProjectEnv { projectEnv | resolved = newResolved }
 
 
 {-| Check whether a function body is worth trying to normalize. Functions that
