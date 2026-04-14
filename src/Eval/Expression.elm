@@ -2636,11 +2636,22 @@ in `SharedContext.tcoAnalyses`. Returns `Nothing` for functions that
 weren't precomputed at project load — let-bound functions, anonymous
 lambdas, etc. — in which case the caller falls back to a live
 `isTailRecursive` / `TcoAnalysis.analyze` walk of the body.
+
+The `env` passed must be the function's *callee* env (i.e. the env
+after `Environment.call*` has switched `currentModule` /
+`currentModuleKey` to the qualified-name's module). That lets us use
+`env.currentModuleKey` directly as the outer lookup key and skip the
+per-call `Environment.moduleKey` string concat that this function
+profiles at the top of the cold-eval hot path.
 -}
 lookupTcoMetadata : QualifiedNameRef -> Env -> Maybe TcoAnalysis.TcoMetadata
 lookupTcoMetadata qualifiedName env =
-    Dict.get (Environment.moduleKey qualifiedName.moduleName) env.shared.tcoAnalyses
-        |> Maybe.andThen (Dict.get qualifiedName.name)
+    case Dict.get env.currentModuleKey env.shared.tcoAnalyses of
+        Just moduleAnalyses ->
+            Dict.get qualifiedName.name moduleAnalyses
+
+        Nothing ->
+            Nothing
 
 
 {-| TCO loop: evaluates body expression in a tight loop using nested
