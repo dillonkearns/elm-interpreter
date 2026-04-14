@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -2460,6 +2460,24 @@ evalWithEnv projectEnv additionalSources expression =
 {-| Like `evalWithEnv`, but with an optional step limit to prevent hangs
 on large computations. Pass `Just n` to limit evaluation to `n` trampoline
 steps, or `Nothing` for unlimited.
+
+**Phase 4 status:** this function stays on the OLD-evaluator path for
+now. The original Phase 4 plan was to route it through the resolved-IR
+trampoline (`evalWithResolvedIRFromFilesAndInterceptsAndLimit` exists
+for exactly that purpose), but the RE trampoline lacks an
+`Eval.Expression.tcoLoop` equivalent: OLD eval's `tcoLoop` runs a
+JS-level while-loop for detected tail-recursive calls and never
+re-enters the step counter, so `tcoProofTests`' tight budgets (e.g.
+110 000 for a 100 000-iteration `countdown`) fit easily. RE's
+trampoline charges one step per `rRecThen` (for the `RIf` condition,
+for each argument eval, etc.), so the same 100 000-iteration loop
+costs ~600 000 counted steps and blows the budget. Routing the test
+through RE would cause `tcoProofTests` to regress — the Phase 4
+rollback signal — so we leave this entry point on OLD eval until RE
+grows a `tcoLoop`-equivalent. The `runRecWithBudget` infrastructure
+added in Phase 4 is ready to be used by a future phase when that
+lands.
+
 -}
 evalWithEnvAndLimit : Maybe Int -> ProjectEnv -> List String -> Expression -> Result Error Value
 evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expression =
@@ -2508,7 +2526,6 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                         |> List.map (\m -> ( m.moduleName, m.interface ))
                         |> ElmDict.fromList
 
-                -- User interfaces take precedence (first arg of union)
                 allInterfaces : ElmDict.Dict ModuleName (List Exposed)
                 allInterfaces =
                     ElmDict.union additionalInterfaces projectEnv.allInterfaces
@@ -2582,6 +2599,10 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
 {-| Like `evalWithEnvFromFiles`, but with an optional step limit.
 Pass `Just n` to limit evaluation to `n` trampoline steps (prevents infinite
 loops from consuming unbounded memory). Pass `Nothing` for unlimited.
+
+**Phase 4 status:** stays on the OLD-evaluator path for the same
+reason `evalWithEnvAndLimit` does — see that function's docstring.
+
 -}
 evalWithEnvFromFilesAndLimit : Maybe Int -> ProjectEnv -> List File -> Expression -> Result Error Value
 evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles expression =
@@ -3415,8 +3436,10 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw (ProjectEnv projectEnv) add
                 finalEnv
 
 
-{-| Resolved-IR variant of `evalWithEnvFromFilesAndValuesAndInterceptsRaw`.
+{-| Unlimited-budget delegate for
+`evalWithResolvedIRFromFilesAndInterceptsAndLimit`.
 
+Resolved-IR variant of `evalWithEnvFromFilesAndValuesAndInterceptsRaw`.
 Takes the same inputs (additional Files to register, injected Values,
 intercepts dict, entry Expression) and routes them through the new
 `Eval.ResolvedExpression.evalR` path instead of `Eval.Expression`.
@@ -3454,7 +3477,33 @@ evalWithResolvedIRFromFilesAndIntercepts :
     -> Dict.Dict String Types.Intercept
     -> Expression
     -> Types.EvalResult Value
-evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
+evalWithResolvedIRFromFilesAndIntercepts projectEnv additionalFiles injectedValues intercepts expression =
+    evalWithResolvedIRFromFilesAndInterceptsAndLimit
+        Nothing
+        projectEnv
+        additionalFiles
+        injectedValues
+        intercepts
+        expression
+
+
+{-| Step-budgeted variant. When `maxSteps` is `Just n`, the resolved-IR
+evaluator's trampoline (`runRecWithBudget`) decrements a counter per
+dispatch and returns "Step limit exceeded" when it reaches zero.
+`Nothing` means unlimited — cheap single-compare overhead per dispatch.
+
+This is the Phase 4 entry point that `evalWithEnvAndLimit` and
+`evalWithEnvFromFilesAndLimit` delegate to.
+-}
+evalWithResolvedIRFromFilesAndInterceptsAndLimit :
+    Maybe Int
+    -> ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> Types.EvalResult Value
+evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
     let
         parsedModules =
             additionalFiles
@@ -3792,7 +3841,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                     { trace = False
                     , coverage = False
                     , coverageProbeLines = Set.empty
-                    , maxSteps = Nothing
+                    , maxSteps = maxSteps
                     , tcoTarget = Nothing
                     , callCounts = Nothing
                     , intercepts = intercepts
@@ -3803,7 +3852,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
 
                 resolverCtx : Resolver.ResolverContext
                 resolverCtx =
-                    Resolver.initContext lastModule mergedGlobalIds
+                    Resolver.initContextWithImports lastModule mergedGlobalIds finalImports
             in
             case Resolver.resolveExpression resolverCtx (fakeNode expression) of
                 Err resolveError ->
@@ -4156,11 +4205,21 @@ extendWithFiles (ProjectEnv projectEnv) additionalFiles =
     envResult
         |> Result.map
             (\env ->
-                ProjectEnv
-                    { env = env
-                    , allInterfaces = allInterfaces
-                    , resolved = projectEnv.resolved
-                    }
+                -- Phase 4: also sync the `ResolvedProject` via
+                -- `extendResolvedWithFiles` so later
+                -- `evalWithResolvedIR*` calls find the new modules'
+                -- declarations in `globalIds` / `bodies` instead of
+                -- erroring with "unknown name" when the caller passes
+                -- an unqualified / aliased reference into the new
+                -- module. The OLD-eval side of the env (shared.functions)
+                -- was already synced by the `buildModuleEnv` fold above.
+                extendResolvedWithFiles additionalFiles
+                    (ProjectEnv
+                        { env = env
+                        , allInterfaces = allInterfaces
+                        , resolved = projectEnv.resolved
+                        }
+                    )
             )
 
 

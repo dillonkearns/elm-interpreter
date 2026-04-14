@@ -237,6 +237,75 @@ runRec project init =
     go (project init) []
 
 
+{-| Step-budgeted variant of `runRec`.
+
+Mirrors `runRec` but counts non-tail `project` invocations against a
+budget. Tail dispatches (`RTail`) are **not** counted — they're the
+trampoline's equivalent of OLD eval's `tcoLoop`, which calls
+`evalExpression` directly in a JS while-loop and never increments the
+recursion-step counter. Matching that semantics lets the step-budget
+tests in `tests/PerfTests.elm:tcoProofTests` pass on the resolved-IR
+path: a 100 000-iteration `countdown` runs in ~0 budget-counted steps
+(one per entry-level dispatch + a few for cond/return evaluations),
+not 100 000+ as it would if every tail iteration charged the budget.
+
+`RecThen` — the non-tail continuation path — does count, matching
+OLD eval's "every non-TCO recursion step decrements" semantics. If
+the budget reaches zero on a counted step, `makeError ()` is returned
+as the final `t` — for the resolved-IR evaluator, that produces an
+`EvErr` with a "Step limit exceeded" message.
+
+`budget == -1` is the unlimited sentinel: no decrements, no
+termination checks beyond the cheap `< 0` compare. This keeps the
+cost on the unlimited path to a single extra integer compare per
+counted dispatch.
+
+-}
+runRecWithBudget : Int -> (() -> t) -> (r -> Rec r t t) -> r -> t
+runRecWithBudget initialBudget makeError project init =
+    let
+        go : Int -> Rec r t t -> List (t -> Rec r t t) -> t
+        go n step stack =
+            case step of
+                RBase t ->
+                    case stack of
+                        [] ->
+                            t
+
+                        next :: rest ->
+                            go n (next t) rest
+
+                RTail r ->
+                    -- Tail dispatch: mirrors OLD eval's `tcoLoop`
+                    -- which doesn't decrement its own counter on
+                    -- each iteration. Unconditionally step forward.
+                    go n (project r) stack
+
+                RecThen r after ->
+                    if n == 0 then
+                        makeError ()
+
+                    else
+                        go (tickBudget n) (project r) (after :: stack)
+    in
+    if initialBudget == 0 then
+        makeError ()
+
+    else
+        go (tickBudget initialBudget) (project init) []
+
+
+{-| Decrement a step budget unless it's the `-1` unlimited sentinel.
+-}
+tickBudget : Int -> Int
+tickBudget n =
+    if n < 0 then
+        n
+
+    else
+        n - 1
+
+
 emptyConfig : Config
 emptyConfig =
     { trace = False
@@ -287,10 +356,34 @@ evalR initEnv initExpr =
        the spot via `envWithLocals staticEnv locals`. Those
        fallbacks are less frequent than the hot recurse path,
        so their record-construction cost doesn't dominate.
+
+       Step budget: `initEnv.fallbackConfig.maxSteps` threads
+       through from `Eval.Module`'s public entry points. When
+       `Just n`, each dispatch in the trampoline decrements a
+       counter and returns a "Step limit exceeded" `EvErr` when
+       it hits zero. When `Nothing`, the unlimited sentinel
+       (`-1`) is used and decrementing is skipped entirely — the
+       only cost on the unlimited path is one extra integer
+       compare per dispatch inside `runRecWithBudget`.
     -}
-    runRec
-        (\( locals, expr ) -> evalRStep initEnv locals expr)
-        ( initEnv.locals, initExpr )
+    let
+        stepProject : ( List Value, RExpr ) -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
+        stepProject ( locals, expr ) =
+            evalRStep initEnv locals expr
+    in
+    case initEnv.fallbackConfig.maxSteps of
+        Nothing ->
+            runRec stepProject ( initEnv.locals, initExpr )
+
+        Just budget ->
+            runRecWithBudget
+                budget
+                (\() ->
+                    evErr initEnv
+                        (Unsupported "Step limit exceeded")
+                )
+                stepProject
+                ( initEnv.locals, initExpr )
 
 
 {-| Rebuild a full REnv from the static-env closure + the current
