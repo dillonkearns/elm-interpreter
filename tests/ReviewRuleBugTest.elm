@@ -32,6 +32,25 @@ suite =
 
                             Ok _ ->
                                 Expect.pass
+        , test "Review.RequestedData.withFiles [] none stays well-typed" <|
+            \_ ->
+                case Eval.Module.buildProjectEnv packageSources of
+                    Err e ->
+                        Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)
+
+                    Ok projectEnv ->
+                        case Eval.Module.evalWithEnv projectEnv [ requestedDataUserModule ] (Expression.FunctionOrValue [] "main") of
+                            Err (Types.EvalError e) ->
+                                Expect.fail (Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                            Err e ->
+                                Expect.fail (Debug.toString e)
+
+                            Ok (String result) ->
+                                Expect.equal "UNCHANGED" result
+
+                            Ok other ->
+                                Expect.fail ("Unexpected value: " ++ Debug.toString other)
         , test "Elm.Docs.decoder works via resolved IR path (no-values docs JSON)" <|
             \_ ->
                 let
@@ -118,6 +137,11 @@ suite =
 userModule : String
 userModule =
     "module Main exposing (main)\n\nimport Review.Rule as Rule exposing (Rule)\nimport Review.Project as Project\n\nmain =\n    let\n        rule : Rule\n        rule =\n            Rule.newModuleRuleSchema \"TestRule\" ()\n                |> Rule.withSimpleExpressionVisitor (\\_ -> [])\n                |> Rule.fromModuleRuleSchema\n\n        project =\n            Project.new\n                |> Project.addModule { path = \"src/A.elm\", source = \"module A exposing (..)\\na = String.fromInt 42\\n\" }\n\n        result =\n            Rule.reviewV2 [ rule ] Nothing project\n    in\n    case result.errors of\n        [] -> \"OK_NO_ERRORS\"\n        _ -> \"GOT_ERRORS\"\n"
+
+
+requestedDataUserModule : String
+requestedDataUserModule =
+    "module Main exposing (main)\n\nimport Review.RequestedData as RequestedData exposing (RequestedData(..))\n\nmain =\n    case RequestedData.withFiles [] RequestedData.none of\n        RequestedData requested ->\n            if List.isEmpty requested.files then\n                \"UNCHANGED\"\n\n            else\n                \"CHANGED\"\n"
 
 
 packageSources : List String

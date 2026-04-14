@@ -645,11 +645,12 @@ The `nativeDispatchers`, `higherOrderDispatchers`, and
 never change under user-module edits, so they carry over from
 `base` unchanged.
 
-**Perf**: O(changed_modules × decls_per_module) resolver walks +
+**Perf**: O(changed\_modules × decls\_per\_module) resolver walks +
 O(base.globalIds) purge scan. For mutation testing's hot loop
 (one module changed per mutant) this is 1/N the cost of the
 full-project rebuild from Phase 1a, where N is the total module
 count. On small-12 that's ~40× faster per call.
+
 -}
 rebuildResolvedForModules :
     List ModuleName
@@ -1124,8 +1125,16 @@ normalizeSummaries summaries =
                     )
                 |> Dict.fromList
 
-        ( normalizedFunctions, _ ) =
+        ( normalizedFunctions, normalizedPrecomputedValues ) =
             normalizeTopLevelConstants summaries sharedFunctionsBefore sharedModuleImports
+
+        optimizedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        optimizedFunctions =
+            optimizeDependencySummaryBodies
+                summaries
+                sharedModuleImports
+                normalizedFunctions
+                normalizedPrecomputedValues
     in
     summaries
         |> List.map
@@ -1137,7 +1146,7 @@ normalizeSummaries summaries =
 
                     updatedFns : Dict.Dict String FunctionImplementation
                     updatedFns =
-                        Dict.get moduleKey normalizedFunctions
+                        Dict.get moduleKey optimizedFunctions
                             |> Maybe.withDefault Dict.empty
                 in
                 { summary
@@ -1150,6 +1159,90 @@ normalizeSummaries summaries =
                                 )
                 }
             )
+
+
+optimizeDependencySummaryBodies :
+    List CachedModuleSummary
+    -> Dict.Dict String ImportedNames
+    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> Dict.Dict String (Dict.Dict String Value)
+    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+optimizeDependencySummaryBodies summaries sharedModuleImports normalizedFunctions normalizedPrecomputedValues =
+    let
+        cfg : Types.Config
+        cfg =
+            { trace = False
+            , coverage = False
+            , coverageProbeLines = Set.empty
+            , maxSteps = Nothing
+            , tcoTarget = Nothing
+            , callCounts = Nothing
+            , intercepts = Dict.empty
+            , memoizedFunctions = MemoSpec.emptyRegistry
+            , collectMemoStats = False
+            , useResolvedIR = False
+            }
+
+        flags : NormalizationFlags.NormalizationFlags
+        flags =
+            NormalizationFlags.packageAggressive
+    in
+    summaries
+        |> List.foldl
+            (\summary acc ->
+                let
+                    moduleKey : String
+                    moduleKey =
+                        Environment.moduleKey summary.moduleName
+
+                    moduleImports : ImportedNames
+                    moduleImports =
+                        Dict.get moduleKey sharedModuleImports
+                            |> Maybe.withDefault emptyImports
+
+                    currentModuleFunctions : Dict.Dict String FunctionImplementation
+                    currentModuleFunctions =
+                        Dict.get moduleKey normalizedFunctions
+                            |> Maybe.withDefault Dict.empty
+
+                    env : Env
+                    env =
+                        { currentModule = summary.moduleName
+                        , currentModuleKey = moduleKey
+                        , callStack = []
+                        , shared =
+                            { functions = normalizedFunctions
+                            , moduleImports = sharedModuleImports
+                            , resolveBridge = Types.noResolveBridge
+                            , precomputedValues = normalizedPrecomputedValues
+                            , tcoAnalyses = Dict.empty
+                            }
+                        , currentModuleFunctions = currentModuleFunctions
+                        , letFunctions = Dict.empty
+                        , values = Dict.empty
+                        , imports = moduleImports
+                        , callDepth = 0
+                        , recursionCheck = Nothing
+                        }
+
+                    optimizedModuleFunctions : Dict.Dict String FunctionImplementation
+                    optimizedModuleFunctions =
+                        currentModuleFunctions
+                            |> Dict.map
+                                (\_ funcImpl ->
+                                    if List.isEmpty funcImpl.arguments then
+                                        funcImpl
+
+                                    else
+                                        { funcImpl
+                                            | expression =
+                                                foldWithFlags flags env cfg funcImpl.expression
+                                        }
+                                )
+                in
+                Dict.insert moduleKey optimizedModuleFunctions acc
+            )
+            Dict.empty
 
 
 {-| AST normalization pass: eagerly evaluate every zero-arg function whose
@@ -2064,6 +2157,7 @@ tryInlineFunction env moduleName funcName args =
                     && not (containsSelfCallInExpr funcName funcImpl.expression)
                     && expressionSize funcImpl.expression
                     < 30
+                    && isInlineSafeExpression funcImpl.expression
                     && not (referencesInternalHelper funcImpl.expression)
             then
                 case extractVarPatternNames funcImpl.arguments of
@@ -2212,6 +2306,74 @@ expressionSize (Node _ expr) =
 
         _ ->
             1
+
+
+{-| Keep package-summary inlining to expression-only helpers.
+Control-flow helpers like `List.isEmpty` were profitable on paper but
+caused bad rewrites in the elm-review dependency graph.
+-}
+isInlineSafeExpression : Node Expression -> Bool
+isInlineSafeExpression (Node _ expr) =
+    case expr of
+        Integer _ ->
+            True
+
+        Hex _ ->
+            True
+
+        Floatable _ ->
+            True
+
+        Literal _ ->
+            True
+
+        CharLiteral _ ->
+            True
+
+        UnitExpr ->
+            True
+
+        FunctionOrValue _ _ ->
+            True
+
+        Application items ->
+            List.all isInlineSafeExpression items
+
+        OperatorApplication _ _ left right ->
+            isInlineSafeExpression left && isInlineSafeExpression right
+
+        Negation inner ->
+            isInlineSafeExpression inner
+
+        ParenthesizedExpression inner ->
+            isInlineSafeExpression inner
+
+        ListExpr items ->
+            List.all isInlineSafeExpression items
+
+        TupledExpression items ->
+            List.all isInlineSafeExpression items
+
+        RecordExpr fields ->
+            List.all (\(Node _ ( _, value )) -> isInlineSafeExpression value) fields
+
+        RecordAccess inner _ ->
+            isInlineSafeExpression inner
+
+        IfBlock _ _ _ ->
+            False
+
+        CaseExpression _ ->
+            False
+
+        LetExpression _ ->
+            False
+
+        LambdaExpression _ ->
+            False
+
+        _ ->
+            False
 
 
 {-| Scope-aware substitution: when entering a binding scope (case pattern,
@@ -4708,6 +4870,7 @@ invocation tax dominated by the body walk in
 `TcoAnalysis.collectTailCalls` and `Eval.Expression.containsSelfCall`.
 On fuzz-heavy workloads (~100K+ calls) that adds up to hundreds of ms
 of pure repeated work.
+
 -}
 precomputeTcoAnalyses :
     Dict.Dict String (Dict.Dict String FunctionImplementation)

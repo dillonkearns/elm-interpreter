@@ -8,6 +8,7 @@ import Elm.Syntax.Node as Node exposing (Node(..))
 import Eval
 import Eval.Module
 import Expect
+import Expression.Extra
 import ListFusion
 import TcoAnalysis
 import Test exposing (Test, describe, skip, test)
@@ -23,6 +24,7 @@ suite =
         , largeListTailRecursionTests
         , tcoAnalysisTests
         , constantFoldingTests
+        , dependencySummaryOptimizationTests
         , dictInliningTests
         , listFusionTests
         , normalizationLosslessnessTests
@@ -199,7 +201,7 @@ main =
 which evaluated to `Int Infinity` at normalization time. The normalizer
 replaced the body with `Expression.Integer Infinity`, which the Wire3
 codec can't round-trip — making the package summary cache silently
-refuse to persist (package_summary_cache_roundtrip_ok = 0 on every
+refuse to persist (package\_summary\_cache\_roundtrip\_ok = 0 on every
 warm run, ~500ms wasted on body-edit scenarios).
 
 Fix: `isLosslessValue` rejects non-finite Int/Float values, so the
@@ -209,6 +211,7 @@ so the in-memory `precomputedValues` cache still hits — recovering the
 runtime speedup without re-introducing the cache corruption. The
 on-disk user-norm cache filters non-lossless values at encode time in
 `InterpreterProject.encodeUserNormCacheEntry`.
+
 -}
 normalizationLosslessnessTests : Test
 normalizationLosslessnessTests =
@@ -300,47 +303,48 @@ The `recurse 50 acc` wrapper makes that re-eval cost hundreds of
 interpreter steps, so a low `maxSteps` budget distinguishes the two
 paths: a cache hit uses ~5 steps and succeeds, a cache miss walks
 the recursion and runs out of budget.
+
 -}
 aliasedPrecomputedLookupTests : Test
 aliasedPrecomputedLookupTests =
     describe "aliased cross-module precomputed-value lookup"
         [ skip <|
             test "aliased qualified ref hits precomputedValues cache" <|
-            \_ ->
-                -- SKIPPED on the `elm-review-runner` branch.
-                --
-                -- This test requires `tryNormalizeConstant` in
-                -- `Eval.Module` to populate `precomputedValues` with
-                -- non-lossless values (`Int Infinity`, `Float NaN`, …)
-                -- so the aliased lookup in `evalNonVariant`
-                -- (upstream `8c2f76e`) can hit. The population side
-                -- was added upstream in `5d861fa` and then reverted
-                -- on this branch in `d9c39de` because the original
-                -- implementation cost +17.7% cold on small-12 via
-                -- interactions with the fixpoint normalization loop.
-                --
-                -- Upstream `1a71da1` replaced the fixpoint with a
-                -- topological single-pass. The theory was this would
-                -- neutralize the regression, and I briefly reintroduced
-                -- the fix in submodule commit `07d382c`. An n=5 bench
-                -- on small-12 showed it still costs +13.7% cold (280
-                -- → 319 legacy, 251 → 272 resolved-list-unplanned),
-                -- and a single-run isolation bench confirmed flipping
-                -- just this one line is the cause. The fixpoint loop
-                -- wasn't the dominant factor; the real cost is
-                -- elsewhere (likely per-pass dict-merge work or
-                -- later cache-lookup hot-path interactions).
-                --
-                -- Re-enable this test after finding a mechanism that
-                -- populates non-lossless values without regressing
-                -- cold. Candidate approaches include lazy memoization
-                -- at the `evalNonVariant` cache-miss site (populate on
-                -- first access, not at normalization time) or
-                -- narrowing the population to only aliased lookups.
-                let
-                    innerSource : String
-                    innerSource =
-                        """module Inner exposing (slow)
+                \_ ->
+                    -- SKIPPED on the `elm-review-runner` branch.
+                    --
+                    -- This test requires `tryNormalizeConstant` in
+                    -- `Eval.Module` to populate `precomputedValues` with
+                    -- non-lossless values (`Int Infinity`, `Float NaN`, …)
+                    -- so the aliased lookup in `evalNonVariant`
+                    -- (upstream `8c2f76e`) can hit. The population side
+                    -- was added upstream in `5d861fa` and then reverted
+                    -- on this branch in `d9c39de` because the original
+                    -- implementation cost +17.7% cold on small-12 via
+                    -- interactions with the fixpoint normalization loop.
+                    --
+                    -- Upstream `1a71da1` replaced the fixpoint with a
+                    -- topological single-pass. The theory was this would
+                    -- neutralize the regression, and I briefly reintroduced
+                    -- the fix in submodule commit `07d382c`. An n=5 bench
+                    -- on small-12 showed it still costs +13.7% cold (280
+                    -- → 319 legacy, 251 → 272 resolved-list-unplanned),
+                    -- and a single-run isolation bench confirmed flipping
+                    -- just this one line is the cause. The fixpoint loop
+                    -- wasn't the dominant factor; the real cost is
+                    -- elsewhere (likely per-pass dict-merge work or
+                    -- later cache-lookup hot-path interactions).
+                    --
+                    -- Re-enable this test after finding a mechanism that
+                    -- populates non-lossless values without regressing
+                    -- cold. Candidate approaches include lazy memoization
+                    -- at the `evalNonVariant` cache-miss site (populate on
+                    -- first access, not at normalization time) or
+                    -- narrowing the population to only aliased lookups.
+                    let
+                        innerSource : String
+                        innerSource =
+                            """module Inner exposing (slow)
 
 slow : Int
 slow =
@@ -356,14 +360,14 @@ recurse n acc =
         recurse (n - 1) acc
 """
 
-                    -- `Probe` has the `import Inner as I` alias we want
-                    -- to exercise, but we DON'T normalize it — that would
-                    -- precompute `main` to `Int Infinity` and short-circuit
-                    -- the top-level lookup before we ever hit the aliased
-                    -- `I.slow` path we're trying to test.
-                    probeSource : String
-                    probeSource =
-                        """module Probe exposing (main)
+                        -- `Probe` has the `import Inner as I` alias we want
+                        -- to exercise, but we DON'T normalize it — that would
+                        -- precompute `main` to `Int Infinity` and short-circuit
+                        -- the top-level lookup before we ever hit the aliased
+                        -- `I.slow` path we're trying to test.
+                        probeSource : String
+                        probeSource =
+                            """module Probe exposing (main)
 
 import Inner as I
 
@@ -373,36 +377,36 @@ main =
     0
 """
 
-                    parseFile : String -> Result String Elm.Syntax.File.File
-                    parseFile src =
-                        Elm.Parser.parseToFile src
-                            |> Result.mapError (\_ -> "parse error")
-                in
-                case ( Eval.Module.buildProjectEnv [], parseFile innerSource ) of
-                    ( Ok baseEnv, Ok innerFile ) ->
-                        case Eval.Module.extendWithFilesNormalized baseEnv [ innerFile ] of
-                            Err _ ->
-                                Expect.fail "extendWithFilesNormalized failed"
+                        parseFile : String -> Result String Elm.Syntax.File.File
+                        parseFile src =
+                            Elm.Parser.parseToFile src
+                                |> Result.mapError (\_ -> "parse error")
+                    in
+                    case ( Eval.Module.buildProjectEnv [], parseFile innerSource ) of
+                        ( Ok baseEnv, Ok innerFile ) ->
+                            case Eval.Module.extendWithFilesNormalized baseEnv [ innerFile ] of
+                                Err _ ->
+                                    Expect.fail "extendWithFilesNormalized failed"
 
-                            Ok projectEnvWithInner ->
-                                case
-                                    Eval.Module.evalWithEnvAndLimit
-                                        (Just 30)
-                                        projectEnvWithInner
-                                        [ probeSource ]
-                                        (Expression.FunctionOrValue [ "I" ] "slow")
-                                of
-                                    Ok _ ->
-                                        Expect.pass
+                                Ok projectEnvWithInner ->
+                                    case
+                                        Eval.Module.evalWithEnvAndLimit
+                                            (Just 30)
+                                            projectEnvWithInner
+                                            [ probeSource ]
+                                            (Expression.FunctionOrValue [ "I" ] "slow")
+                                    of
+                                        Ok _ ->
+                                            Expect.pass
 
-                                    Err e ->
-                                        Expect.fail
-                                            ("I.slow eval ran out of step budget — the aliased cross-module ref to Inner.slow is not hitting the precomputedValues cache. Error: "
-                                                ++ Debug.toString e
-                                            )
+                                        Err e ->
+                                            Expect.fail
+                                                ("I.slow eval ran out of step budget — the aliased cross-module ref to Inner.slow is not hitting the precomputedValues cache. Error: "
+                                                    ++ Debug.toString e
+                                                )
 
-                    _ ->
-                        Expect.fail "setup failed (parse or buildProjectEnv)"
+                        _ ->
+                            Expect.fail "setup failed (parse or buildProjectEnv)"
         ]
 
 
@@ -667,6 +671,7 @@ total sizeOfValue cost was ~31 billion node traversals.
 
 These tests verify that iterating over large lists completes in bounded time
 (i.e. the cycle-check cost is O(1) per check, not O(listLen)).
+
 -}
 largeListTailRecursionTests : Test
 largeListTailRecursionTests =
@@ -773,6 +778,7 @@ non-TCO trampoline path (which uses ~5-10 trampoline steps per iteration).
 
 If TCO is NOT engaging, these tests FAIL with "Step limit exceeded".
 If TCO IS engaging, the step budget is sufficient and they pass.
+
 -}
 tcoProofTests : Test
 tcoProofTests =
@@ -1083,6 +1089,74 @@ constantFoldingTests =
                     ]
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (Int 15))
+        ]
+
+
+dependencySummaryOptimizationTests : Test
+dependencySummaryOptimizationTests =
+    let
+        normalizedBodyString :
+            List String
+            -> String
+            -> String
+            -> Result String String
+        normalizedBodyString sources moduleName functionName =
+            case Eval.Module.parseProjectSources sources of
+                Err _ ->
+                    Err "parse failed"
+
+                Ok parsedModules ->
+                    case
+                        Eval.Module.normalizeSummaries
+                            (Eval.Module.buildCachedModuleSummariesFromParsed parsedModules)
+                            |> List.filter (\summary -> summary.moduleName == [ moduleName ])
+                            |> List.concatMap .functions
+                            |> List.filter (\func -> Node.value func.name == functionName)
+                            |> List.head
+                    of
+                        Just func ->
+                            Ok (Expression.Extra.toString func.expression)
+
+                        Nothing ->
+                            Err "function not found"
+    in
+    describe "Dependency summary optimization"
+        [ test "cross-module simple helper is inlined in normalized summaries" <|
+            \_ ->
+                normalizedBodyString
+                    [ String.join "\n"
+                        [ "module Helpers exposing (inc)"
+                        , "inc n ="
+                        , "    n + 1"
+                        ]
+                    , String.join "\n"
+                        [ "module Main exposing (bump)"
+                        , "import Helpers"
+                        , "bump x ="
+                        , "    Helpers.inc x"
+                        ]
+                    ]
+                    "Main"
+                    "bump"
+                    |> Expect.equal (Ok "x + 1")
+        , test "cross-module precomputed constant is substituted in normalized summaries" <|
+            \_ ->
+                normalizedBodyString
+                    [ String.join "\n"
+                        [ "module Constants exposing (threshold)"
+                        , "threshold ="
+                        , "    10"
+                        ]
+                    , String.join "\n"
+                        [ "module Main exposing (bump)"
+                        , "import Constants"
+                        , "bump x ="
+                        , "    x + Constants.threshold"
+                        ]
+                    ]
+                    "Main"
+                    "bump"
+                    |> Expect.equal (Ok "x + 10")
         ]
 
 

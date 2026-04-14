@@ -1,4 +1,4 @@
-module NormalizationFlags exposing (NormalizationFlags, all, default, experimental, none)
+module NormalizationFlags exposing (NormalizationFlags, all, default, experimental, none, packageAggressive)
 
 {-| Feature flags for individual normalization passes.
 Toggle independently to measure impact of each optimization.
@@ -11,6 +11,7 @@ targeted way.
 The `fixpoint*` and `listFusion*` flags gate the two passes that run
 unconditionally today in `runModuleNormalizationToFixpoint`. These
 are the knobs the A/B benchmark harness wants.
+
 -}
 
 
@@ -81,6 +82,7 @@ getting pre-computed at load time and fall back to runtime re-eval
 per reference. Callers who know their project hits this pattern
 (e.g. `String.Diacritics.lookupArray ← lookupTable`) can bump
 `fixpointPasses` to 2 or 3 via the flag plumbing.
+
 -}
 default : NormalizationFlags
 default =
@@ -103,3 +105,25 @@ takes to run a new experiment.
 experimental : NormalizationFlags
 experimental =
     default
+
+
+{-| Dependency/package-only body optimization profile.
+
+This is intentionally more aggressive than `default`, because package
+summary normalization is cached to disk and reused across many user-project
+loads. That makes it a good place to spend extra work on:
+
+  - inlining small helper functions
+  - substituting already-precomputed zero-arg refs
+
+We keep constant-application folding off here because it eagerly invokes the
+evaluator across arbitrary subexpressions and is a much bigger compile-time
+multiplier.
+
+-}
+packageAggressive : NormalizationFlags
+packageAggressive =
+    { default
+        | inlinePrecomputedRefs = True
+        , inlineFunctions = True
+    }
