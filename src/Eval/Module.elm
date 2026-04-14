@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -1445,7 +1445,8 @@ dict. All three are keyed on the simple function name.
 
 -}
 runModuleNormalizationToFixpoint :
-    ModuleName
+    Maybe (Set String)
+    -> ModuleName
     -> String
     -> ImportedNames
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
@@ -1458,8 +1459,17 @@ runModuleNormalizationToFixpoint :
         , Dict.Dict String FunctionImplementation
         , Dict.Dict String Value
         )
-runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
+runModuleNormalizationToFixpoint normalizationTargets moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
     let
+        isSelectedTarget : String -> Bool
+        isSelectedTarget name =
+            case normalizationTargets of
+                Nothing ->
+                    True
+
+                Just selectedNames ->
+                    Set.member name selectedNames
+
         -- Flags read from the single `NormalizationFlags.experimental`
         -- knob. Edit that value + rebuild to run a new A/B experiment.
         flags : NormalizationFlags.NormalizationFlags
@@ -1494,7 +1504,7 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
                             -- rewritten body from the incoming `currentFns`.
                             { acc | fns = Dict.insert name priorFn acc.fns }
 
-                        else if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
+                        else if isSelectedTarget name && List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
                             case
                                 tryNormalizeConstant
                                     moduleName
@@ -1550,6 +1560,7 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
         ( fixpointFns, fixpointDelta, fixpointPrecomputed ) =
             if flags.runFixpoint then
                 normalizeInDepOrder
+                    normalizationTargets
                     moduleName
                     moduleKey
                     moduleImports
@@ -1573,12 +1584,12 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
             if flags.runListFusion then
                 fixpointFns
                     |> Dict.map
-                        (\_ funcImpl ->
-                            if List.isEmpty funcImpl.arguments then
-                                funcImpl
+                        (\name funcImpl ->
+                            if isSelectedTarget name && not (List.isEmpty funcImpl.arguments) then
+                                { funcImpl | expression = ListFusion.fuse funcImpl.expression }
 
                             else
-                                { funcImpl | expression = ListFusion.fuse funcImpl.expression }
+                                funcImpl
                         )
 
             else
@@ -1598,16 +1609,20 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
             foldedFns
                 |> Dict.foldl
                     (\name foldedImpl acc ->
-                        case Dict.get name originalModuleFns of
-                            Just origImpl ->
-                                if foldedImpl.expression /= origImpl.expression then
-                                    Dict.insert name foldedImpl acc
+                        if isSelectedTarget name then
+                            case Dict.get name originalModuleFns of
+                                Just origImpl ->
+                                    if foldedImpl.expression /= origImpl.expression then
+                                        Dict.insert name foldedImpl acc
 
-                                else
+                                    else
+                                        acc
+
+                                Nothing ->
                                     acc
 
-                            Nothing ->
-                                acc
+                        else
+                            acc
                     )
                     foldedDelta
     in
@@ -1634,7 +1649,8 @@ but the guard keeps the pass safe on malformed input.
 
 -}
 normalizeInDepOrder :
-    ModuleName
+    Maybe (Set String)
+    -> ModuleName
     -> String
     -> ImportedNames
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
@@ -1647,14 +1663,23 @@ normalizeInDepOrder :
         , Dict.Dict String FunctionImplementation
         , Dict.Dict String Value
         )
-normalizeInDepOrder moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
+normalizeInDepOrder normalizationTargets moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
     let
+        isSelectedTarget : String -> Bool
+        isSelectedTarget name =
+            case normalizationTargets of
+                Nothing ->
+                    True
+
+                Just selectedNames ->
+                    Set.member name selectedNames
+
         candidateNames : Set String
         candidateNames =
             originalModuleFns
                 |> Dict.foldl
                     (\name funcImpl acc ->
-                        if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
+                        if isSelectedTarget name && List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
                             Set.insert name acc
 
                         else
@@ -2308,9 +2333,10 @@ expressionSize (Node _ expr) =
             1
 
 
-{-| Keep package-summary inlining to expression-only helpers.
-Control-flow helpers like `List.isEmpty` were profitable on paper but
-caused bad rewrites in the elm-review dependency graph.
+{-| Keep package-summary inlining to simple expression helpers.
+Control-flow and generic function-call helpers like `List.isEmpty` were
+profitable on paper but caused bad rewrites or warm-path regressions in the
+elm-review dependency graph.
 -}
 isInlineSafeExpression : Node Expression -> Bool
 isInlineSafeExpression (Node _ expr) =
@@ -2337,7 +2363,18 @@ isInlineSafeExpression (Node _ expr) =
             True
 
         Application items ->
-            List.all isInlineSafeExpression items
+            case items of
+                [] ->
+                    False
+
+                headExpr :: args ->
+                    case Node.value headExpr of
+                        FunctionOrValue _ name ->
+                            Eval.Expression.isUpperName name
+                                && List.all isInlineSafeExpression args
+
+                        _ ->
+                            False
 
         OperatorApplication _ _ left right ->
             isInlineSafeExpression left && isInlineSafeExpression right
@@ -5027,11 +5064,16 @@ functions and previously-normalized sibling modules are visible) and the
 place to install the rewritten bodies.
 
 -}
-normalizeOneModuleInEnv :
-    ModuleName
+normalizeOneModuleInEnvSelected :
+    Maybe (Set String)
+    -> ModuleName
     -> ProjectEnv
-    -> ( ProjectEnv, Dict.Dict String FunctionImplementation )
-normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
+    ->
+        ( ProjectEnv
+        , Dict.Dict String FunctionImplementation
+        , Dict.Dict String Value
+        )
+normalizeOneModuleInEnvSelected normalizationTargets moduleName (ProjectEnv projectEnv) =
     let
         env : Env
         env =
@@ -5066,6 +5108,7 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
 
         ( normalizedModuleFns, delta, normalizedPrecomputedFns ) =
             runModuleNormalizationToFixpoint
+                normalizationTargets
                 moduleName
                 moduleKey
                 moduleImports
@@ -5074,6 +5117,25 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
                 sharedPrecomputedValues
                 originalModuleFns
                 originalPrecomputedFns
+
+        selectedPrecomputed : Dict.Dict String Value
+        selectedPrecomputed =
+            case normalizationTargets of
+                Nothing ->
+                    normalizedPrecomputedFns
+
+                Just targetNames ->
+                    targetNames
+                        |> Set.foldl
+                            (\name acc ->
+                                case Dict.get name normalizedPrecomputedFns of
+                                    Just value ->
+                                        Dict.insert name value acc
+
+                                    Nothing ->
+                                        acc
+                            )
+                            Dict.empty
 
         updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
         updatedFunctions =
@@ -5098,7 +5160,16 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
                     }
             }
     in
-    ( ProjectEnv { projectEnv | env = newEnv }, delta )
+    ( ProjectEnv { projectEnv | env = newEnv }, delta, selectedPrecomputed )
+
+
+normalizeOneModuleInEnv :
+    ModuleName
+    -> ProjectEnv
+    -> ( ProjectEnv, Dict.Dict String FunctionImplementation )
+normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
+    normalizeOneModuleInEnvSelected Nothing moduleName (ProjectEnv projectEnv)
+        |> (\( updatedEnv, delta, _ ) -> ( updatedEnv, delta ))
 
 
 {-| Merge a pre-computed normalization delta into the env, overlaying the
