@@ -1313,7 +1313,27 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
                     )
 
             else
-                Nothing
+                -- Eval succeeded but the value can't round-trip to an
+                -- Expression (e.g., `round (1 / 0) : Int` evaluates to
+                -- `Int Infinity`, which `Expression.Integer Infinity`
+                -- can't Wire3-encode). Return the value anyway so the
+                -- in-memory `precomputedValues` cache still hits at
+                -- runtime — the user-norm on-disk cache filters these
+                -- out before serializing. Keeps the original expression
+                -- so the function body still round-trips.
+                --
+                -- Previously reverted in `d9c39de` because caching
+                -- non-lossless values in the fixpoint normalization loop
+                -- triggered additional passes + larger per-pass dict
+                -- merges, driving a +17.7% cold regression on small-12.
+                -- Upstream `1a71da1` replaced the fixpoint with a
+                -- topological-order single pass, which removes the
+                -- concern — this reintroduction is required for the
+                -- `PerfTests.aliasedPrecomputedLookupTests` merged from
+                -- upstream `8c2f76e` to pass, and the cold regression
+                -- should not recur since there's no fixpoint left to
+                -- amplify the work.
+                Just ( funcImpl, value )
 
         Err _ ->
             Nothing
