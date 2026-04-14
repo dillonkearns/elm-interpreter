@@ -271,10 +271,18 @@ variableTests =
             \_ -> expectResolvesTo "helper" (RGlobal 100)
         , test "qualified global" <|
             \_ -> expectResolvesTo "Other.func" (RGlobal 200)
-        , test "uppercase unqualified → RCtor" <|
+        , test "uppercase unqualified → RCtor (canonical currentModule)" <|
             \_ ->
+                -- Unqualified `Nothing` in the `Test` module with no
+                -- `Maybe(..)` import falls through to the current-module
+                -- fallback, which now tags the `RCtor` with the current
+                -- module name (`["Test"]`) to mirror OLD eval's
+                -- `evalVariant` normalization. Previously dropped to `[]`,
+                -- which caused `Custom` value `==` mismatches whenever the
+                -- same ctor was qualified elsewhere. See
+                -- `ClosureOrderingTest.orderExtraExplicitViaExtendResolved`.
                 expectResolvesTo "Nothing"
-                    (RCtor { moduleName = [], name = "Nothing" })
+                    (RCtor { moduleName = [ "Test" ], name = "Nothing" })
         , test "uppercase qualified → RCtor" <|
             \_ ->
                 expectResolvesTo "Maybe.Just"
