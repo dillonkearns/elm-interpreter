@@ -78,6 +78,7 @@ type alias ResolvedProject =
     , nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
     , higherOrderDispatchers : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
     , kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
+    , globals : Dict.Dict IR.GlobalId Value
     , errors : List ResolveErrorEntry
     }
 
@@ -108,6 +109,66 @@ through its own code path inside this module.
 projectEnvResolved : ProjectEnv -> ResolvedProject
 projectEnvResolved (ProjectEnv projectEnv) =
     projectEnv.resolved
+
+
+{-| Rebuild `ResolvedProject.globals` from `env.shared.precomputedValues`,
+mapping each `(moduleKey, name)` pair through `resolved.globalIds` to
+find the matching `GlobalId`. Entries whose module or name isn't in
+`globalIds` are silently dropped — the resolver's user-module pass may
+not have picked them up, and the precomputed cache is always a best-
+effort optimization.
+
+Phase 2 of the OLD-evaluator migration plan: the resolved-IR evaluator
+(`Eval.ResolvedExpression.evalGlobal`) already checks `env.globals`
+before walking a resolved body, so by populating this dict at project-
+load / normalization time, we move the precomputed-value fast path
+from OLD eval's `evalFunctionOrValue` to RE's `evalGlobal`. That in
+turn replaces the per-eval `precomputedGlobalsCache` construction
+inside `evalWithResolvedIRFromFilesAndIntercepts` with a one-shot
+build at project-env time, amortizing the cost across every later
+eval instead of paying it per call.
+
+Called at every site that mutates `env.shared.precomputedValues`:
+initial `buildProjectEnv*` completion, `extendResolvedWithFiles`,
+`extendWithFilesNormalized`, `normalizeOneModuleInEnv`,
+`normalizeUserModulesInEnv`, `replaceModuleInEnv`, etc. The call is
+pure and idempotent — safe to invoke whenever the ProjectEnv passes
+through a public boundary.
+
+-}
+refreshResolvedGlobals : ProjectEnv -> ProjectEnv
+refreshResolvedGlobals (ProjectEnv projectEnv) =
+    let
+        newGlobals : Dict.Dict IR.GlobalId Value
+        newGlobals =
+            projectEnv.env.shared.precomputedValues
+                |> Dict.foldl
+                    (\moduleKey moduleVals outer ->
+                        let
+                            mn : ModuleName
+                            mn =
+                                String.split "." moduleKey
+                        in
+                        Dict.foldl
+                            (\name value inner ->
+                                case Dict.get ( mn, name ) projectEnv.resolved.globalIds of
+                                    Just id ->
+                                        Dict.insert id value inner
+
+                                    Nothing ->
+                                        inner
+                            )
+                            outer
+                            moduleVals
+                    )
+                    Dict.empty
+
+        resolved : ResolvedProject
+        resolved =
+            projectEnv.resolved
+    in
+    ProjectEnv
+        { projectEnv | resolved = { resolved | globals = newGlobals } }
 
 
 {-| Evaluate a top-level expression via the new resolved-IR evaluator.
@@ -206,7 +267,7 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                 renv : RE.REnv
                 renv =
                     { locals = []
-                    , globals = Dict.empty
+                    , globals = projectEnv.resolved.globals
                     , resolvedBodies = projectEnv.resolved.bodies
                     , globalIdToName = projectEnv.resolved.globalIdToName
                     , nativeDispatchers = projectEnv.resolved.nativeDispatchers
@@ -502,6 +563,7 @@ resolveProject summaries =
             , nativeDispatchers = nativeDispatchers
             , higherOrderDispatchers = higherOrderDispatchers
             , kernelDispatchers = kernelDispatchers
+            , globals = Dict.empty
             , errors = []
             }
     in
@@ -840,11 +902,13 @@ buildProjectEnvFromSummaries summaries =
             }
     in
     Ok
-        (ProjectEnv
-            { env = env
-            , allInterfaces = allInterfaces
-            , resolved = resolveProject summaries
-            }
+        (refreshResolvedGlobals
+            (ProjectEnv
+                { env = env
+                , allInterfaces = allInterfaces
+                , resolved = resolveProject summaries
+                }
+            )
         )
 
 
@@ -2374,11 +2438,13 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
     buildModuleEnv updatedInterfaces newModule cleanedEnv
         |> Result.map
             (\env ->
-                ProjectEnv
-                    { env = env
-                    , allInterfaces = updatedInterfaces
-                    , resolved = projectEnv.resolved
-                    }
+                refreshResolvedGlobals
+                    (ProjectEnv
+                        { env = env
+                        , allInterfaces = updatedInterfaces
+                        , resolved = projectEnv.resolved
+                        }
+                    )
             )
 
 
@@ -3625,39 +3691,32 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                    mutable cache, which isn't worth the complexity until
                    we see it dominate in profiles.
                 -}
-                {- Pre-built `globals` cache from the project's
-                   `precomputedValues`, shared between the main `renv`
-                   and the `installedBridge`'s per-call `bridgeRenv`.
+                {- Pre-built `globals` cache from the project env's
+                   `ResolvedProject.globals`, shared between the main
+                   `renv` and the `installedBridge`'s per-call
+                   `bridgeRenv`. Phase 2 of the OLD-evaluator migration
+                   plan: previously this dict was rebuilt per call by
+                   walking `env.shared.precomputedValues` and mapping
+                   each entry through `mergedGlobalIds`. Now the
+                   project env carries the pre-built dict, so repeated
+                   calls amortize the build cost to zero.
+
+                   `mergedGlobalIds` is a superset of
+                   `baseResolved.globalIds` (new additional-file ids
+                   extend the map rather than replace it), so any
+                   entry already in `projectEnv.resolved.globals`
+                   stays valid under the merged map. Additional files
+                   aren't normalized at this point, so they don't
+                   contribute new `precomputedValues` entries — the
+                   cache is complete with the base set.
+
                    Critical for `RemoveAccentsTest`-shape workloads
                    where a 65 K-iteration `Array.initialize` callback
-                   references `lookupTable` on every iteration: with
-                   the cache populated, each reference is a single
-                   `Dict.get` instead of a fresh body walk that
-                   re-builds the 65 K-element Dict.
+                   references `lookupTable` on every iteration.
                 -}
                 precomputedGlobalsCache : Dict.Dict IR.GlobalId Value
                 precomputedGlobalsCache =
-                    env.shared.precomputedValues
-                        |> Dict.foldl
-                            (\moduleKey moduleVals outer ->
-                                let
-                                    mn : ModuleName
-                                    mn =
-                                        String.split "." moduleKey
-                                in
-                                Dict.foldl
-                                    (\name value inner ->
-                                        case Dict.get ( mn, name ) mergedGlobalIds of
-                                            Just id ->
-                                                Dict.insert id value inner
-
-                                            Nothing ->
-                                                inner
-                                    )
-                                    outer
-                                    moduleVals
-                            )
-                            Dict.empty
+                    projectEnv.resolved.globals
 
                 installedBridge : Types.ResolveBridge
                 installedBridge =
@@ -4284,7 +4343,7 @@ extendResolvedWithFiles additionalFiles (ProjectEnv projectEnv) =
                 , bodies = mergedBodies
             }
     in
-    ProjectEnv { projectEnv | resolved = newResolved }
+    refreshResolvedGlobals (ProjectEnv { projectEnv | resolved = newResolved })
 
 
 {-| Check whether a function body is worth trying to normalize. Functions that
@@ -4567,19 +4626,21 @@ setModulePrecomputedValues moduleName values (ProjectEnv projectEnv) =
         key =
             Environment.moduleKey moduleName
     in
-    ProjectEnv
-        { projectEnv
-            | env =
-                { env
-                    | shared =
-                        { functions = env.shared.functions
-                        , moduleImports = env.shared.moduleImports
-                        , resolveBridge = env.shared.resolveBridge
-                        , precomputedValues = Dict.insert key values env.shared.precomputedValues
-                        , tcoAnalyses = env.shared.tcoAnalyses
-                        }
-                }
-        }
+    refreshResolvedGlobals
+        (ProjectEnv
+            { projectEnv
+                | env =
+                    { env
+                        | shared =
+                            { functions = env.shared.functions
+                            , moduleImports = env.shared.moduleImports
+                            , resolveBridge = env.shared.resolveBridge
+                            , precomputedValues = Dict.insert key values env.shared.precomputedValues
+                            , tcoAnalyses = env.shared.tcoAnalyses
+                            }
+                    }
+            }
+        )
 
 
 {-| Read the current normalized function dict for a single module out of a
@@ -4715,7 +4776,7 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
                     }
             }
     in
-    ( ProjectEnv { projectEnv | env = newEnv }, delta )
+    ( refreshResolvedGlobals (ProjectEnv { projectEnv | env = newEnv }), delta )
 
 
 {-| Merge a pre-computed normalization delta into the env, overlaying the
@@ -4854,8 +4915,10 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                     }
             }
     in
-    ProjectEnv
-        { projectEnv | env = newEnv }
+    refreshResolvedGlobals
+        (ProjectEnv
+            { projectEnv | env = newEnv }
+        )
 
 
 {-| Like `evalWithEnv`, but returns trace information (call tree + log lines)

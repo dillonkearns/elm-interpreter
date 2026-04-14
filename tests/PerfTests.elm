@@ -29,6 +29,7 @@ suite =
         , spineCollectionTests
         , overApplicationTests
         , aliasedPrecomputedLookupTests
+        , precomputedViaResolvedIRTests
         ]
 
 
@@ -372,6 +373,77 @@ main =
 
                     _ ->
                         Expect.fail "setup failed (parse or buildProjectEnv)"
+        ]
+
+
+{-| Phase 2 companion to `aliasedPrecomputedLookupTests`: exercise the
+same precomputed-value shape through `Eval.Module.evalWithResolvedIR`
+(the non-bridge path) instead of `evalWithEnvAndLimit`. Before Phase 2,
+`evalWithResolvedIR` built an empty `globals` dict and never consulted
+`env.shared.precomputedValues`, so any aliased reference to a
+non-lossless precomputed top-level fell through `delegateByName` back
+to OLD eval. Phase 2 populates `ResolvedProject.globals` at project-
+load time and threads it into every `REnv` the resolved-IR entry
+points construct, so `evalGlobal`'s `env.globals` check hits without
+the bridge round-trip.
+
+The test asserts that both evaluator paths produce the same Value on
+the shape — smoke-level correctness for the new globals wiring. The
+bench is where the speed win shows up.
+-}
+precomputedViaResolvedIRTests : Test
+precomputedViaResolvedIRTests =
+    describe "precomputed-value lookup via evalWithResolvedIR"
+        [ test "Inner.slow agrees between OLD eval and resolved-IR entry points" <|
+            \_ ->
+                let
+                    innerSource : String
+                    innerSource =
+                        """module Inner exposing (slow)
+
+slow : Int
+slow =
+    recurse 50 (round (1 / 0))
+
+
+recurse : Int -> Int -> Int
+recurse n acc =
+    if n <= 0 then
+        acc
+
+    else
+        recurse (n - 1) acc
+"""
+
+                in
+                case Eval.Module.buildProjectEnv [ innerSource ] of
+                    Err _ ->
+                        Expect.fail "buildProjectEnv failed"
+
+                    Ok projectEnvWithInner ->
+                        let
+                            resolvedIRResult =
+                                Eval.Module.evalWithResolvedIR projectEnvWithInner "Inner.slow"
+
+                            oldEvalResult =
+                                Eval.Module.evalWithEnv
+                                    projectEnvWithInner
+                                    []
+                                    (Expression.FunctionOrValue [ "Inner" ] "slow")
+                        in
+                        case ( resolvedIRResult, oldEvalResult ) of
+                            ( Ok resolvedValue, Ok oldValue ) ->
+                                resolvedValue
+                                    |> Expect.equal oldValue
+
+                            ( Err e, _ ) ->
+                                Expect.fail
+                                    ("evalWithResolvedIR failed on Inner.slow — the resolved-IR path is not consulting precomputedValues via ResolvedProject.globals. Error: "
+                                        ++ Debug.toString e
+                                    )
+
+                            ( _, Err e ) ->
+                                Expect.fail ("OLD eval baseline failed: " ++ Debug.toString e)
         ]
 
 
