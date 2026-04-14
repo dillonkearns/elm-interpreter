@@ -14,6 +14,7 @@ import Recursion exposing (Rec)
 import Regex
 import Rope exposing (Rope)
 import Set
+import TcoAnalysis
 
 
 type alias PartialEval out =
@@ -233,6 +234,15 @@ type alias SharedContext =
     -- built from a `Dict.fromList` over ~800 unicode code points and took
     -- 87 s per reference without this cache.
     , precomputedValues : Dict String (Dict String Value)
+
+    -- Per-function tail-recursion analysis cached at project load.
+    -- Keyed moduleKey → name → metadata. `tcoLoop` and the call-
+    -- dispatch path consult this before falling back to a live walk of
+    -- the body AST. Populated by `Eval.Module.precomputeTcoAnalyses`
+    -- when modules are added to the project env (build / extend).
+    -- Functions with no entry (e.g. let-bound, anonymous) fall back to
+    -- live computation, so missing entries are correct, just slower.
+    , tcoAnalyses : Dict String (Dict String TcoAnalysis.TcoMetadata)
     }
 
 

@@ -114,6 +114,7 @@ addFunction moduleName function env =
             , moduleImports = env.shared.moduleImports
             , resolveBridge = env.shared.resolveBridge
             , precomputedValues = env.shared.precomputedValues
+            , tcoAnalyses = env.shared.tcoAnalyses
             }
         , currentModuleFunctions =
             if isCurrentModule then
@@ -162,7 +163,7 @@ empty moduleName =
     { currentModule = moduleName
     , currentModuleKey = moduleKey moduleName
     , callStack = []
-    , shared = { functions = Dict.empty, moduleImports = Dict.empty, resolveBridge = noResolveBridge, precomputedValues = Dict.empty }
+    , shared = { functions = Dict.empty, moduleImports = Dict.empty, resolveBridge = noResolveBridge, precomputedValues = Dict.empty, tcoAnalyses = Dict.empty }
     , currentModuleFunctions = Dict.empty
     , letFunctions = Dict.empty
     , values = Dict.empty
