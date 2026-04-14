@@ -603,7 +603,7 @@ applyClosureStep staticEnv locals head newArgs =
 
     else
         case head of
-            PartiallyApplied _ appliedArgs _ debugName impl arity ->
+            PartiallyApplied paLocalEnv appliedArgs _ debugName impl arity ->
                 case impl of
                     RExprImpl implBody ->
                         let
@@ -616,11 +616,21 @@ applyClosureStep staticEnv locals head newArgs =
                                 List.length totalArgs
                         in
                         if totalCount < arity then
-                            -- Partial application: construct a new PA. No recursion.
+                            -- Partial application: construct a new PA.
+                            -- Preserve `paLocalEnv` (the input closure's
+                            -- captured env) so the new PA can still bridge
+                            -- back to the new evaluator when the OLD
+                            -- evaluator reaches it via a kernel callback
+                            -- like `Kernel.JsArray.initialize`. Replacing
+                            -- it with `Environment.empty []` would lose
+                            -- the bridge and surface as "RExprImpl
+                            -- encountered with noResolveBridge" once the
+                            -- partially-applied closure escapes to the
+                            -- old evaluator.
                             rBase
                                 (EvOk
                                     (PartiallyApplied
-                                        (Environment.empty [])
+                                        paLocalEnv
                                         totalArgs
                                         []
                                         debugName
@@ -638,8 +648,10 @@ applyClosureStep staticEnv locals head newArgs =
                             let
                                 selfClosure : Value
                                 selfClosure =
+                                    -- See partial-application branch for
+                                    -- why `paLocalEnv` is preserved here.
                                     PartiallyApplied
-                                        (Environment.empty [])
+                                        paLocalEnv
                                         []
                                         []
                                         debugName
@@ -673,8 +685,10 @@ applyClosureStep staticEnv locals head newArgs =
 
                                 selfClosure : Value
                                 selfClosure =
+                                    -- See partial-application branch for
+                                    -- why `paLocalEnv` is preserved here.
                                     PartiallyApplied
-                                        (Environment.empty [])
+                                        paLocalEnv
                                         []
                                         []
                                         debugName
@@ -1264,8 +1278,12 @@ applyClosure env head newArgs =
                                 -- recursive calls has no applied args — it's
                                 -- what the user wrote as `f`, not what they
                                 -- wrote as `f 5` part-way through a call.
+                                -- Preserve `paLocalEnv` so the bridge stays
+                                -- reachable when this self-closure escapes
+                                -- to the OLD evaluator. See
+                                -- `applyClosureStep` for the same fix.
                                 PartiallyApplied
-                                    (Environment.empty [])
+                                    paLocalEnv
                                     []
                                     []
                                     debugName
@@ -1275,7 +1293,7 @@ applyClosure env head newArgs =
                         if totalCount < arity then
                             EvOk
                                 (PartiallyApplied
-                                    (Environment.empty [])
+                                    paLocalEnv
                                     totalArgs
                                     []
                                     debugName
@@ -1304,33 +1322,80 @@ applyClosure env head newArgs =
 
                     _ ->
                         {- AstImpl / KernelImpl: delegate to the old
-                           evaluator's `evalFunction`, which already handles
-                           pattern binding for AstImpl and calls the kernel
-                           function directly for KernelImpl. This is the
-                           path that lets higher-order core callbacks like
-                           `List.foldl (+) 0 xs` work — `(+)` is a KernelImpl
-                           PA, and the dispatcher in `NativeDispatchHO`
-                           calls this with the fully-applied args list.
+                           evaluator's `evalFunction`, but handle all three
+                           application cases (partial / exact / over) the
+                           same way the `RExprImpl` branch above does.
 
-                           For partial application (total < arity) we could
-                           return a PA here too, but the old evaluator's
-                           `evalFunction` already handles that case (it
-                           returns `Value.mkPartiallyApplied` when
-                           `oldArgsLength < patternsLength`).
+                           `evalFunction` itself ONLY handles partial and
+                           exact application — it bails with "Could not
+                           match lambda patterns" on over-application
+                           because it pattern-binds the full arg list
+                           against the full pattern list, which have
+                           different lengths. Over-application in the old
+                           evaluator is handled by `evalApplicationGeneral`,
+                           not `evalFunction`, so callers of `applyClosure`
+                           must split the args themselves.
+
+                           The composeR bug surfaced here: a top-level
+                           `fuzz2Like = (\f (a, b) -> f a b) >> identity`
+                           is a composeR partial application (2 of 3 args),
+                           and `fuzz2Like plus (3, 4)` over-applies it
+                           with two more args. Without the split, the
+                           full `[lambda, identity, plus, (3,4)]` list hit
+                           composeR's 3-pattern binding and errored.
                         -}
                         let
                             totalArgs : List Value
                             totalArgs =
                                 appliedArgs ++ newArgs
+
+                            totalCount : Int
+                            totalCount =
+                                List.length totalArgs
                         in
-                        Eval.Expression.evalFunction
-                            totalArgs
-                            patterns
-                            arity
-                            debugName
-                            impl
-                            env.fallbackConfig
-                            paLocalEnv
+                        if totalCount < arity then
+                            EvOk
+                                (PartiallyApplied
+                                    paLocalEnv
+                                    totalArgs
+                                    patterns
+                                    debugName
+                                    impl
+                                    arity
+                                )
+
+                        else if totalCount == arity then
+                            Eval.Expression.evalFunction
+                                totalArgs
+                                patterns
+                                arity
+                                debugName
+                                impl
+                                env.fallbackConfig
+                                paLocalEnv
+
+                        else
+                            let
+                                bodyArgs : List Value
+                                bodyArgs =
+                                    List.take arity totalArgs
+
+                                extraArgs : List Value
+                                extraArgs =
+                                    List.drop arity totalArgs
+                            in
+                            Eval.Expression.evalFunction
+                                bodyArgs
+                                patterns
+                                arity
+                                debugName
+                                impl
+                                env.fallbackConfig
+                                paLocalEnv
+                                |> andThenValue
+                                    (\intermediate ->
+                                        applyClosure env intermediate extraArgs
+                                    )
 
             Custom qualRef existingArgs ->
                 -- Constructor application: treat as arg accumulation.

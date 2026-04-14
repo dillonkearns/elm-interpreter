@@ -428,26 +428,32 @@ resolveProject summaries =
             RE.buildHigherOrderRegistry
                 (\key -> Dict.get key globalIds)
 
-        {- Build the kernel dispatcher registry by walking EVERY kernel
-           function from `Eval.Expression.kernelFunctions` and mapping
-           each one to its user-facing `GlobalId`. This covers:
+        {- Build the kernel dispatcher registry from `kernelFunctions`.
+           Only register entries whose module key is a user-facing name
+           (like `Dict`, `String`, `Basics`) — NOT ones under the
+           `Elm.Kernel.*` prefix.
 
-           1. `Elm.Kernel.*` functions (e.g. `Elm.Kernel.Basics.add`)
-              → mapped to the core module (`Basics.add`) via prefix strip
-           2. User-level module kernels (e.g. `Dict.empty`, `Dict.insert`)
-              → mapped directly by module name
+           The previous behavior also mapped `Elm.Kernel.X.fn` →
+           `X.fn` via prefix strip, on the assumption that the Core
+           wrapper for `X.fn` was a trivial pass-through. That
+           assumption is WRONG for any Core wrapper that adapts
+           argument types across the kernel boundary, e.g.:
 
-           Previously only covered direct 0-arg kernel aliases found
-           by `extractKernelReference`. The widened version registers
-           ALL kernel functions, which means evalR's `delegateCoreApply`
-           can dispatch via int-keyed `FastDict.get id` instead of
-           falling through to the string-keyed `delegateByName` path.
+             String.join sep chunks =
+                 Elm.Kernel.String.join sep (Elm.Kernel.List.toArray chunks)
 
-           The profile shows `_Utils_cmp` (string comparison for Dict
-           key ordering) at 18.5% of total time, with 85% of that
-           coming from `Dict.get` in `evalKernelFunction`'s string-keyed
-           lookup. This change eliminates that entire string-comparison
-           cost path for kernel functions.
+           The user-level `String.join` takes a `List String`, but the
+           kernel `Elm.Kernel.String.join` takes a `jsArray string`
+           (JsArray). Short-circuiting `String.join` to the kernel
+           dispatcher bypasses the `toArray chunks` conversion, the
+           kernel sees a `List` where it expects a `JsArray`, and fires
+           "Expected the second argument to be List String".
+
+           User-level kernel entries (`( [ "Dict" ], ... )`,
+           `( [ "String" ], ... )`, etc.) are DELIBERATELY registered
+           as drop-in replacements for the Core wrapper — they are
+           safe to short-circuit. `Elm.Kernel.*` entries are only safe
+           when the caller has already done any arg marshalling.
         -}
         kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
         kernelDispatchers =
@@ -455,38 +461,32 @@ resolveProject summaries =
                 |> Dict.foldl
                     (\moduleKey moduleDict outer ->
                         let
-                            -- Map kernel module key back to a ModuleName
-                            -- for globalIds lookup. kernelFunctions keys
-                            -- are joined strings like "Elm.Kernel.Basics"
-                            -- or "Dict". Split and strip the Elm.Kernel prefix.
-                            coreModuleName : ModuleName
-                            coreModuleName =
-                                let
-                                    parts =
-                                        String.split "." moduleKey
-                                in
-                                case parts of
-                                    "Elm" :: "Kernel" :: rest ->
-                                        rest
-
-                                    _ ->
-                                        parts
+                            parts : List String
+                            parts =
+                                String.split "." moduleKey
                         in
-                        moduleDict
-                            |> Dict.foldl
-                                (\funcName ( arity, kernelFn ) acc ->
-                                    case Dict.get ( coreModuleName, funcName ) globalIds of
-                                        Just id ->
-                                            Dict.insert id
-                                                { arity = arity
-                                                , kernelFn = kernelFn
-                                                }
-                                                acc
-
-                                        Nothing ->
-                                            acc
-                                )
+                        case parts of
+                            "Elm" :: "Kernel" :: _ ->
+                                -- Kernel-internal entries; don't short-
+                                -- circuit user-level calls to these.
                                 outer
+
+                            _ ->
+                                moduleDict
+                                    |> Dict.foldl
+                                        (\funcName ( arity, kernelFn ) acc ->
+                                            case Dict.get ( parts, funcName ) globalIds of
+                                                Just id ->
+                                                    Dict.insert id
+                                                        { arity = arity
+                                                        , kernelFn = kernelFn
+                                                        }
+                                                        acc
+
+                                                Nothing ->
+                                                    acc
+                                        )
+                                        outer
                     )
                     Dict.empty
 
@@ -3625,6 +3625,40 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                    mutable cache, which isn't worth the complexity until
                    we see it dominate in profiles.
                 -}
+                {- Pre-built `globals` cache from the project's
+                   `precomputedValues`, shared between the main `renv`
+                   and the `installedBridge`'s per-call `bridgeRenv`.
+                   Critical for `RemoveAccentsTest`-shape workloads
+                   where a 65 K-iteration `Array.initialize` callback
+                   references `lookupTable` on every iteration: with
+                   the cache populated, each reference is a single
+                   `Dict.get` instead of a fresh body walk that
+                   re-builds the 65 K-element Dict.
+                -}
+                precomputedGlobalsCache : Dict.Dict IR.GlobalId Value
+                precomputedGlobalsCache =
+                    env.shared.precomputedValues
+                        |> Dict.foldl
+                            (\moduleKey moduleVals outer ->
+                                let
+                                    mn : ModuleName
+                                    mn =
+                                        String.split "." moduleKey
+                                in
+                                Dict.foldl
+                                    (\name value inner ->
+                                        case Dict.get ( mn, name ) mergedGlobalIds of
+                                            Just id ->
+                                                Dict.insert id value inner
+
+                                            Nothing ->
+                                                inner
+                                    )
+                                    outer
+                                    moduleVals
+                            )
+                            Dict.empty
+
                 installedBridge : Types.ResolveBridge
                 installedBridge =
                     Types.ResolveBridge
@@ -3642,7 +3676,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                 bridgeRenv : RE.REnv
                                 bridgeRenv =
                                     { locals = bodyLocals
-                                    , globals = Dict.empty
+                                    , globals = precomputedGlobalsCache
                                     , resolvedBodies = mergedBodies
                                     , globalIdToName = mergedGlobalIdToName
                                     , nativeDispatchers = baseResolved.nativeDispatchers
@@ -3727,7 +3761,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                         renv : RE.REnv
                         renv =
                             { locals = []
-                            , globals = Dict.empty
+                            , globals = precomputedGlobalsCache
                             , resolvedBodies = mergedBodies
                             , globalIdToName = mergedGlobalIdToName
                             , nativeDispatchers = baseResolved.nativeDispatchers
