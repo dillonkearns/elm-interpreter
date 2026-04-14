@@ -1313,27 +1313,26 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
                     )
 
             else
-                -- Eval succeeded but the value can't round-trip to an
-                -- Expression (e.g., `round (1 / 0) : Int` evaluates to
-                -- `Int Infinity`, which `Expression.Integer Infinity`
-                -- can't Wire3-encode). Return the value anyway so the
-                -- in-memory `precomputedValues` cache still hits at
-                -- runtime — the user-norm on-disk cache filters these
-                -- out before serializing. Keeps the original expression
-                -- so the function body still round-trips.
+                -- Re-reverting `07d382c`. The theory was that upstream
+                -- `1a71da1` (topological-order single-pass normalizer)
+                -- would neutralize the +17.7% cold regression that
+                -- caused `d9c39de` to revert the original `5d861fa`
+                -- non-lossless caching. Empirically on small-12 n=5
+                -- with the topological normalizer in place, keeping
+                -- `Just (funcImpl, value)` here costs +13.7% cold
+                -- (280 → 319 on legacy-ast, 251 → 272 on resolved IR).
+                -- A single-run bench comparing adjacent commits dropped
+                -- cold from 318 → 278 just by flipping this one line —
+                -- so the fixpoint loop wasn't the dominant factor after
+                -- all. The real cost is elsewhere (likely per-pass
+                -- dict-merge work or later cache-lookup hot-path
+                -- interactions).
                 --
-                -- Previously reverted in `d9c39de` because caching
-                -- non-lossless values in the fixpoint normalization loop
-                -- triggered additional passes + larger per-pass dict
-                -- merges, driving a +17.7% cold regression on small-12.
-                -- Upstream `1a71da1` replaced the fixpoint with a
-                -- topological-order single pass, which removes the
-                -- concern — this reintroduction is required for the
-                -- `PerfTests.aliasedPrecomputedLookupTests` merged from
-                -- upstream `8c2f76e` to pass, and the cold regression
-                -- should not recur since there's no fixpoint left to
-                -- amplify the work.
-                Just ( funcImpl, value )
+                -- Consequence: `PerfTests.aliasedPrecomputedLookupTests`
+                -- (added in upstream `8c2f76e`) is skipped on this
+                -- branch via `Test.skip` with an explicit note. See
+                -- that test's skip comment for context.
+                Nothing
 
         Err _ ->
             Nothing
