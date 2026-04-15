@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -20,6 +20,7 @@ import Elm.Syntax.Type
 import Elm.Syntax.TypeAlias exposing (TypeAlias)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
 import Environment
+import Expression.Extra
 import Eval.Expression
 import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedExpression as RE
@@ -917,6 +918,341 @@ type alias CachedModuleSummary =
     }
 
 
+type alias DependencySummaryStats =
+    { functionsVisited : Int
+    , functionsRewritten : Int
+    , inlineCandidates : Int
+    , inlineSuccesses : Int
+    , inlineRejectedPattern : Int
+    , inlineRejectedArity : Int
+    , inlineRejectedSelfCall : Int
+    , inlineRejectedBodyTooLarge : Int
+    , inlineRejectedUnsafe : Int
+    , inlineRejectedUnsafeApplication : Int
+    , inlineRejectedUnsafeIf : Int
+    , inlineRejectedUnsafeCase : Int
+    , inlineRejectedUnsafeLet : Int
+    , inlineRejectedUnsafeLambda : Int
+    , inlineRejectedUnsafeOther : Int
+    , inlineRejectedInternalHelper : Int
+    , inlineBodyLt30 : Int
+    , inlineBody30To59 : Int
+    , inlineBody60Plus : Int
+    , inlineShapeLeaf : Int
+    , inlineShapeConstructor : Int
+    , inlineShapeOperator : Int
+    , inlineShapeRecordAccess : Int
+    , inlineShapeCollection : Int
+    , inlineShapeOther : Int
+    , inlinePayoffChanged : Int
+    , inlinePayoffChangedShapeLeaf : Int
+    , inlinePayoffChangedShapeConstructor : Int
+    , inlinePayoffChangedShapeOperator : Int
+    , inlinePayoffChangedShapeRecordAccess : Int
+    , inlinePayoffChangedShapeCollection : Int
+    , inlinePayoffChangedShapeOther : Int
+    , inlinePayoffChangedBodyLt30 : Int
+    , inlinePayoffChangedBody30To59 : Int
+    , inlinePayoffChangedBody60Plus : Int
+    , inlinePayoffInline : Int
+    , inlinePayoffInlineShapeLeaf : Int
+    , inlinePayoffInlineShapeConstructor : Int
+    , inlinePayoffInlineShapeOperator : Int
+    , inlinePayoffInlineShapeRecordAccess : Int
+    , inlinePayoffInlineShapeCollection : Int
+    , inlinePayoffInlineShapeOther : Int
+    , inlinePayoffInlineBodyLt30 : Int
+    , inlinePayoffInlineBody30To59 : Int
+    , inlinePayoffInlineBody60Plus : Int
+    , inlinePayoffConstantFold : Int
+    , inlinePayoffConstantFoldShapeLeaf : Int
+    , inlinePayoffConstantFoldShapeConstructor : Int
+    , inlinePayoffConstantFoldShapeOperator : Int
+    , inlinePayoffConstantFoldShapeRecordAccess : Int
+    , inlinePayoffConstantFoldShapeCollection : Int
+    , inlinePayoffConstantFoldShapeOther : Int
+    , inlinePayoffConstantFoldBodyLt30 : Int
+    , inlinePayoffConstantFoldBody30To59 : Int
+    , inlinePayoffConstantFoldBody60Plus : Int
+    , inlinePayoffPrecomputedRef : Int
+    , inlinePayoffPrecomputedRefShapeLeaf : Int
+    , inlinePayoffPrecomputedRefShapeConstructor : Int
+    , inlinePayoffPrecomputedRefShapeOperator : Int
+    , inlinePayoffPrecomputedRefShapeRecordAccess : Int
+    , inlinePayoffPrecomputedRefShapeCollection : Int
+    , inlinePayoffPrecomputedRefShapeOther : Int
+    , inlinePayoffPrecomputedRefBodyLt30 : Int
+    , inlinePayoffPrecomputedRefBody30To59 : Int
+    , inlinePayoffPrecomputedRefBody60Plus : Int
+    , inlineShadowRejectCollection : Int
+    , inlineShadowRejectCollectionPayoffChanged : Int
+    , inlineShadowRejectCollectionPayoffInline : Int
+    , inlineShadowRejectCollectionPayoffPrecomputedRef : Int
+    , inlineShadowRejectCollectionFinalShrinks : Int
+    , inlineShadowRejectCollectionFinalNonApplication : Int
+    , inlineShadowRejectCollectionFinalDirectRootWin : Int
+    , inlineShadowRejectCollectionFinalConstructorApplication : Int
+    , inlineShadowRejectCollectionNoPayoffNoDirectBenefit : Int
+    , inlineShadowRejectGrowth0 : Int
+    , inlineShadowRejectGrowth0PayoffChanged : Int
+    , inlineShadowRejectGrowth0PayoffInline : Int
+    , inlineShadowRejectGrowth0PayoffPrecomputedRef : Int
+    , inlineShadowRejectGrowth0FinalShrinks : Int
+    , inlineShadowRejectGrowth0FinalNonApplication : Int
+    , inlineShadowRejectGrowth0FinalDirectRootWin : Int
+    , inlineShadowRejectGrowth0FinalConstructorApplication : Int
+    , inlineShadowRejectGrowth0NoPayoffNoDirectBenefit : Int
+    , inlineShadowRejectGrowth1 : Int
+    , inlineShadowRejectGrowth1PayoffChanged : Int
+    , inlineShadowRejectGrowth1PayoffInline : Int
+    , inlineShadowRejectGrowth1PayoffPrecomputedRef : Int
+    , inlineShadowRejectGrowth1FinalShrinks : Int
+    , inlineShadowRejectGrowth1FinalNonApplication : Int
+    , inlineShadowRejectGrowth1FinalDirectRootWin : Int
+    , inlineShadowRejectGrowth1FinalConstructorApplication : Int
+    , inlineShadowRejectGrowth1NoPayoffNoDirectBenefit : Int
+    , listFusionChanges : Int
+    , listFusionPipelineNormalizations : Int
+    , listFusionHeadFlattenRewrites : Int
+    , listFusionRuleRewrites : Int
+    , precomputedRefSubstitutions : Int
+    , constantFolds : Int
+    , rejectSamples : List String
+    }
+
+
+emptyDependencySummaryStats : DependencySummaryStats
+emptyDependencySummaryStats =
+    { functionsVisited = 0
+    , functionsRewritten = 0
+    , inlineCandidates = 0
+    , inlineSuccesses = 0
+    , inlineRejectedPattern = 0
+    , inlineRejectedArity = 0
+    , inlineRejectedSelfCall = 0
+    , inlineRejectedBodyTooLarge = 0
+    , inlineRejectedUnsafe = 0
+    , inlineRejectedUnsafeApplication = 0
+    , inlineRejectedUnsafeIf = 0
+    , inlineRejectedUnsafeCase = 0
+    , inlineRejectedUnsafeLet = 0
+    , inlineRejectedUnsafeLambda = 0
+    , inlineRejectedUnsafeOther = 0
+    , inlineRejectedInternalHelper = 0
+    , inlineBodyLt30 = 0
+    , inlineBody30To59 = 0
+    , inlineBody60Plus = 0
+    , inlineShapeLeaf = 0
+    , inlineShapeConstructor = 0
+    , inlineShapeOperator = 0
+    , inlineShapeRecordAccess = 0
+    , inlineShapeCollection = 0
+    , inlineShapeOther = 0
+    , inlinePayoffChanged = 0
+    , inlinePayoffChangedShapeLeaf = 0
+    , inlinePayoffChangedShapeConstructor = 0
+    , inlinePayoffChangedShapeOperator = 0
+    , inlinePayoffChangedShapeRecordAccess = 0
+    , inlinePayoffChangedShapeCollection = 0
+    , inlinePayoffChangedShapeOther = 0
+    , inlinePayoffChangedBodyLt30 = 0
+    , inlinePayoffChangedBody30To59 = 0
+    , inlinePayoffChangedBody60Plus = 0
+    , inlinePayoffInline = 0
+    , inlinePayoffInlineShapeLeaf = 0
+    , inlinePayoffInlineShapeConstructor = 0
+    , inlinePayoffInlineShapeOperator = 0
+    , inlinePayoffInlineShapeRecordAccess = 0
+    , inlinePayoffInlineShapeCollection = 0
+    , inlinePayoffInlineShapeOther = 0
+    , inlinePayoffInlineBodyLt30 = 0
+    , inlinePayoffInlineBody30To59 = 0
+    , inlinePayoffInlineBody60Plus = 0
+    , inlinePayoffConstantFold = 0
+    , inlinePayoffConstantFoldShapeLeaf = 0
+    , inlinePayoffConstantFoldShapeConstructor = 0
+    , inlinePayoffConstantFoldShapeOperator = 0
+    , inlinePayoffConstantFoldShapeRecordAccess = 0
+    , inlinePayoffConstantFoldShapeCollection = 0
+    , inlinePayoffConstantFoldShapeOther = 0
+    , inlinePayoffConstantFoldBodyLt30 = 0
+    , inlinePayoffConstantFoldBody30To59 = 0
+    , inlinePayoffConstantFoldBody60Plus = 0
+    , inlinePayoffPrecomputedRef = 0
+    , inlinePayoffPrecomputedRefShapeLeaf = 0
+    , inlinePayoffPrecomputedRefShapeConstructor = 0
+    , inlinePayoffPrecomputedRefShapeOperator = 0
+    , inlinePayoffPrecomputedRefShapeRecordAccess = 0
+    , inlinePayoffPrecomputedRefShapeCollection = 0
+    , inlinePayoffPrecomputedRefShapeOther = 0
+    , inlinePayoffPrecomputedRefBodyLt30 = 0
+    , inlinePayoffPrecomputedRefBody30To59 = 0
+    , inlinePayoffPrecomputedRefBody60Plus = 0
+    , inlineShadowRejectCollection = 0
+    , inlineShadowRejectCollectionPayoffChanged = 0
+    , inlineShadowRejectCollectionPayoffInline = 0
+    , inlineShadowRejectCollectionPayoffPrecomputedRef = 0
+    , inlineShadowRejectCollectionFinalShrinks = 0
+    , inlineShadowRejectCollectionFinalNonApplication = 0
+    , inlineShadowRejectCollectionFinalDirectRootWin = 0
+    , inlineShadowRejectCollectionFinalConstructorApplication = 0
+    , inlineShadowRejectCollectionNoPayoffNoDirectBenefit = 0
+    , inlineShadowRejectGrowth0 = 0
+    , inlineShadowRejectGrowth0PayoffChanged = 0
+    , inlineShadowRejectGrowth0PayoffInline = 0
+    , inlineShadowRejectGrowth0PayoffPrecomputedRef = 0
+    , inlineShadowRejectGrowth0FinalShrinks = 0
+    , inlineShadowRejectGrowth0FinalNonApplication = 0
+    , inlineShadowRejectGrowth0FinalDirectRootWin = 0
+    , inlineShadowRejectGrowth0FinalConstructorApplication = 0
+    , inlineShadowRejectGrowth0NoPayoffNoDirectBenefit = 0
+    , inlineShadowRejectGrowth1 = 0
+    , inlineShadowRejectGrowth1PayoffChanged = 0
+    , inlineShadowRejectGrowth1PayoffInline = 0
+    , inlineShadowRejectGrowth1PayoffPrecomputedRef = 0
+    , inlineShadowRejectGrowth1FinalShrinks = 0
+    , inlineShadowRejectGrowth1FinalNonApplication = 0
+    , inlineShadowRejectGrowth1FinalDirectRootWin = 0
+    , inlineShadowRejectGrowth1FinalConstructorApplication = 0
+    , inlineShadowRejectGrowth1NoPayoffNoDirectBenefit = 0
+    , listFusionChanges = 0
+    , listFusionPipelineNormalizations = 0
+    , listFusionHeadFlattenRewrites = 0
+    , listFusionRuleRewrites = 0
+    , precomputedRefSubstitutions = 0
+    , constantFolds = 0
+    , rejectSamples = []
+    }
+
+
+mergeDependencySummaryStats : DependencySummaryStats -> DependencySummaryStats -> DependencySummaryStats
+mergeDependencySummaryStats left right =
+    { functionsVisited = left.functionsVisited + right.functionsVisited
+    , functionsRewritten = left.functionsRewritten + right.functionsRewritten
+    , inlineCandidates = left.inlineCandidates + right.inlineCandidates
+    , inlineSuccesses = left.inlineSuccesses + right.inlineSuccesses
+    , inlineRejectedPattern = left.inlineRejectedPattern + right.inlineRejectedPattern
+    , inlineRejectedArity = left.inlineRejectedArity + right.inlineRejectedArity
+    , inlineRejectedSelfCall = left.inlineRejectedSelfCall + right.inlineRejectedSelfCall
+    , inlineRejectedBodyTooLarge = left.inlineRejectedBodyTooLarge + right.inlineRejectedBodyTooLarge
+    , inlineRejectedUnsafe = left.inlineRejectedUnsafe + right.inlineRejectedUnsafe
+    , inlineRejectedUnsafeApplication = left.inlineRejectedUnsafeApplication + right.inlineRejectedUnsafeApplication
+    , inlineRejectedUnsafeIf = left.inlineRejectedUnsafeIf + right.inlineRejectedUnsafeIf
+    , inlineRejectedUnsafeCase = left.inlineRejectedUnsafeCase + right.inlineRejectedUnsafeCase
+    , inlineRejectedUnsafeLet = left.inlineRejectedUnsafeLet + right.inlineRejectedUnsafeLet
+    , inlineRejectedUnsafeLambda = left.inlineRejectedUnsafeLambda + right.inlineRejectedUnsafeLambda
+    , inlineRejectedUnsafeOther = left.inlineRejectedUnsafeOther + right.inlineRejectedUnsafeOther
+    , inlineRejectedInternalHelper = left.inlineRejectedInternalHelper + right.inlineRejectedInternalHelper
+    , inlineBodyLt30 = left.inlineBodyLt30 + right.inlineBodyLt30
+    , inlineBody30To59 = left.inlineBody30To59 + right.inlineBody30To59
+    , inlineBody60Plus = left.inlineBody60Plus + right.inlineBody60Plus
+    , inlineShapeLeaf = left.inlineShapeLeaf + right.inlineShapeLeaf
+    , inlineShapeConstructor = left.inlineShapeConstructor + right.inlineShapeConstructor
+    , inlineShapeOperator = left.inlineShapeOperator + right.inlineShapeOperator
+    , inlineShapeRecordAccess = left.inlineShapeRecordAccess + right.inlineShapeRecordAccess
+    , inlineShapeCollection = left.inlineShapeCollection + right.inlineShapeCollection
+    , inlineShapeOther = left.inlineShapeOther + right.inlineShapeOther
+    , inlinePayoffChanged = left.inlinePayoffChanged + right.inlinePayoffChanged
+    , inlinePayoffChangedShapeLeaf = left.inlinePayoffChangedShapeLeaf + right.inlinePayoffChangedShapeLeaf
+    , inlinePayoffChangedShapeConstructor = left.inlinePayoffChangedShapeConstructor + right.inlinePayoffChangedShapeConstructor
+    , inlinePayoffChangedShapeOperator = left.inlinePayoffChangedShapeOperator + right.inlinePayoffChangedShapeOperator
+    , inlinePayoffChangedShapeRecordAccess = left.inlinePayoffChangedShapeRecordAccess + right.inlinePayoffChangedShapeRecordAccess
+    , inlinePayoffChangedShapeCollection = left.inlinePayoffChangedShapeCollection + right.inlinePayoffChangedShapeCollection
+    , inlinePayoffChangedShapeOther = left.inlinePayoffChangedShapeOther + right.inlinePayoffChangedShapeOther
+    , inlinePayoffChangedBodyLt30 = left.inlinePayoffChangedBodyLt30 + right.inlinePayoffChangedBodyLt30
+    , inlinePayoffChangedBody30To59 = left.inlinePayoffChangedBody30To59 + right.inlinePayoffChangedBody30To59
+    , inlinePayoffChangedBody60Plus = left.inlinePayoffChangedBody60Plus + right.inlinePayoffChangedBody60Plus
+    , inlinePayoffInline = left.inlinePayoffInline + right.inlinePayoffInline
+    , inlinePayoffInlineShapeLeaf = left.inlinePayoffInlineShapeLeaf + right.inlinePayoffInlineShapeLeaf
+    , inlinePayoffInlineShapeConstructor = left.inlinePayoffInlineShapeConstructor + right.inlinePayoffInlineShapeConstructor
+    , inlinePayoffInlineShapeOperator = left.inlinePayoffInlineShapeOperator + right.inlinePayoffInlineShapeOperator
+    , inlinePayoffInlineShapeRecordAccess = left.inlinePayoffInlineShapeRecordAccess + right.inlinePayoffInlineShapeRecordAccess
+    , inlinePayoffInlineShapeCollection = left.inlinePayoffInlineShapeCollection + right.inlinePayoffInlineShapeCollection
+    , inlinePayoffInlineShapeOther = left.inlinePayoffInlineShapeOther + right.inlinePayoffInlineShapeOther
+    , inlinePayoffInlineBodyLt30 = left.inlinePayoffInlineBodyLt30 + right.inlinePayoffInlineBodyLt30
+    , inlinePayoffInlineBody30To59 = left.inlinePayoffInlineBody30To59 + right.inlinePayoffInlineBody30To59
+    , inlinePayoffInlineBody60Plus = left.inlinePayoffInlineBody60Plus + right.inlinePayoffInlineBody60Plus
+    , inlinePayoffConstantFold = left.inlinePayoffConstantFold + right.inlinePayoffConstantFold
+    , inlinePayoffConstantFoldShapeLeaf = left.inlinePayoffConstantFoldShapeLeaf + right.inlinePayoffConstantFoldShapeLeaf
+    , inlinePayoffConstantFoldShapeConstructor = left.inlinePayoffConstantFoldShapeConstructor + right.inlinePayoffConstantFoldShapeConstructor
+    , inlinePayoffConstantFoldShapeOperator = left.inlinePayoffConstantFoldShapeOperator + right.inlinePayoffConstantFoldShapeOperator
+    , inlinePayoffConstantFoldShapeRecordAccess = left.inlinePayoffConstantFoldShapeRecordAccess + right.inlinePayoffConstantFoldShapeRecordAccess
+    , inlinePayoffConstantFoldShapeCollection = left.inlinePayoffConstantFoldShapeCollection + right.inlinePayoffConstantFoldShapeCollection
+    , inlinePayoffConstantFoldShapeOther = left.inlinePayoffConstantFoldShapeOther + right.inlinePayoffConstantFoldShapeOther
+    , inlinePayoffConstantFoldBodyLt30 = left.inlinePayoffConstantFoldBodyLt30 + right.inlinePayoffConstantFoldBodyLt30
+    , inlinePayoffConstantFoldBody30To59 = left.inlinePayoffConstantFoldBody30To59 + right.inlinePayoffConstantFoldBody30To59
+    , inlinePayoffConstantFoldBody60Plus = left.inlinePayoffConstantFoldBody60Plus + right.inlinePayoffConstantFoldBody60Plus
+    , inlinePayoffPrecomputedRef = left.inlinePayoffPrecomputedRef + right.inlinePayoffPrecomputedRef
+    , inlinePayoffPrecomputedRefShapeLeaf = left.inlinePayoffPrecomputedRefShapeLeaf + right.inlinePayoffPrecomputedRefShapeLeaf
+    , inlinePayoffPrecomputedRefShapeConstructor = left.inlinePayoffPrecomputedRefShapeConstructor + right.inlinePayoffPrecomputedRefShapeConstructor
+    , inlinePayoffPrecomputedRefShapeOperator = left.inlinePayoffPrecomputedRefShapeOperator + right.inlinePayoffPrecomputedRefShapeOperator
+    , inlinePayoffPrecomputedRefShapeRecordAccess = left.inlinePayoffPrecomputedRefShapeRecordAccess + right.inlinePayoffPrecomputedRefShapeRecordAccess
+    , inlinePayoffPrecomputedRefShapeCollection = left.inlinePayoffPrecomputedRefShapeCollection + right.inlinePayoffPrecomputedRefShapeCollection
+    , inlinePayoffPrecomputedRefShapeOther = left.inlinePayoffPrecomputedRefShapeOther + right.inlinePayoffPrecomputedRefShapeOther
+    , inlinePayoffPrecomputedRefBodyLt30 = left.inlinePayoffPrecomputedRefBodyLt30 + right.inlinePayoffPrecomputedRefBodyLt30
+    , inlinePayoffPrecomputedRefBody30To59 = left.inlinePayoffPrecomputedRefBody30To59 + right.inlinePayoffPrecomputedRefBody30To59
+    , inlinePayoffPrecomputedRefBody60Plus = left.inlinePayoffPrecomputedRefBody60Plus + right.inlinePayoffPrecomputedRefBody60Plus
+    , inlineShadowRejectCollection = left.inlineShadowRejectCollection + right.inlineShadowRejectCollection
+    , inlineShadowRejectCollectionPayoffChanged = left.inlineShadowRejectCollectionPayoffChanged + right.inlineShadowRejectCollectionPayoffChanged
+    , inlineShadowRejectCollectionPayoffInline = left.inlineShadowRejectCollectionPayoffInline + right.inlineShadowRejectCollectionPayoffInline
+    , inlineShadowRejectCollectionPayoffPrecomputedRef = left.inlineShadowRejectCollectionPayoffPrecomputedRef + right.inlineShadowRejectCollectionPayoffPrecomputedRef
+    , inlineShadowRejectCollectionFinalShrinks = left.inlineShadowRejectCollectionFinalShrinks + right.inlineShadowRejectCollectionFinalShrinks
+    , inlineShadowRejectCollectionFinalNonApplication = left.inlineShadowRejectCollectionFinalNonApplication + right.inlineShadowRejectCollectionFinalNonApplication
+    , inlineShadowRejectCollectionFinalDirectRootWin = left.inlineShadowRejectCollectionFinalDirectRootWin + right.inlineShadowRejectCollectionFinalDirectRootWin
+    , inlineShadowRejectCollectionFinalConstructorApplication = left.inlineShadowRejectCollectionFinalConstructorApplication + right.inlineShadowRejectCollectionFinalConstructorApplication
+    , inlineShadowRejectCollectionNoPayoffNoDirectBenefit = left.inlineShadowRejectCollectionNoPayoffNoDirectBenefit + right.inlineShadowRejectCollectionNoPayoffNoDirectBenefit
+    , inlineShadowRejectGrowth0 = left.inlineShadowRejectGrowth0 + right.inlineShadowRejectGrowth0
+    , inlineShadowRejectGrowth0PayoffChanged = left.inlineShadowRejectGrowth0PayoffChanged + right.inlineShadowRejectGrowth0PayoffChanged
+    , inlineShadowRejectGrowth0PayoffInline = left.inlineShadowRejectGrowth0PayoffInline + right.inlineShadowRejectGrowth0PayoffInline
+    , inlineShadowRejectGrowth0PayoffPrecomputedRef = left.inlineShadowRejectGrowth0PayoffPrecomputedRef + right.inlineShadowRejectGrowth0PayoffPrecomputedRef
+    , inlineShadowRejectGrowth0FinalShrinks = left.inlineShadowRejectGrowth0FinalShrinks + right.inlineShadowRejectGrowth0FinalShrinks
+    , inlineShadowRejectGrowth0FinalNonApplication = left.inlineShadowRejectGrowth0FinalNonApplication + right.inlineShadowRejectGrowth0FinalNonApplication
+    , inlineShadowRejectGrowth0FinalDirectRootWin = left.inlineShadowRejectGrowth0FinalDirectRootWin + right.inlineShadowRejectGrowth0FinalDirectRootWin
+    , inlineShadowRejectGrowth0FinalConstructorApplication = left.inlineShadowRejectGrowth0FinalConstructorApplication + right.inlineShadowRejectGrowth0FinalConstructorApplication
+    , inlineShadowRejectGrowth0NoPayoffNoDirectBenefit = left.inlineShadowRejectGrowth0NoPayoffNoDirectBenefit + right.inlineShadowRejectGrowth0NoPayoffNoDirectBenefit
+    , inlineShadowRejectGrowth1 = left.inlineShadowRejectGrowth1 + right.inlineShadowRejectGrowth1
+    , inlineShadowRejectGrowth1PayoffChanged = left.inlineShadowRejectGrowth1PayoffChanged + right.inlineShadowRejectGrowth1PayoffChanged
+    , inlineShadowRejectGrowth1PayoffInline = left.inlineShadowRejectGrowth1PayoffInline + right.inlineShadowRejectGrowth1PayoffInline
+    , inlineShadowRejectGrowth1PayoffPrecomputedRef = left.inlineShadowRejectGrowth1PayoffPrecomputedRef + right.inlineShadowRejectGrowth1PayoffPrecomputedRef
+    , inlineShadowRejectGrowth1FinalShrinks = left.inlineShadowRejectGrowth1FinalShrinks + right.inlineShadowRejectGrowth1FinalShrinks
+    , inlineShadowRejectGrowth1FinalNonApplication = left.inlineShadowRejectGrowth1FinalNonApplication + right.inlineShadowRejectGrowth1FinalNonApplication
+    , inlineShadowRejectGrowth1FinalDirectRootWin = left.inlineShadowRejectGrowth1FinalDirectRootWin + right.inlineShadowRejectGrowth1FinalDirectRootWin
+    , inlineShadowRejectGrowth1FinalConstructorApplication = left.inlineShadowRejectGrowth1FinalConstructorApplication + right.inlineShadowRejectGrowth1FinalConstructorApplication
+    , inlineShadowRejectGrowth1NoPayoffNoDirectBenefit = left.inlineShadowRejectGrowth1NoPayoffNoDirectBenefit + right.inlineShadowRejectGrowth1NoPayoffNoDirectBenefit
+    , listFusionChanges = left.listFusionChanges + right.listFusionChanges
+    , listFusionPipelineNormalizations = left.listFusionPipelineNormalizations + right.listFusionPipelineNormalizations
+    , listFusionHeadFlattenRewrites = left.listFusionHeadFlattenRewrites + right.listFusionHeadFlattenRewrites
+    , listFusionRuleRewrites = left.listFusionRuleRewrites + right.listFusionRuleRewrites
+    , precomputedRefSubstitutions = left.precomputedRefSubstitutions + right.precomputedRefSubstitutions
+    , constantFolds = left.constantFolds + right.constantFolds
+    , rejectSamples = mergeRejectSamples left.rejectSamples right.rejectSamples
+    }
+
+
+rejectSampleLimit : Int
+rejectSampleLimit =
+    16
+
+
+collectRejectSamples : Bool
+collectRejectSamples =
+    False
+
+
+mergeRejectSamples : List String -> List String -> List String
+mergeRejectSamples left right =
+    List.foldl addRejectSample left right
+
+
+addRejectSample : String -> List String -> List String
+addRejectSample sample samples =
+    if List.member sample samples || List.length samples >= rejectSampleLimit then
+        samples
+
+    else
+        samples ++ [ sample ]
+
+
 {-| Parse all sources and build an environment from them.
 This is the expensive phase (parse + fold through buildModuleEnv).
 The result can be reused across multiple `evalWithEnv` calls.
@@ -1096,8 +1432,16 @@ already-normalized `Array.fromList [...]` body yields the same expression).
 Safe to call regardless of cache state.
 
 -}
-normalizeSummaries : List CachedModuleSummary -> List CachedModuleSummary
-normalizeSummaries summaries =
+type alias DependencySummaryOptimizationResult =
+    { functions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+    , stats : DependencySummaryStats
+    }
+
+
+normalizeSummariesWithStats :
+    List CachedModuleSummary
+    -> { summaries : List CachedModuleSummary, stats : DependencySummaryStats }
+normalizeSummariesWithStats summaries =
     let
         sharedFunctionsBefore : Dict.Dict String (Dict.Dict String FunctionImplementation)
         sharedFunctionsBefore =
@@ -1128,37 +1472,45 @@ normalizeSummaries summaries =
         ( normalizedFunctions, normalizedPrecomputedValues ) =
             normalizeTopLevelConstants summaries sharedFunctionsBefore sharedModuleImports
 
-        optimizedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
-        optimizedFunctions =
+        optimizationResult : DependencySummaryOptimizationResult
+        optimizationResult =
             optimizeDependencySummaryBodies
                 summaries
                 sharedModuleImports
                 normalizedFunctions
                 normalizedPrecomputedValues
     in
-    summaries
-        |> List.map
-            (\summary ->
-                let
-                    moduleKey : String
-                    moduleKey =
-                        Environment.moduleKey summary.moduleName
+    { summaries =
+        summaries
+            |> List.map
+                (\summary ->
+                    let
+                        moduleKey : String
+                        moduleKey =
+                            Environment.moduleKey summary.moduleName
 
-                    updatedFns : Dict.Dict String FunctionImplementation
-                    updatedFns =
-                        Dict.get moduleKey optimizedFunctions
-                            |> Maybe.withDefault Dict.empty
-                in
-                { summary
-                    | functions =
-                        summary.functions
-                            |> List.map
-                                (\f ->
-                                    Dict.get (Node.value f.name) updatedFns
-                                        |> Maybe.withDefault f
-                                )
-                }
-            )
+                        updatedFns : Dict.Dict String FunctionImplementation
+                        updatedFns =
+                            Dict.get moduleKey optimizationResult.functions
+                                |> Maybe.withDefault Dict.empty
+                    in
+                    { summary
+                        | functions =
+                            summary.functions
+                                |> List.map
+                                    (\f ->
+                                        Dict.get (Node.value f.name) updatedFns
+                                            |> Maybe.withDefault f
+                                    )
+                    }
+                )
+    , stats = optimizationResult.stats
+    }
+
+
+normalizeSummaries : List CachedModuleSummary -> List CachedModuleSummary
+normalizeSummaries summaries =
+    (normalizeSummariesWithStats summaries).summaries
 
 
 optimizeDependencySummaryBodies :
@@ -1166,7 +1518,7 @@ optimizeDependencySummaryBodies :
     -> Dict.Dict String ImportedNames
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
     -> Dict.Dict String (Dict.Dict String Value)
-    -> Dict.Dict String (Dict.Dict String FunctionImplementation)
+    -> DependencySummaryOptimizationResult
 optimizeDependencySummaryBodies summaries sharedModuleImports normalizedFunctions normalizedPrecomputedValues =
     let
         cfg : Types.Config
@@ -1225,24 +1577,81 @@ optimizeDependencySummaryBodies summaries sharedModuleImports normalizedFunction
                         , recursionCheck = Nothing
                         }
 
-                    optimizedModuleFunctions : Dict.Dict String FunctionImplementation
+                    optimizedModuleFunctions : { functions : Dict.Dict String FunctionImplementation, stats : DependencySummaryStats }
                     optimizedModuleFunctions =
                         currentModuleFunctions
-                            |> Dict.map
-                                (\_ funcImpl ->
+                            |> Dict.foldl
+                                (\name funcImpl moduleAcc ->
                                     if List.isEmpty funcImpl.arguments then
-                                        funcImpl
+                                        { moduleAcc | functions = Dict.insert name funcImpl moduleAcc.functions }
 
                                     else
-                                        { funcImpl
-                                            | expression =
-                                                foldWithFlags flags env cfg funcImpl.expression
+                                        let
+                                            rewriteOutcome : DependencyRewriteResult
+                                            rewriteOutcome =
+                                                foldWithFlagsAndStats flags env cfg funcImpl.expression
+
+                                            fusionOutcome : ListFusion.FuseResult
+                                            fusionOutcome =
+                                                if flags.runListFusion then
+                                                    ListFusion.canonicalizeWithStats rewriteOutcome.expression
+
+                                                else
+                                                    { expression = rewriteOutcome.expression
+                                                    , stats = ListFusion.emptyFuseStats
+                                                    }
+
+                                            normalizedExpression : Node Expression
+                                            normalizedExpression =
+                                                fusionOutcome.expression
+
+                                            listFusionStats : DependencySummaryStats
+                                            listFusionStats =
+                                                { emptyDependencySummaryStats
+                                                    | listFusionChanges =
+                                                        if normalizedExpression /= rewriteOutcome.expression then
+                                                            1
+
+                                                        else
+                                                            0
+                                                    , listFusionPipelineNormalizations = fusionOutcome.stats.pipelineNormalizations
+                                                    , listFusionHeadFlattenRewrites = fusionOutcome.stats.headFlattenRewrites
+                                                    , listFusionRuleRewrites = fusionOutcome.stats.ruleRewrites
+                                                }
+
+                                            functionStats : DependencySummaryStats
+                                            functionStats =
+                                                { emptyDependencySummaryStats
+                                                    | functionsVisited = 1
+                                                    , functionsRewritten =
+                                                        if normalizedExpression /= funcImpl.expression then
+                                                            1
+
+                                                        else
+                                                            0
+                                                }
+                                        in
+                                        { functions =
+                                            Dict.insert
+                                                name
+                                                { funcImpl | expression = normalizedExpression }
+                                                moduleAcc.functions
+                                        , stats =
+                                            mergeDependencySummaryStats
+                                                moduleAcc.stats
+                                                (mergeDependencySummaryStats
+                                                    functionStats
+                                                    (mergeDependencySummaryStats listFusionStats rewriteOutcome.stats)
+                                                )
                                         }
                                 )
+                                { functions = Dict.empty, stats = emptyDependencySummaryStats }
                 in
-                Dict.insert moduleKey optimizedModuleFunctions acc
+                { functions = Dict.insert moduleKey optimizedModuleFunctions.functions acc.functions
+                , stats = mergeDependencySummaryStats acc.stats optimizedModuleFunctions.stats
+                }
             )
-            Dict.empty
+            { functions = Dict.empty, stats = emptyDependencySummaryStats }
 
 
 {-| AST normalization pass: eagerly evaluate every zero-arg function whose
@@ -1889,6 +2298,625 @@ isLosslessValue value =
             False
 
 
+type alias DependencyRewriteResult =
+    { expression : Node Expression
+    , stats : DependencySummaryStats
+    }
+
+
+type InlineBodyShape
+    = InlineLeaf
+    | InlineConstructor
+    | InlineOperator
+    | InlineRecordAccess
+    | InlineCollection
+    | InlineOther
+
+
+type InlinePayoffKind
+    = InlinePayoffChangedKind
+    | InlinePayoffInlineKind
+    | InlinePayoffConstantFoldKind
+    | InlinePayoffPrecomputedRefKind
+
+
+type ShadowInlineFilter
+    = ShadowRejectCollection
+    | ShadowRejectGrowth0
+    | ShadowRejectGrowth1
+
+
+type alias InlineRewrite =
+    { expression : Node Expression
+    , bodySize : Int
+    , bodyShape : InlineBodyShape
+    }
+
+
+type InlineRejectReason
+    = InlineRejectPattern
+    | InlineRejectArity
+    | InlineRejectSelfCall
+    | InlineRejectBodyTooLarge
+    | InlineRejectUnsafe InlineUnsafeRoot
+    | InlineRejectInternalHelper
+
+
+type InlineDecision
+    = InlineApplied InlineRewrite
+    | InlineRejected
+        { reason : InlineRejectReason
+        , sample : Maybe String
+        }
+    | InlineNotApplicable
+
+
+type InlineUnsafeRoot
+    = InlineUnsafeApplication
+    | InlineUnsafeIf
+    | InlineUnsafeCase
+    | InlineUnsafeLet
+    | InlineUnsafeLambda
+    | InlineUnsafeOther
+
+
+rewriteResult : Node Expression -> DependencyRewriteResult
+rewriteResult expression =
+    { expression = expression
+    , stats = emptyDependencySummaryStats
+    }
+
+
+combineRewriteResults : List DependencyRewriteResult -> { expressions : List (Node Expression), stats : DependencySummaryStats }
+combineRewriteResults results =
+    { expressions = List.map .expression results
+    , stats =
+        results
+            |> List.foldl
+                (\result acc -> mergeDependencySummaryStats acc result.stats)
+                emptyDependencySummaryStats
+    }
+
+
+inlineRewriteStats : InlineRewrite -> DependencySummaryStats
+inlineRewriteStats inlineRewrite =
+    let
+        baseStats =
+            { emptyDependencySummaryStats
+                | inlineCandidates = 1
+                , inlineSuccesses = 1
+                , inlineBodyLt30 =
+                    if inlineRewrite.bodySize < 30 then
+                        1
+
+                    else
+                        0
+                , inlineBody30To59 =
+                    if inlineRewrite.bodySize >= 30 && inlineRewrite.bodySize < 60 then
+                        1
+
+                    else
+                        0
+                , inlineBody60Plus =
+                    if inlineRewrite.bodySize >= 60 then
+                        1
+
+                        else
+                            0
+            }
+    in
+    case inlineRewrite.bodyShape of
+        InlineLeaf ->
+            { baseStats | inlineShapeLeaf = 1 }
+
+        InlineConstructor ->
+            { baseStats | inlineShapeConstructor = 1 }
+
+        InlineOperator ->
+            { baseStats | inlineShapeOperator = 1 }
+
+        InlineRecordAccess ->
+            { baseStats | inlineShapeRecordAccess = 1 }
+
+        InlineCollection ->
+            { baseStats | inlineShapeCollection = 1 }
+
+        InlineOther ->
+            { baseStats | inlineShapeOther = 1 }
+
+
+inlinePayoffTotalStats : InlinePayoffKind -> DependencySummaryStats
+inlinePayoffTotalStats payoffKind =
+    case payoffKind of
+        InlinePayoffChangedKind ->
+            { emptyDependencySummaryStats | inlinePayoffChanged = 1 }
+
+        InlinePayoffInlineKind ->
+            { emptyDependencySummaryStats | inlinePayoffInline = 1 }
+
+        InlinePayoffConstantFoldKind ->
+            { emptyDependencySummaryStats | inlinePayoffConstantFold = 1 }
+
+        InlinePayoffPrecomputedRefKind ->
+            { emptyDependencySummaryStats | inlinePayoffPrecomputedRef = 1 }
+
+
+inlinePayoffShapeStats : InlinePayoffKind -> InlineBodyShape -> DependencySummaryStats
+inlinePayoffShapeStats payoffKind bodyShape =
+    case ( payoffKind, bodyShape ) of
+        ( InlinePayoffChangedKind, InlineLeaf ) ->
+            { emptyDependencySummaryStats | inlinePayoffChangedShapeLeaf = 1 }
+
+        ( InlinePayoffChangedKind, InlineConstructor ) ->
+            { emptyDependencySummaryStats | inlinePayoffChangedShapeConstructor = 1 }
+
+        ( InlinePayoffChangedKind, InlineOperator ) ->
+            { emptyDependencySummaryStats | inlinePayoffChangedShapeOperator = 1 }
+
+        ( InlinePayoffChangedKind, InlineRecordAccess ) ->
+            { emptyDependencySummaryStats | inlinePayoffChangedShapeRecordAccess = 1 }
+
+        ( InlinePayoffChangedKind, InlineCollection ) ->
+            { emptyDependencySummaryStats | inlinePayoffChangedShapeCollection = 1 }
+
+        ( InlinePayoffChangedKind, InlineOther ) ->
+            { emptyDependencySummaryStats | inlinePayoffChangedShapeOther = 1 }
+
+        ( InlinePayoffInlineKind, InlineLeaf ) ->
+            { emptyDependencySummaryStats | inlinePayoffInlineShapeLeaf = 1 }
+
+        ( InlinePayoffInlineKind, InlineConstructor ) ->
+            { emptyDependencySummaryStats | inlinePayoffInlineShapeConstructor = 1 }
+
+        ( InlinePayoffInlineKind, InlineOperator ) ->
+            { emptyDependencySummaryStats | inlinePayoffInlineShapeOperator = 1 }
+
+        ( InlinePayoffInlineKind, InlineRecordAccess ) ->
+            { emptyDependencySummaryStats | inlinePayoffInlineShapeRecordAccess = 1 }
+
+        ( InlinePayoffInlineKind, InlineCollection ) ->
+            { emptyDependencySummaryStats | inlinePayoffInlineShapeCollection = 1 }
+
+        ( InlinePayoffInlineKind, InlineOther ) ->
+            { emptyDependencySummaryStats | inlinePayoffInlineShapeOther = 1 }
+
+        ( InlinePayoffConstantFoldKind, InlineLeaf ) ->
+            { emptyDependencySummaryStats | inlinePayoffConstantFoldShapeLeaf = 1 }
+
+        ( InlinePayoffConstantFoldKind, InlineConstructor ) ->
+            { emptyDependencySummaryStats | inlinePayoffConstantFoldShapeConstructor = 1 }
+
+        ( InlinePayoffConstantFoldKind, InlineOperator ) ->
+            { emptyDependencySummaryStats | inlinePayoffConstantFoldShapeOperator = 1 }
+
+        ( InlinePayoffConstantFoldKind, InlineRecordAccess ) ->
+            { emptyDependencySummaryStats | inlinePayoffConstantFoldShapeRecordAccess = 1 }
+
+        ( InlinePayoffConstantFoldKind, InlineCollection ) ->
+            { emptyDependencySummaryStats | inlinePayoffConstantFoldShapeCollection = 1 }
+
+        ( InlinePayoffConstantFoldKind, InlineOther ) ->
+            { emptyDependencySummaryStats | inlinePayoffConstantFoldShapeOther = 1 }
+
+        ( InlinePayoffPrecomputedRefKind, InlineLeaf ) ->
+            { emptyDependencySummaryStats | inlinePayoffPrecomputedRefShapeLeaf = 1 }
+
+        ( InlinePayoffPrecomputedRefKind, InlineConstructor ) ->
+            { emptyDependencySummaryStats | inlinePayoffPrecomputedRefShapeConstructor = 1 }
+
+        ( InlinePayoffPrecomputedRefKind, InlineOperator ) ->
+            { emptyDependencySummaryStats | inlinePayoffPrecomputedRefShapeOperator = 1 }
+
+        ( InlinePayoffPrecomputedRefKind, InlineRecordAccess ) ->
+            { emptyDependencySummaryStats | inlinePayoffPrecomputedRefShapeRecordAccess = 1 }
+
+        ( InlinePayoffPrecomputedRefKind, InlineCollection ) ->
+            { emptyDependencySummaryStats | inlinePayoffPrecomputedRefShapeCollection = 1 }
+
+        ( InlinePayoffPrecomputedRefKind, InlineOther ) ->
+            { emptyDependencySummaryStats | inlinePayoffPrecomputedRefShapeOther = 1 }
+
+
+inlinePayoffBodyStats : InlinePayoffKind -> Int -> DependencySummaryStats
+inlinePayoffBodyStats payoffKind bodySize =
+    if bodySize < 30 then
+        case payoffKind of
+            InlinePayoffChangedKind ->
+                { emptyDependencySummaryStats | inlinePayoffChangedBodyLt30 = 1 }
+
+            InlinePayoffInlineKind ->
+                { emptyDependencySummaryStats | inlinePayoffInlineBodyLt30 = 1 }
+
+            InlinePayoffConstantFoldKind ->
+                { emptyDependencySummaryStats | inlinePayoffConstantFoldBodyLt30 = 1 }
+
+            InlinePayoffPrecomputedRefKind ->
+                { emptyDependencySummaryStats | inlinePayoffPrecomputedRefBodyLt30 = 1 }
+
+    else if bodySize < 60 then
+        case payoffKind of
+            InlinePayoffChangedKind ->
+                { emptyDependencySummaryStats | inlinePayoffChangedBody30To59 = 1 }
+
+            InlinePayoffInlineKind ->
+                { emptyDependencySummaryStats | inlinePayoffInlineBody30To59 = 1 }
+
+            InlinePayoffConstantFoldKind ->
+                { emptyDependencySummaryStats | inlinePayoffConstantFoldBody30To59 = 1 }
+
+            InlinePayoffPrecomputedRefKind ->
+                { emptyDependencySummaryStats | inlinePayoffPrecomputedRefBody30To59 = 1 }
+
+    else
+        case payoffKind of
+            InlinePayoffChangedKind ->
+                { emptyDependencySummaryStats | inlinePayoffChangedBody60Plus = 1 }
+
+            InlinePayoffInlineKind ->
+                { emptyDependencySummaryStats | inlinePayoffInlineBody60Plus = 1 }
+
+            InlinePayoffConstantFoldKind ->
+                { emptyDependencySummaryStats | inlinePayoffConstantFoldBody60Plus = 1 }
+
+            InlinePayoffPrecomputedRefKind ->
+                { emptyDependencySummaryStats | inlinePayoffPrecomputedRefBody60Plus = 1 }
+
+
+inlinePayoffKindStats : Bool -> InlinePayoffKind -> InlineRewrite -> DependencySummaryStats
+inlinePayoffKindStats didTrigger payoffKind inlineRewrite =
+    if didTrigger then
+        mergeDependencySummaryStats
+            (inlinePayoffTotalStats payoffKind)
+            (mergeDependencySummaryStats
+                (inlinePayoffShapeStats payoffKind inlineRewrite.bodyShape)
+                (inlinePayoffBodyStats payoffKind inlineRewrite.bodySize)
+            )
+
+    else
+        emptyDependencySummaryStats
+
+
+inlinePayoffStats : InlineRewrite -> DependencyRewriteResult -> DependencySummaryStats
+inlinePayoffStats inlineRewrite recursiveResult =
+    mergeDependencySummaryStats
+        (inlinePayoffKindStats
+            (recursiveResult.expression /= inlineRewrite.expression)
+            InlinePayoffChangedKind
+            inlineRewrite
+        )
+        (mergeDependencySummaryStats
+            (inlinePayoffKindStats
+                (recursiveResult.stats.inlineSuccesses > 0)
+                InlinePayoffInlineKind
+                inlineRewrite
+            )
+            (mergeDependencySummaryStats
+                (inlinePayoffKindStats
+                    (recursiveResult.stats.constantFolds > 0)
+                    InlinePayoffConstantFoldKind
+                    inlineRewrite
+                )
+                (inlinePayoffKindStats
+                    (recursiveResult.stats.precomputedRefSubstitutions > 0)
+                    InlinePayoffPrecomputedRefKind
+                    inlineRewrite
+                )
+            )
+        )
+
+
+type alias InlineShadowFlags =
+    { didChanged : Bool
+    , didInline : Bool
+    , didConstantFold : Bool
+    , didPrecomputedRef : Bool
+    , finalShrinks : Bool
+    , finalNonApplication : Bool
+    , finalDirectRootWin : Bool
+    , finalConstructorApplication : Bool
+    }
+
+
+countBool : Bool -> Int
+countBool value =
+    if value then
+        1
+
+    else
+        0
+
+
+isApplicationRoot : Node Expression -> Bool
+isApplicationRoot (Node _ expr) =
+    case expr of
+        Application _ ->
+            True
+
+        _ ->
+            False
+
+
+isDirectRootWin : Node Expression -> Bool
+isDirectRootWin expression =
+    classifyInlineBodyShape expression /= InlineOther
+
+
+isConstructorApplication : Node Expression -> Bool
+isConstructorApplication expression =
+    classifyInlineBodyShape expression == InlineConstructor
+
+
+shadowInlineFilterWouldReject : Int -> InlineRewrite -> ShadowInlineFilter -> Bool
+shadowInlineFilterWouldReject callSiteSize inlineRewrite shadowFilter =
+    let
+        inlinedSize =
+            expressionSize inlineRewrite.expression
+    in
+    case shadowFilter of
+        ShadowRejectCollection ->
+            inlineRewrite.bodyShape == InlineCollection
+
+        ShadowRejectGrowth0 ->
+            inlinedSize > callSiteSize
+
+        ShadowRejectGrowth1 ->
+            inlinedSize > callSiteSize + 1
+
+
+shadowInlineFilterStats : ShadowInlineFilter -> InlineShadowFlags -> DependencySummaryStats
+shadowInlineFilterStats shadowFilter shadowFlags =
+    let
+        hasDownstreamPayoff =
+            shadowFlags.didChanged
+                || shadowFlags.didInline
+                || shadowFlags.didConstantFold
+                || shadowFlags.didPrecomputedRef
+
+        hasDirectBenefit =
+            shadowFlags.finalShrinks
+                || shadowFlags.finalDirectRootWin
+
+        noPayoffNoDirectBenefit =
+            countBool (not hasDownstreamPayoff && not hasDirectBenefit)
+    in
+    case shadowFilter of
+        ShadowRejectCollection ->
+            { emptyDependencySummaryStats
+                | inlineShadowRejectCollection = 1
+                , inlineShadowRejectCollectionPayoffChanged = countBool shadowFlags.didChanged
+                , inlineShadowRejectCollectionPayoffInline = countBool shadowFlags.didInline
+                , inlineShadowRejectCollectionPayoffPrecomputedRef = countBool shadowFlags.didPrecomputedRef
+                , inlineShadowRejectCollectionFinalShrinks = countBool shadowFlags.finalShrinks
+                , inlineShadowRejectCollectionFinalNonApplication = countBool shadowFlags.finalNonApplication
+                , inlineShadowRejectCollectionFinalDirectRootWin = countBool shadowFlags.finalDirectRootWin
+                , inlineShadowRejectCollectionFinalConstructorApplication = countBool shadowFlags.finalConstructorApplication
+                , inlineShadowRejectCollectionNoPayoffNoDirectBenefit = noPayoffNoDirectBenefit
+            }
+
+        ShadowRejectGrowth0 ->
+            { emptyDependencySummaryStats
+                | inlineShadowRejectGrowth0 = 1
+                , inlineShadowRejectGrowth0PayoffChanged = countBool shadowFlags.didChanged
+                , inlineShadowRejectGrowth0PayoffInline = countBool shadowFlags.didInline
+                , inlineShadowRejectGrowth0PayoffPrecomputedRef = countBool shadowFlags.didPrecomputedRef
+                , inlineShadowRejectGrowth0FinalShrinks = countBool shadowFlags.finalShrinks
+                , inlineShadowRejectGrowth0FinalNonApplication = countBool shadowFlags.finalNonApplication
+                , inlineShadowRejectGrowth0FinalDirectRootWin = countBool shadowFlags.finalDirectRootWin
+                , inlineShadowRejectGrowth0FinalConstructorApplication = countBool shadowFlags.finalConstructorApplication
+                , inlineShadowRejectGrowth0NoPayoffNoDirectBenefit = noPayoffNoDirectBenefit
+            }
+
+        ShadowRejectGrowth1 ->
+            { emptyDependencySummaryStats
+                | inlineShadowRejectGrowth1 = 1
+                , inlineShadowRejectGrowth1PayoffChanged = countBool shadowFlags.didChanged
+                , inlineShadowRejectGrowth1PayoffInline = countBool shadowFlags.didInline
+                , inlineShadowRejectGrowth1PayoffPrecomputedRef = countBool shadowFlags.didPrecomputedRef
+                , inlineShadowRejectGrowth1FinalShrinks = countBool shadowFlags.finalShrinks
+                , inlineShadowRejectGrowth1FinalNonApplication = countBool shadowFlags.finalNonApplication
+                , inlineShadowRejectGrowth1FinalDirectRootWin = countBool shadowFlags.finalDirectRootWin
+                , inlineShadowRejectGrowth1FinalConstructorApplication = countBool shadowFlags.finalConstructorApplication
+                , inlineShadowRejectGrowth1NoPayoffNoDirectBenefit = noPayoffNoDirectBenefit
+            }
+
+
+shadowInlineStats : Int -> InlineRewrite -> DependencyRewriteResult -> DependencySummaryStats
+shadowInlineStats callSiteSize inlineRewrite recursiveResult =
+    let
+        shadowFlags =
+            { didChanged = recursiveResult.expression /= inlineRewrite.expression
+            , didInline = recursiveResult.stats.inlineSuccesses > 0
+            , didConstantFold = recursiveResult.stats.constantFolds > 0
+            , didPrecomputedRef = recursiveResult.stats.precomputedRefSubstitutions > 0
+            , finalShrinks = expressionSize recursiveResult.expression < callSiteSize
+            , finalNonApplication = not (isApplicationRoot recursiveResult.expression)
+            , finalDirectRootWin = isDirectRootWin recursiveResult.expression
+            , finalConstructorApplication = isConstructorApplication recursiveResult.expression
+            }
+
+        statsFor shadowFilter =
+            if shadowInlineFilterWouldReject callSiteSize inlineRewrite shadowFilter then
+                shadowInlineFilterStats shadowFilter shadowFlags
+
+            else
+                emptyDependencySummaryStats
+    in
+    mergeDependencySummaryStats
+        (statsFor ShadowRejectCollection)
+        (mergeDependencySummaryStats
+            (statsFor ShadowRejectGrowth0)
+            (statsFor ShadowRejectGrowth1)
+        )
+
+
+inlineRejectStats : InlineRejectReason -> Maybe String -> DependencySummaryStats
+inlineRejectStats rejectReason maybeSample =
+    let
+        baseStats =
+            { emptyDependencySummaryStats | inlineCandidates = 1 }
+
+        withSample : DependencySummaryStats -> DependencySummaryStats
+        withSample stats =
+            case maybeSample of
+                Just sample ->
+                    { stats | rejectSamples = addRejectSample sample stats.rejectSamples }
+
+                Nothing ->
+                    stats
+    in
+    case rejectReason of
+        InlineRejectPattern ->
+            withSample { baseStats | inlineRejectedPattern = 1 }
+
+        InlineRejectArity ->
+            withSample { baseStats | inlineRejectedArity = 1 }
+
+        InlineRejectSelfCall ->
+            withSample { baseStats | inlineRejectedSelfCall = 1 }
+
+        InlineRejectBodyTooLarge ->
+            withSample { baseStats | inlineRejectedBodyTooLarge = 1 }
+
+        InlineRejectUnsafe unsafeRoot ->
+            case unsafeRoot of
+                InlineUnsafeApplication ->
+                    withSample { baseStats | inlineRejectedUnsafe = 1, inlineRejectedUnsafeApplication = 1 }
+
+                InlineUnsafeIf ->
+                    withSample { baseStats | inlineRejectedUnsafe = 1, inlineRejectedUnsafeIf = 1 }
+
+                InlineUnsafeCase ->
+                    withSample { baseStats | inlineRejectedUnsafe = 1, inlineRejectedUnsafeCase = 1 }
+
+                InlineUnsafeLet ->
+                    withSample { baseStats | inlineRejectedUnsafe = 1, inlineRejectedUnsafeLet = 1 }
+
+                InlineUnsafeLambda ->
+                    withSample { baseStats | inlineRejectedUnsafe = 1, inlineRejectedUnsafeLambda = 1 }
+
+                InlineUnsafeOther ->
+                    withSample { baseStats | inlineRejectedUnsafe = 1, inlineRejectedUnsafeOther = 1 }
+
+        InlineRejectInternalHelper ->
+            withSample { baseStats | inlineRejectedInternalHelper = 1 }
+
+
+formatRejectSample : InlineRejectReason -> List String -> String -> Node Expression -> String
+formatRejectSample rejectReason moduleName funcName expression =
+    let
+        reasonLabel =
+            case rejectReason of
+                InlineRejectPattern ->
+                    "pattern"
+
+                InlineRejectArity ->
+                    "arity"
+
+                InlineRejectSelfCall ->
+                    "self_call"
+
+                InlineRejectBodyTooLarge ->
+                    "body_too_large"
+
+                InlineRejectUnsafe InlineUnsafeApplication ->
+                    "unsafe_application"
+
+                InlineRejectUnsafe InlineUnsafeIf ->
+                    "unsafe_if"
+
+                InlineRejectUnsafe InlineUnsafeCase ->
+                    "unsafe_case"
+
+                InlineRejectUnsafe InlineUnsafeLet ->
+                    "unsafe_let"
+
+                InlineRejectUnsafe InlineUnsafeLambda ->
+                    "unsafe_lambda"
+
+                InlineRejectUnsafe InlineUnsafeOther ->
+                    "unsafe_other"
+
+                InlineRejectInternalHelper ->
+                    "internal_helper"
+
+        qualifiedName =
+            String.join "." (moduleName ++ [ funcName ])
+    in
+    reasonLabel ++ " | " ++ qualifiedName ++ " | " ++ Expression.Extra.toString expression
+
+
+classifyUnsafeRoot : Node Expression -> InlineUnsafeRoot
+classifyUnsafeRoot (Node _ expr) =
+    case expr of
+        Application _ ->
+            InlineUnsafeApplication
+
+        IfBlock _ _ _ ->
+            InlineUnsafeIf
+
+        CaseExpression _ ->
+            InlineUnsafeCase
+
+        LetExpression _ ->
+            InlineUnsafeLet
+
+        LambdaExpression _ ->
+            InlineUnsafeLambda
+
+        _ ->
+            InlineUnsafeOther
+
+
+classifyInlineBodyShape : Node Expression -> InlineBodyShape
+classifyInlineBodyShape (Node _ expr) =
+    case expr of
+        Integer _ ->
+            InlineLeaf
+
+        Hex _ ->
+            InlineLeaf
+
+        Floatable _ ->
+            InlineLeaf
+
+        Literal _ ->
+            InlineLeaf
+
+        CharLiteral _ ->
+            InlineLeaf
+
+        UnitExpr ->
+            InlineLeaf
+
+        FunctionOrValue _ _ ->
+            InlineLeaf
+
+        Application ((Node _ (FunctionOrValue _ name)) :: _) ->
+            if Eval.Expression.isUpperName name then
+                InlineConstructor
+
+            else
+                InlineOther
+
+        OperatorApplication _ _ _ _ ->
+            InlineOperator
+
+        RecordAccess _ _ ->
+            InlineRecordAccess
+
+        ListExpr _ ->
+            InlineCollection
+
+        TupledExpression _ ->
+            InlineCollection
+
+        RecordExpr _ ->
+            InlineCollection
+
+        _ ->
+            InlineOther
+
+
 foldWithFlags :
     NormalizationFlags.NormalizationFlags
     -> Env
@@ -1896,6 +2924,16 @@ foldWithFlags :
     -> Node Expression
     -> Node Expression
 foldWithFlags flags env cfg node =
+    (foldWithFlagsAndStats flags env cfg node).expression
+
+
+foldWithFlagsAndStats :
+    NormalizationFlags.NormalizationFlags
+    -> Env
+    -> Config
+    -> Node Expression
+    -> DependencyRewriteResult
+foldWithFlagsAndStats flags env cfg node =
     foldConstantSubExpressionsHelp 3 flags env cfg node
 
 
@@ -1905,25 +2943,47 @@ foldConstantSubExpressionsHelp :
     -> Env
     -> Config
     -> Node Expression
-    -> Node Expression
+    -> DependencyRewriteResult
 foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
     if depth <= 0 then
-        node
+        rewriteResult node
 
     else
         let
-            tryFold : Node Expression -> Node Expression
+            recurse : Node Expression -> DependencyRewriteResult
+            recurse =
+                foldConstantSubExpressionsHelp depth flags env cfg
+
+            recurseNext : Node Expression -> DependencyRewriteResult
+            recurseNext =
+                foldConstantSubExpressionsHelp (depth - 1) flags env cfg
+
+            tryFold : Node Expression -> { expression : Node Expression, didFold : Bool }
             tryFold foldedNode =
                 case Eval.Expression.evalExpression foldedNode cfg env |> EvalResult.toResult of
                     Ok value ->
                         if isLosslessValue value then
-                            Value.toExpression value
+                            { expression = Value.toExpression value
+                            , didFold = True
+                            }
 
                         else
-                            foldedNode
+                            { expression = foldedNode
+                            , didFold = False
+                            }
 
                     Err _ ->
-                        foldedNode
+                        { expression = foldedNode
+                        , didFold = False
+                        }
+
+            constantFoldStats : DependencySummaryStats
+            constantFoldStats =
+                { emptyDependencySummaryStats | constantFolds = 1 }
+
+            precomputedRefSubstitutionStats : DependencySummaryStats
+            precomputedRefSubstitutionStats =
+                { emptyDependencySummaryStats | precomputedRefSubstitutions = 1 }
 
             isConstantLeaf : Expression -> Bool
             isConstantLeaf e =
@@ -1970,26 +3030,65 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
         in
         case expr of
             ListExpr items ->
-                Node range (ListExpr (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
+                let
+                    itemResults =
+                        List.map recurse items
+
+                    combined =
+                        combineRewriteResults itemResults
+                in
+                { expression = Node range (ListExpr combined.expressions)
+                , stats = combined.stats
+                }
 
             TupledExpression items ->
-                Node range (TupledExpression (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
+                let
+                    itemResults =
+                        List.map recurse items
+
+                    combined =
+                        combineRewriteResults itemResults
+                in
+                { expression = Node range (TupledExpression combined.expressions)
+                , stats = combined.stats
+                }
 
             RecordExpr fields ->
-                Node range
-                    (RecordExpr
-                        (List.map
-                            (\(Node fRange ( name, value )) ->
-                                Node fRange ( name, foldConstantSubExpressionsHelp depth flags env cfg value )
-                            )
-                            fields
-                        )
-                    )
+                let
+                    fieldResults =
+                        fields
+                            |> List.map
+                                (\(Node fRange ( name, value )) ->
+                                    let
+                                        valueResult =
+                                            recurse value
+                                    in
+                                    { field = Node fRange ( name, valueResult.expression )
+                                    , stats = valueResult.stats
+                                    }
+                                )
+                in
+                { expression = Node range (RecordExpr (List.map .field fieldResults))
+                , stats =
+                    fieldResults
+                        |> List.foldl
+                            (\result acc -> mergeDependencySummaryStats acc result.stats)
+                            emptyDependencySummaryStats
+                }
 
             Application ((Node _ (FunctionOrValue moduleName funcName)) :: args) ->
                 let
+                    foldedArgResults =
+                        List.map recurse args
+
                     foldedArgs =
-                        List.map (foldConstantSubExpressionsHelp depth flags env cfg) args
+                        List.map .expression foldedArgResults
+
+                    argStats =
+                        foldedArgResults
+                            |> List.foldl
+                                (\result acc -> mergeDependencySummaryStats acc result.stats)
+                                emptyDependencySummaryStats
 
                     foldedNode =
                         Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs))
@@ -1999,106 +3098,265 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
                         && List.all (\(Node _ e) -> isConstantLeaf e) foldedArgs
                         && not (List.isEmpty foldedArgs)
                 then
-                    tryFold foldedNode
+                    let
+                        folded =
+                            tryFold foldedNode
+                    in
+                    { expression = folded.expression
+                    , stats =
+                        if folded.didFold then
+                            mergeDependencySummaryStats argStats constantFoldStats
+
+                        else
+                            argStats
+                    }
 
                 else if flags.inlineFunctions then
-                    case tryInlineFunction env moduleName funcName foldedArgs of
-                        Just inlinedExpr ->
-                            foldConstantSubExpressionsHelp (depth - 1) flags env cfg inlinedExpr
+                    case tryInlineFunction flags env moduleName funcName foldedArgs of
+                        InlineApplied inlineRewrite ->
+                            let
+                                recursiveResult =
+                                    recurseNext inlineRewrite.expression
 
-                        Nothing ->
-                            foldedNode
+                                payoffStats =
+                                    inlinePayoffStats inlineRewrite recursiveResult
+
+                                shadowStats =
+                                    shadowInlineStats (expressionSize foldedNode) inlineRewrite recursiveResult
+                            in
+                            { expression = recursiveResult.expression
+                            , stats =
+                                mergeDependencySummaryStats
+                                    argStats
+                                    (mergeDependencySummaryStats
+                                        (inlineRewriteStats inlineRewrite)
+                                        (mergeDependencySummaryStats
+                                            payoffStats
+                                            (mergeDependencySummaryStats shadowStats recursiveResult.stats)
+                                        )
+                                    )
+                            }
+
+                        InlineRejected reject ->
+                            { expression = foldedNode
+                            , stats =
+                                mergeDependencySummaryStats
+                                    argStats
+                                    (inlineRejectStats reject.reason reject.sample)
+                            }
+
+                        InlineNotApplicable ->
+                            { expression = foldedNode
+                            , stats = argStats
+                            }
 
                 else
-                    foldedNode
+                    { expression = foldedNode
+                    , stats = argStats
+                    }
 
             IfBlock cond thenBranch elseBranch ->
-                Node range
-                    (IfBlock
-                        (foldConstantSubExpressionsHelp depth flags env cfg cond)
-                        (foldConstantSubExpressionsHelp depth flags env cfg thenBranch)
-                        (foldConstantSubExpressionsHelp depth flags env cfg elseBranch)
-                    )
+                let
+                    condResult =
+                        recurse cond
+
+                    thenResult =
+                        recurse thenBranch
+
+                    elseResult =
+                        recurse elseBranch
+                in
+                { expression =
+                    Node range
+                        (IfBlock
+                            condResult.expression
+                            thenResult.expression
+                            elseResult.expression
+                        )
+                , stats =
+                    mergeDependencySummaryStats
+                        condResult.stats
+                        (mergeDependencySummaryStats thenResult.stats elseResult.stats)
+                }
 
             CaseExpression { expression, cases } ->
-                Node range
-                    (CaseExpression
-                        { expression = foldConstantSubExpressionsHelp depth flags env cfg expression
-                        , cases =
-                            List.map
-                                (\( pat, body ) -> ( pat, foldConstantSubExpressionsHelp depth flags env cfg body ))
-                                cases
-                        }
-                    )
+                let
+                    expressionResult =
+                        recurse expression
+
+                    caseResults =
+                        cases
+                            |> List.map
+                                (\( pat, body ) ->
+                                    let
+                                        bodyResult =
+                                            recurse body
+                                    in
+                                    { caseBody = ( pat, bodyResult.expression )
+                                    , stats = bodyResult.stats
+                                    }
+                                )
+                in
+                { expression =
+                    Node range
+                        (CaseExpression
+                            { expression = expressionResult.expression
+                            , cases = List.map .caseBody caseResults
+                            }
+                        )
+                , stats =
+                    caseResults
+                        |> List.foldl
+                            (\result acc -> mergeDependencySummaryStats acc result.stats)
+                            expressionResult.stats
+                }
 
             LetExpression { declarations, expression } ->
-                Node range
-                    (LetExpression
-                        { declarations =
-                            List.map
+                let
+                    declarationResults =
+                        declarations
+                            |> List.map
                                 (\(Node dRange decl) ->
-                                    Node dRange
-                                        (case decl of
-                                            LetFunction f ->
-                                                LetFunction
-                                                    { f
-                                                        | declaration =
-                                                            let
-                                                                (Node implRange impl) =
-                                                                    f.declaration
-                                                            in
-                                                            Node implRange
-                                                                { impl
-                                                                    | expression = foldConstantSubExpressionsHelp depth flags env cfg impl.expression
-                                                                }
-                                                    }
+                                    case decl of
+                                        LetFunction f ->
+                                            let
+                                                (Node implRange impl) =
+                                                    f.declaration
 
-                                            LetDestructuring pat val ->
-                                                LetDestructuring pat (foldConstantSubExpressionsHelp depth flags env cfg val)
-                                        )
+                                                functionExpressionResult =
+                                                    recurse impl.expression
+                                            in
+                                            { declaration =
+                                                Node dRange
+                                                    (LetFunction
+                                                        { f
+                                                            | declaration =
+                                                                Node implRange
+                                                                    { impl | expression = functionExpressionResult.expression }
+                                                        }
+                                                    )
+                                            , stats = functionExpressionResult.stats
+                                            }
+
+                                        LetDestructuring pat val ->
+                                            let
+                                                valueResult =
+                                                    recurse val
+                                            in
+                                            { declaration =
+                                                Node dRange (LetDestructuring pat valueResult.expression)
+                                            , stats = valueResult.stats
+                                            }
                                 )
-                                declarations
-                        , expression = foldConstantSubExpressionsHelp depth flags env cfg expression
-                        }
-                    )
+
+                    expressionResult =
+                        recurse expression
+                in
+                { expression =
+                    Node range
+                        (LetExpression
+                            { declarations = List.map .declaration declarationResults
+                            , expression = expressionResult.expression
+                            }
+                        )
+                , stats =
+                    declarationResults
+                        |> List.foldl
+                            (\result acc -> mergeDependencySummaryStats acc result.stats)
+                            expressionResult.stats
+                }
 
             OperatorApplication op dir left right ->
                 let
-                    foldedLeft =
-                        foldConstantSubExpressionsHelp depth flags env cfg left
+                    leftResult =
+                        recurse left
 
-                    foldedRight =
-                        foldConstantSubExpressionsHelp depth flags env cfg right
+                    rightResult =
+                        recurse right
+
+                    foldedNode =
+                        Node range (OperatorApplication op dir leftResult.expression rightResult.expression)
                 in
-                if flags.foldConstantApplications && isConstantLeaf ((\(Node _ e) -> e) foldedLeft) && isConstantLeaf ((\(Node _ e) -> e) foldedRight) then
-                    tryFold (Node range (OperatorApplication op dir foldedLeft foldedRight))
+                if flags.foldConstantApplications && isConstantLeaf (Node.value leftResult.expression) && isConstantLeaf (Node.value rightResult.expression) then
+                    let
+                        folded =
+                            tryFold foldedNode
+                    in
+                    { expression = folded.expression
+                    , stats =
+                        mergeDependencySummaryStats
+                            leftResult.stats
+                            (mergeDependencySummaryStats
+                                rightResult.stats
+                                (if folded.didFold then
+                                    constantFoldStats
+
+                                 else
+                                    emptyDependencySummaryStats
+                                )
+                            )
+                    }
 
                 else
-                    Node range (OperatorApplication op dir foldedLeft foldedRight)
+                    { expression = foldedNode
+                    , stats = mergeDependencySummaryStats leftResult.stats rightResult.stats
+                    }
 
             Negation inner ->
                 let
-                    foldedInner =
-                        foldConstantSubExpressionsHelp depth flags env cfg inner
+                    innerResult =
+                        recurse inner
+
+                    foldedNode =
+                        Node range (Negation innerResult.expression)
                 in
-                if isConstantLeaf ((\(Node _ e) -> e) foldedInner) then
-                    tryFold (Node range (Negation foldedInner))
+                if isConstantLeaf (Node.value innerResult.expression) then
+                    let
+                        folded =
+                            tryFold foldedNode
+                    in
+                    { expression = folded.expression
+                    , stats =
+                        mergeDependencySummaryStats
+                            innerResult.stats
+                            (if folded.didFold then
+                                constantFoldStats
+
+                             else
+                                emptyDependencySummaryStats
+                            )
+                    }
 
                 else
-                    Node range (Negation foldedInner)
+                    { expression = foldedNode
+                    , stats = innerResult.stats
+                    }
 
             ParenthesizedExpression inner ->
-                Node range (ParenthesizedExpression (foldConstantSubExpressionsHelp depth flags env cfg inner))
+                let
+                    innerResult =
+                        recurse inner
+                in
+                { expression = Node range (ParenthesizedExpression innerResult.expression)
+                , stats = innerResult.stats
+                }
 
             LambdaExpression lambda ->
-                Node range
-                    (LambdaExpression
-                        { lambda | expression = foldConstantSubExpressionsHelp depth flags env cfg lambda.expression }
-                    )
+                let
+                    innerResult =
+                        recurse lambda.expression
+                in
+                { expression =
+                    Node range
+                        (LambdaExpression
+                            { lambda | expression = innerResult.expression }
+                        )
+                , stats = innerResult.stats
+                }
 
             FunctionOrValue [] name ->
                 if not flags.inlinePrecomputedRefs then
-                    node
+                    rewriteResult node
 
                 else
                     case Dict.get env.currentModuleKey env.shared.precomputedValues of
@@ -2106,20 +3364,22 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
                             case Dict.get name modulePrecomputed of
                                 Just value ->
                                     if isLosslessValue value then
-                                        Value.toExpression value
+                                        { expression = Value.toExpression value
+                                        , stats = precomputedRefSubstitutionStats
+                                        }
 
                                     else
-                                        node
+                                        rewriteResult node
 
                                 Nothing ->
-                                    node
+                                    rewriteResult node
 
                         Nothing ->
-                            node
+                            rewriteResult node
 
             FunctionOrValue ((_ :: _) as moduleName) name ->
                 if not flags.inlinePrecomputedRefs then
-                    node
+                    rewriteResult node
 
                 else
                     let
@@ -2131,27 +3391,29 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
                             case Dict.get name modulePrecomputed of
                                 Just value ->
                                     if isLosslessValue value then
-                                        Value.toExpression value
+                                        { expression = Value.toExpression value
+                                        , stats = precomputedRefSubstitutionStats
+                                        }
 
                                     else
-                                        node
+                                        rewriteResult node
 
                                 Nothing ->
-                                    node
+                                    rewriteResult node
 
                         Nothing ->
-                            node
+                            rewriteResult node
 
             _ ->
-                node
+                rewriteResult node
 
 
 {-| Try to inline a small non-recursive function at a call site.
 For cross-module calls, qualifies unqualified refs in the inlined body
 with the source module name so they resolve correctly in the caller's context.
 -}
-tryInlineFunction : Env -> List String -> String -> List (Node Expression) -> Maybe (Node Expression)
-tryInlineFunction env moduleName funcName args =
+tryInlineFunction : NormalizationFlags.NormalizationFlags -> Env -> List String -> String -> List (Node Expression) -> InlineDecision
+tryInlineFunction flags env moduleName funcName args =
     let
         sourceModuleKey =
             if List.isEmpty moduleName then
@@ -2176,17 +3438,35 @@ tryInlineFunction env moduleName funcName args =
     in
     case maybeFuncImpl of
         Just funcImpl ->
-            if
-                List.length funcImpl.arguments
-                    == List.length args
-                    && not (containsSelfCallInExpr funcName funcImpl.expression)
-                    && expressionSize funcImpl.expression
-                    < 30
-                    && isInlineSafeExpression funcImpl.expression
-                    && not (referencesInternalHelper funcImpl.expression)
-            then
-                case extractVarPatternNames funcImpl.arguments of
-                    Just paramNames ->
+            case extractVarPatternNames funcImpl.arguments of
+                Just paramNames ->
+                    let
+                        bodySize : Int
+                        bodySize =
+                            expressionSize funcImpl.expression
+
+                        bodyShape : InlineBodyShape
+                        bodyShape =
+                            classifyInlineBodyShape funcImpl.expression
+
+                        paramNameSet : Set.Set String
+                        paramNameSet =
+                            paramNamesSet paramNames
+                    in
+                    let
+                        inlineSafe : Bool
+                        inlineSafe =
+                            isInlineSafeBody paramNameSet funcImpl.expression
+                    in
+                    if
+                        List.length paramNames
+                            == List.length args
+                        && not (containsSelfCallInExpr funcName funcImpl.expression)
+                        && bodySize
+                            < flags.inlineFunctionMaxSize
+                        && inlineSafe
+                        && not (referencesInternalHelper funcImpl.expression)
+                    then
                         let
                             sourceFunctionNames =
                                 Dict.get sourceModuleKey env.shared.functions
@@ -2196,7 +3476,7 @@ tryInlineFunction env moduleName funcName args =
 
                             preQualified =
                                 if isCrossModule then
-                                    qualifyUnqualifiedRefs sourceModuleName sourceFunctionNames (paramNamesSet paramNames) funcImpl.expression
+                                    qualifyUnqualifiedRefs sourceModuleName sourceFunctionNames paramNameSet funcImpl.expression
 
                                 else
                                     funcImpl.expression
@@ -2205,16 +3485,70 @@ tryInlineFunction env moduleName funcName args =
                                 List.map2 Tuple.pair paramNames args
                                     |> Dict.fromList
                         in
-                        Just (substituteVars substitution preQualified)
+                        InlineApplied
+                            { expression = substituteVars substitution preQualified
+                            , bodySize = bodySize
+                            , bodyShape = bodyShape
+                            }
 
-                    Nothing ->
-                        Nothing
+                    else
+                        if List.length paramNames /= List.length args then
+                            InlineRejected
+                                { reason = InlineRejectArity
+                                , sample = Nothing
+                                }
 
-            else
-                Nothing
+                        else if containsSelfCallInExpr funcName funcImpl.expression then
+                            InlineRejected
+                                { reason = InlineRejectSelfCall
+                                , sample = Nothing
+                                }
+
+                        else if bodySize >= flags.inlineFunctionMaxSize then
+                            InlineRejected
+                                { reason = InlineRejectBodyTooLarge
+                                , sample = Nothing
+                                }
+
+                        else if not inlineSafe then
+                            let
+                                rejectReason =
+                                    InlineRejectUnsafe (classifyUnsafeRoot funcImpl.expression)
+
+                                sample =
+                                    if not collectRejectSamples then
+                                        Nothing
+
+                                    else
+                                        case rejectReason of
+                                            InlineRejectUnsafe InlineUnsafeApplication ->
+                                                Just (formatRejectSample rejectReason sourceModuleName funcName funcImpl.expression)
+
+                                            _ ->
+                                                Nothing
+                            in
+                            InlineRejected
+                                { reason = rejectReason
+                                , sample = sample
+                                }
+
+                        else if referencesInternalHelper funcImpl.expression then
+                            InlineRejected
+                                { reason = InlineRejectInternalHelper
+                                , sample = Nothing
+                                }
+
+                        else
+                            InlineNotApplicable
+
+                Nothing ->
+                    InlineRejected
+                        { reason = InlineRejectPattern
+                        , sample = Nothing
+                        }
 
         Nothing ->
-            Nothing
+            InlineNotApplicable
 
 
 paramNamesSet : List String -> Set.Set String
@@ -2334,10 +3668,16 @@ expressionSize (Node _ expr) =
 
 
 {-| Keep package-summary inlining to simple expression helpers.
-Control-flow and generic function-call helpers like `List.isEmpty` were
-profitable on paper but caused bad rewrites or warm-path regressions in the
-elm-review dependency graph.
+Control-flow stays off-limits. We also allow tiny wrapper applications like
+`List.isEmpty xs` when each parameter is used at most once, so package
+summaries can bypass an extra helper frame without duplicating expensive work.
 -}
+isInlineSafeBody : Set.Set String -> Node Expression -> Bool
+isInlineSafeBody paramNameSet expression =
+    isInlineSafeExpression expression
+        || isInlineSafeWrapperApplication paramNameSet expression
+
+
 isInlineSafeExpression : Node Expression -> Bool
 isInlineSafeExpression (Node _ expr) =
     case expr of
@@ -2411,6 +3751,220 @@ isInlineSafeExpression (Node _ expr) =
 
         _ ->
             False
+
+
+isInlineSafeWrapperApplication : Set.Set String -> Node Expression -> Bool
+isInlineSafeWrapperApplication paramNameSet ((Node _ expr) as expression) =
+    case expr of
+        Application (headExpr :: args) ->
+            not (List.isEmpty args)
+                && isInlineSafeWrapperHead paramNameSet headExpr
+                && List.all (isInlineSafeWrapperArgument paramNameSet) args
+                && parametersUsedAtMostOnce paramNameSet expression
+
+        ParenthesizedExpression inner ->
+            isInlineSafeWrapperApplication paramNameSet inner
+
+        _ ->
+            False
+
+
+isInlineSafeWrapperHead : Set.Set String -> Node Expression -> Bool
+isInlineSafeWrapperHead paramNameSet (Node _ expr) =
+    case expr of
+        FunctionOrValue [] name ->
+            not (Set.member name paramNameSet)
+
+        FunctionOrValue _ _ ->
+            True
+
+        RecordAccessFunction _ ->
+            True
+
+        Operator _ ->
+            True
+
+        PrefixOperator _ ->
+            True
+
+        ParenthesizedExpression inner ->
+            isInlineSafeWrapperHead paramNameSet inner
+
+        _ ->
+            False
+
+
+isInlineSafeWrapperArgument : Set.Set String -> Node Expression -> Bool
+isInlineSafeWrapperArgument paramNameSet ((Node _ expr) as expression) =
+    case expr of
+        Integer _ ->
+            True
+
+        Hex _ ->
+            True
+
+        Floatable _ ->
+            True
+
+        Literal _ ->
+            True
+
+        CharLiteral _ ->
+            True
+
+        UnitExpr ->
+            True
+
+        FunctionOrValue _ _ ->
+            True
+
+        RecordAccessFunction _ ->
+            True
+
+        Operator _ ->
+            True
+
+        PrefixOperator _ ->
+            True
+
+        Application (headExpr :: args) ->
+            not (List.isEmpty args)
+                && isInlineSafeWrapperHead paramNameSet headExpr
+                && List.all (isInlineSafeWrapperArgument paramNameSet) args
+
+        OperatorApplication _ _ left right ->
+            isInlineSafeWrapperArgument paramNameSet left
+                && isInlineSafeWrapperArgument paramNameSet right
+
+        Negation inner ->
+            isInlineSafeWrapperArgument paramNameSet inner
+
+        ParenthesizedExpression inner ->
+            isInlineSafeWrapperArgument paramNameSet inner
+
+        ListExpr items ->
+            List.all (isInlineSafeWrapperArgument paramNameSet) items
+
+        TupledExpression items ->
+            List.all (isInlineSafeWrapperArgument paramNameSet) items
+
+        RecordExpr fields ->
+            List.all (\(Node _ ( _, value )) -> isInlineSafeWrapperArgument paramNameSet value) fields
+
+        RecordAccess inner _ ->
+            isInlineSafeWrapperArgument paramNameSet inner
+
+        LambdaExpression lambda ->
+            let
+                lambdaShadows =
+                    List.foldl (\pattern acc -> Set.union acc (collectPatternNames pattern)) Set.empty lambda.args
+
+                outerParamsVisibleInLambdaBody =
+                    Set.diff paramNameSet lambdaShadows
+            in
+            not (referencesAnyWrapperParams outerParamsVisibleInLambdaBody lambda.expression)
+                && isInlineSafeWrapperArgument outerParamsVisibleInLambdaBody lambda.expression
+
+        _ ->
+            False
+
+
+referencesAnyWrapperParams : Set.Set String -> Node Expression -> Bool
+referencesAnyWrapperParams paramNameSet expression =
+    not (Dict.isEmpty (parameterUseCounts paramNameSet expression))
+
+parametersUsedAtMostOnce : Set.Set String -> Node Expression -> Bool
+parametersUsedAtMostOnce paramNameSet expression =
+    parameterUseCounts paramNameSet expression
+        |> Dict.values
+        |> List.all (\count -> count <= 1)
+
+
+parameterUseCounts : Set.Set String -> Node Expression -> Dict.Dict String Int
+parameterUseCounts paramNameSet (Node _ expr) =
+    let
+        mergeCounts : Dict.Dict String Int -> Dict.Dict String Int -> Dict.Dict String Int
+        mergeCounts left right =
+            Dict.merge
+                (\key leftCount acc -> Dict.insert key leftCount acc)
+                (\key leftCount rightCount acc -> Dict.insert key (leftCount + rightCount) acc)
+                (\key rightCount acc -> Dict.insert key rightCount acc)
+                left
+                right
+                Dict.empty
+
+        sumCounts : List (Dict.Dict String Int) -> Dict.Dict String Int
+        sumCounts counts =
+            List.foldl mergeCounts Dict.empty counts
+    in
+    case expr of
+        FunctionOrValue [] name ->
+            if Set.member name paramNameSet then
+                Dict.singleton name 1
+
+            else
+                Dict.empty
+
+        Application items ->
+            sumCounts (List.map (parameterUseCounts paramNameSet) items)
+
+        OperatorApplication _ _ left right ->
+            mergeCounts
+                (parameterUseCounts paramNameSet left)
+                (parameterUseCounts paramNameSet right)
+
+        IfBlock condition thenBranch elseBranch ->
+            sumCounts
+                [ parameterUseCounts paramNameSet condition
+                , parameterUseCounts paramNameSet thenBranch
+                , parameterUseCounts paramNameSet elseBranch
+                ]
+
+        CaseExpression caseBlock ->
+            sumCounts
+                (parameterUseCounts paramNameSet caseBlock.expression
+                    :: List.map (\( _, body ) -> parameterUseCounts paramNameSet body) caseBlock.cases
+                )
+
+        LetExpression letBlock ->
+            sumCounts
+                (parameterUseCounts paramNameSet letBlock.expression
+                    :: List.map
+                        (\(Node _ declaration) ->
+                            case declaration of
+                                LetFunction letFunction ->
+                                    parameterUseCounts paramNameSet ((Node.value letFunction.declaration).expression)
+
+                                LetDestructuring _ value ->
+                                    parameterUseCounts paramNameSet value
+                        )
+                        letBlock.declarations
+                )
+
+        ListExpr items ->
+            sumCounts (List.map (parameterUseCounts paramNameSet) items)
+
+        TupledExpression items ->
+            sumCounts (List.map (parameterUseCounts paramNameSet) items)
+
+        ParenthesizedExpression inner ->
+            parameterUseCounts paramNameSet inner
+
+        Negation inner ->
+            parameterUseCounts paramNameSet inner
+
+        LambdaExpression lambda ->
+            parameterUseCounts paramNameSet lambda.expression
+
+        RecordExpr fields ->
+            sumCounts
+                (List.map (\(Node _ ( _, value )) -> parameterUseCounts paramNameSet value) fields)
+
+        RecordAccess inner _ ->
+            parameterUseCounts paramNameSet inner
+
+        _ ->
+            Dict.empty
 
 
 {-| Scope-aware substitution: when entering a binding scope (case pattern,

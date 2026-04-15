@@ -19,6 +19,7 @@ type alias NormalizationFlags =
     { foldConstantApplications : Bool
     , inlinePrecomputedRefs : Bool
     , inlineFunctions : Bool
+    , inlineFunctionMaxSize : Int
     , fuseListMaps : Bool
 
     -- The two passes that run on every cold-user load. `runFixpoint`
@@ -45,6 +46,7 @@ all =
     { foldConstantApplications = True
     , inlinePrecomputedRefs = True
     , inlineFunctions = True
+    , inlineFunctionMaxSize = 30
     , fuseListMaps = True
     , runFixpoint = True
     , runListFusion = True
@@ -58,6 +60,7 @@ none =
     { foldConstantApplications = False
     , inlinePrecomputedRefs = False
     , inlineFunctions = False
+    , inlineFunctionMaxSize = 0
     , fuseListMaps = False
     , runFixpoint = False
     , runListFusion = False
@@ -89,6 +92,7 @@ default =
     { foldConstantApplications = False
     , inlinePrecomputedRefs = False
     , inlineFunctions = False
+    , inlineFunctionMaxSize = 30
     , fuseListMaps = True
     , runFixpoint = True
     , runListFusion = True
@@ -126,4 +130,5 @@ packageAggressive =
     { default
         | inlinePrecomputedRefs = True
         , inlineFunctions = True
+        , inlineFunctionMaxSize = 30
     }

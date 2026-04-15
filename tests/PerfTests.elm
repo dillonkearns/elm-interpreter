@@ -1119,6 +1119,39 @@ dependencySummaryOptimizationTests =
 
                         Nothing ->
                             Err "function not found"
+
+        normalizedBodyAndStats :
+            List String
+            -> String
+            -> String
+            -> Result String { body : String, stats : Eval.Module.DependencySummaryStats }
+        normalizedBodyAndStats sources moduleName functionName =
+            case Eval.Module.parseProjectSources sources of
+                Err _ ->
+                    Err "parse failed"
+
+                Ok parsedModules ->
+                    let
+                        normalizedResult =
+                            Eval.Module.normalizeSummariesWithStats
+                                (Eval.Module.buildCachedModuleSummariesFromParsed parsedModules)
+                    in
+                    case
+                        normalizedResult.summaries
+                            |> List.filter (\summary -> summary.moduleName == [ moduleName ])
+                            |> List.concatMap .functions
+                            |> List.filter (\func -> Node.value func.name == functionName)
+                            |> List.head
+                    of
+                        Just func ->
+                            Ok
+                                { body = Expression.Extra.toString func.expression
+                                , stats = normalizedResult.stats
+                                }
+
+                        Nothing ->
+                            Err "function not found"
+
     in
     describe "Dependency summary optimization"
         [ test "cross-module simple helper is inlined in normalized summaries" <|
@@ -1157,6 +1190,347 @@ dependencySummaryOptimizationTests =
                     "Main"
                     "bump"
                     |> Expect.equal (Ok "x + 10")
+        , test "dependency summary list fusion flattens nested application heads" <|
+            \_ ->
+                case
+                    normalizedBodyAndStats
+                        [ String.join "\n"
+                            [ "module Main exposing (apply)"
+                            , "apply f a b ="
+                            , "    ((f a) b)"
+                            ]
+                        ]
+                        "Main"
+                        "apply"
+                of
+                    Ok result ->
+                        if
+                            result.body == "f a b"
+                                && result.stats.listFusionChanges == 1
+                                && result.stats.listFusionPipelineNormalizations == 0
+                                && result.stats.listFusionHeadFlattenRewrites == 1
+                                && result.stats.listFusionRuleRewrites == 0
+                        then
+                            Expect.pass
+
+                        else
+                            Expect.fail
+                                ("unexpected list-fusion body/stats: "
+                                    ++ result.body
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.listFusionChanges
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.listFusionPipelineNormalizations
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.listFusionHeadFlattenRewrites
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.listFusionRuleRewrites
+                                )
+
+                    Err err ->
+                        Expect.fail err
+        , test "dependency summary list fusion normalizes pipeline applications" <|
+            \_ ->
+                case
+                    normalizedBodyAndStats
+                        [ String.join "\n"
+                            [ "module Main exposing (mapOnce)"
+                            , "mapOnce xs ="
+                            , "    xs |> List.map (\\x -> x + 1)"
+                            ]
+                        ]
+                        "Main"
+                        "mapOnce"
+                of
+                    Ok result ->
+                        if
+                            result.body == "List.map (\\x -> x + 1) xs"
+                                && result.stats.listFusionChanges == 1
+                                && result.stats.listFusionPipelineNormalizations == 1
+                                && result.stats.listFusionHeadFlattenRewrites == 0
+                                && result.stats.listFusionRuleRewrites == 0
+                        then
+                            Expect.pass
+
+                        else
+                            Expect.fail
+                                ("unexpected pipeline list-fusion body/stats: "
+                                    ++ result.body
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.listFusionChanges
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.listFusionPipelineNormalizations
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.listFusionHeadFlattenRewrites
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.listFusionRuleRewrites
+                                )
+
+                    Err err ->
+                        Expect.fail err
+        , test "collection helper still inlines while shadow collection filter counts it" <|
+            \_ ->
+                case
+                    normalizedBodyAndStats
+                        [ String.join "\n"
+                            [ "module Helpers exposing (singleton)"
+                            , "singleton x ="
+                            , "    [ x ]"
+                            ]
+                        , String.join "\n"
+                            [ "module Main exposing (make)"
+                            , "import Helpers"
+                            , "make value ="
+                            , "    Helpers.singleton value"
+                            ]
+                        ]
+                        "Main"
+                        "make"
+                of
+                    Ok result ->
+                        if
+                            result.body == "[ value ]"
+                                && result.stats.inlineShadowRejectCollection == 1
+                                && result.stats.inlineShadowRejectCollectionFinalShrinks == 1
+                                && result.stats.inlineShadowRejectCollectionFinalNonApplication == 1
+                                && result.stats.inlineShadowRejectCollectionFinalDirectRootWin == 1
+                                && result.stats.inlineShadowRejectCollectionFinalConstructorApplication == 0
+                                && result.stats.inlineShadowRejectCollectionNoPayoffNoDirectBenefit == 0
+                        then
+                            Expect.pass
+
+                        else
+                            Expect.fail
+                                ("unexpected shadow stats/body: "
+                                    ++ result.body
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectCollection
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectCollectionFinalShrinks
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectCollectionFinalNonApplication
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectCollectionFinalDirectRootWin
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectCollectionFinalConstructorApplication
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectCollectionNoPayoffNoDirectBenefit
+                                )
+
+                    Err err ->
+                        Expect.fail err
+        , test "growing helper still inlines while shadow growth filters count it" <|
+            \_ ->
+                case
+                    normalizedBodyAndStats
+                        [ String.join "\n"
+                            [ "module Helpers exposing (makeList)"
+                            , "makeList x ="
+                            , "    [ x, x, x, x ]"
+                            ]
+                        , String.join "\n"
+                            [ "module Main exposing (make)"
+                            , "import Helpers"
+                            , "make value ="
+                            , "    Helpers.makeList value"
+                            ]
+                        ]
+                        "Main"
+                        "make"
+                of
+                    Ok result ->
+                        if
+                            result.body == "[ value, value, value, value ]"
+                                && result.stats.inlineShadowRejectGrowth0 == 1
+                                && result.stats.inlineShadowRejectGrowth0FinalShrinks == 0
+                                && result.stats.inlineShadowRejectGrowth0FinalNonApplication == 1
+                                && result.stats.inlineShadowRejectGrowth0FinalDirectRootWin == 1
+                                && result.stats.inlineShadowRejectGrowth0FinalConstructorApplication == 0
+                                && result.stats.inlineShadowRejectGrowth0NoPayoffNoDirectBenefit == 0
+                                && result.stats.inlineShadowRejectGrowth1 == 1
+                                && result.stats.inlineShadowRejectGrowth1FinalShrinks == 0
+                                && result.stats.inlineShadowRejectGrowth1FinalNonApplication == 1
+                                && result.stats.inlineShadowRejectGrowth1FinalDirectRootWin == 1
+                                && result.stats.inlineShadowRejectGrowth1FinalConstructorApplication == 0
+                                && result.stats.inlineShadowRejectGrowth1NoPayoffNoDirectBenefit == 0
+                        then
+                            Expect.pass
+
+                        else
+                            Expect.fail
+                                ("unexpected shadow growth stats/body: "
+                                    ++ result.body
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0FinalShrinks
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0FinalNonApplication
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0FinalDirectRootWin
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0FinalConstructorApplication
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0NoPayoffNoDirectBenefit
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth1
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth1FinalShrinks
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth1FinalNonApplication
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth1FinalDirectRootWin
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth1FinalConstructorApplication
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth1NoPayoffNoDirectBenefit
+                                )
+
+                    Err err ->
+                        Expect.fail err
+        , test "constructor builder counts as a direct root win even when application root remains" <|
+            \_ ->
+                case
+                    normalizedBodyAndStats
+                        [ String.join "\n"
+                            [ "module Helpers exposing (Box(..), wrap)"
+                            , "type Box"
+                            , "    = Box Int Int Int"
+                            , "wrap x ="
+                            , "    Box x x x"
+                            ]
+                        , String.join "\n"
+                            [ "module Main exposing (make)"
+                            , "import Helpers"
+                            , "make value ="
+                            , "    Helpers.wrap value"
+                            ]
+                        ]
+                        "Main"
+                        "make"
+                of
+                    Ok result ->
+                        if
+                            result.body == "Helpers.Box value value value"
+                                && result.stats.inlineShadowRejectGrowth0 == 1
+                                && result.stats.inlineShadowRejectGrowth0FinalShrinks == 0
+                                && result.stats.inlineShadowRejectGrowth0FinalNonApplication == 0
+                                && result.stats.inlineShadowRejectGrowth0FinalDirectRootWin == 1
+                                && result.stats.inlineShadowRejectGrowth0FinalConstructorApplication == 1
+                                && result.stats.inlineShadowRejectGrowth0NoPayoffNoDirectBenefit == 0
+                        then
+                            Expect.pass
+
+                        else
+                            Expect.fail
+                                ("unexpected constructor shadow stats/body: "
+                                    ++ result.body
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0FinalShrinks
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0FinalNonApplication
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0FinalDirectRootWin
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0FinalConstructorApplication
+                                    ++ " / "
+                                    ++ String.fromInt result.stats.inlineShadowRejectGrowth0NoPayoffNoDirectBenefit
+                                )
+
+                    Err err ->
+                        Expect.fail err
+        , test "cross-module library wrapper is inlined when it is a linear-use application wrapper" <|
+            \_ ->
+                normalizedBodyString
+                    [ String.join "\n"
+                        [ "module Helpers exposing (isEmpty)"
+                        , "isEmpty xs ="
+                        , "    List.isEmpty xs"
+                        ]
+                    , String.join "\n"
+                        [ "module Main exposing (check)"
+                        , "import Helpers"
+                        , "check items ="
+                        , "    Helpers.isEmpty items"
+                        ]
+                    ]
+                    "Main"
+                    "check"
+                    |> Expect.equal (Ok "List.isEmpty items")
+        , test "cross-module higher-order wrapper is inlined when its lambda does not capture wrapper params" <|
+            \_ ->
+                normalizedBodyString
+                    [ String.join "\n"
+                        [ "module Helpers exposing (count)"
+                        , "count xs ="
+                        , "    List.foldl (\\_ i -> i + 1) 0 xs"
+                        ]
+                    , String.join "\n"
+                        [ "module Main exposing (check)"
+                        , "import Helpers"
+                        , "check items ="
+                        , "    Helpers.count items"
+                        ]
+                    ]
+                    "Main"
+                    "check"
+                    |> Expect.equal (Ok "List.foldl (\\_ i -> i + 1) 0 items")
+        , test "cross-module eager nested-call wrapper is inlined when parameters stay outside deferred lambdas" <|
+            \_ ->
+                normalizedBodyString
+                    [ String.join "\n"
+                        [ "module Helpers exposing (replace)"
+                        , "replace before after string ="
+                        , "    String.join after (String.split before string)"
+                        ]
+                    , String.join "\n"
+                        [ "module Main exposing (check)"
+                        , "import Helpers"
+                        , "check source ="
+                        , "    Helpers.replace \"-\" \"_\" source"
+                        ]
+                    ]
+                    "Main"
+                    "check"
+                    |> Expect.equal (Ok "String.join \"_\" (String.split \"-\" source)")
+        , test "cross-module higher-order wrapper is not inlined when its lambda captures a wrapper param" <|
+            \_ ->
+                normalizedBodyString
+                    [ String.join "\n"
+                        [ "module Helpers exposing (mapWith)"
+                        , "mapWith func xs ="
+                        , "    List.map (\\x -> func x) xs"
+                        ]
+                    , String.join "\n"
+                        [ "module Main exposing (check)"
+                        , "import Helpers"
+                        , "check items ="
+                        , "    Helpers.mapWith String.length items"
+                        ]
+                    ]
+                    "Main"
+                    "check"
+                    |> Expect.equal (Ok "Helpers.mapWith String.length items")
+        , test "cross-module application wrapper is not inlined when it duplicates the argument" <|
+            \_ ->
+                normalizedBodyString
+                    [ String.join "\n"
+                        [ "module Helpers exposing (duplicate)"
+                        , "duplicate xs ="
+                        , "    List.append xs xs"
+                        ]
+                    , String.join "\n"
+                        [ "module Main exposing (check)"
+                        , "import Helpers"
+                        , "check items ="
+                        , "    Helpers.duplicate items"
+                        ]
+                    ]
+                    "Main"
+                    "check"
+                    |> Expect.equal (Ok "Helpers.duplicate items")
         ]
 
 
