@@ -81,6 +81,7 @@ eventual tracing integration, matching the fields on the existing
 -}
 type alias REnv =
     { locals : List Value
+    , globals : FastDict.Dict IR.GlobalId Value
     , resolvedBodies : FastDict.Dict IR.GlobalId RExpr
     , globalIdToName : FastDict.Dict IR.GlobalId ( ModuleName, String )
     , nativeDispatchers : FastDict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
@@ -138,6 +139,7 @@ core dispatch build their own `REnv` with a real project env.
 emptyREnv : REnv
 emptyREnv =
     { locals = []
+    , globals = FastDict.empty
     , resolvedBodies = FastDict.empty
     , globalIdToName = FastDict.empty
     , nativeDispatchers = FastDict.empty
@@ -235,6 +237,75 @@ runRec project init =
     go (project init) []
 
 
+{-| Step-budgeted variant of `runRec`.
+
+Mirrors `runRec` but counts non-tail `project` invocations against a
+budget. Tail dispatches (`RTail`) are **not** counted — they're the
+trampoline's equivalent of OLD eval's `tcoLoop`, which calls
+`evalExpression` directly in a JS while-loop and never increments the
+recursion-step counter. Matching that semantics lets the step-budget
+tests in `tests/PerfTests.elm:tcoProofTests` pass on the resolved-IR
+path: a 100 000-iteration `countdown` runs in ~0 budget-counted steps
+(one per entry-level dispatch + a few for cond/return evaluations),
+not 100 000+ as it would if every tail iteration charged the budget.
+
+`RecThen` — the non-tail continuation path — does count, matching
+OLD eval's "every non-TCO recursion step decrements" semantics. If
+the budget reaches zero on a counted step, `makeError ()` is returned
+as the final `t` — for the resolved-IR evaluator, that produces an
+`EvErr` with a "Step limit exceeded" message.
+
+`budget == -1` is the unlimited sentinel: no decrements, no
+termination checks beyond the cheap `< 0` compare. This keeps the
+cost on the unlimited path to a single extra integer compare per
+counted dispatch.
+
+-}
+runRecWithBudget : Int -> (() -> t) -> (r -> Rec r t t) -> r -> t
+runRecWithBudget initialBudget makeError project init =
+    let
+        go : Int -> Rec r t t -> List (t -> Rec r t t) -> t
+        go n step stack =
+            case step of
+                RBase t ->
+                    case stack of
+                        [] ->
+                            t
+
+                        next :: rest ->
+                            go n (next t) rest
+
+                RTail r ->
+                    -- Tail dispatch: mirrors OLD eval's `tcoLoop`
+                    -- which doesn't decrement its own counter on
+                    -- each iteration. Unconditionally step forward.
+                    go n (project r) stack
+
+                RecThen r after ->
+                    if n == 0 then
+                        makeError ()
+
+                    else
+                        go (tickBudget n) (project r) (after :: stack)
+    in
+    if initialBudget == 0 then
+        makeError ()
+
+    else
+        go (tickBudget initialBudget) (project init) []
+
+
+{-| Decrement a step budget unless it's the `-1` unlimited sentinel.
+-}
+tickBudget : Int -> Int
+tickBudget n =
+    if n < 0 then
+        n
+
+    else
+        n - 1
+
+
 emptyConfig : Config
 emptyConfig =
     { trace = False
@@ -285,10 +356,34 @@ evalR initEnv initExpr =
        the spot via `envWithLocals staticEnv locals`. Those
        fallbacks are less frequent than the hot recurse path,
        so their record-construction cost doesn't dominate.
+
+       Step budget: `initEnv.fallbackConfig.maxSteps` threads
+       through from `Eval.Module`'s public entry points. When
+       `Just n`, each dispatch in the trampoline decrements a
+       counter and returns a "Step limit exceeded" `EvErr` when
+       it hits zero. When `Nothing`, the unlimited sentinel
+       (`-1`) is used and decrementing is skipped entirely — the
+       only cost on the unlimited path is one extra integer
+       compare per dispatch inside `runRecWithBudget`.
     -}
-    runRec
-        (\( locals, expr ) -> evalRStep initEnv locals expr)
-        ( initEnv.locals, initExpr )
+    let
+        stepProject : ( List Value, RExpr ) -> Rec ( List Value, RExpr ) (EvalResult Value) (EvalResult Value)
+        stepProject ( locals, expr ) =
+            evalRStep initEnv locals expr
+    in
+    case initEnv.fallbackConfig.maxSteps of
+        Nothing ->
+            runRec stepProject ( initEnv.locals, initExpr )
+
+        Just budget ->
+            runRecWithBudget
+                budget
+                (\() ->
+                    evErr initEnv
+                        (Unsupported "Step limit exceeded")
+                )
+                stepProject
+                ( initEnv.locals, initExpr )
 
 
 {-| Rebuild a full REnv from the static-env closure + the current
@@ -611,7 +706,7 @@ applyClosureStep staticEnv locals head newArgs =
 
     else
         case head of
-            PartiallyApplied _ appliedArgs _ debugName impl arity ->
+            PartiallyApplied paLocalEnv appliedArgs _ debugName impl arity ->
                 case impl of
                     RExprImpl implBody ->
                         let
@@ -624,11 +719,21 @@ applyClosureStep staticEnv locals head newArgs =
                                 List.length totalArgs
                         in
                         if totalCount < arity then
-                            -- Partial application: construct a new PA. No recursion.
+                            -- Partial application: construct a new PA.
+                            -- Preserve `paLocalEnv` (the input closure's
+                            -- captured env) so the new PA can still bridge
+                            -- back to the new evaluator when the OLD
+                            -- evaluator reaches it via a kernel callback
+                            -- like `Kernel.JsArray.initialize`. Replacing
+                            -- it with `Environment.empty []` would lose
+                            -- the bridge and surface as "RExprImpl
+                            -- encountered with noResolveBridge" once the
+                            -- partially-applied closure escapes to the
+                            -- old evaluator.
                             rBase
                                 (EvOk
                                     (PartiallyApplied
-                                        (Environment.empty [])
+                                        paLocalEnv
                                         totalArgs
                                         []
                                         debugName
@@ -646,8 +751,10 @@ applyClosureStep staticEnv locals head newArgs =
                             let
                                 selfClosure : Value
                                 selfClosure =
+                                    -- See partial-application branch for
+                                    -- why `paLocalEnv` is preserved here.
                                     PartiallyApplied
-                                        (Environment.empty [])
+                                        paLocalEnv
                                         []
                                         []
                                         debugName
@@ -681,8 +788,10 @@ applyClosureStep staticEnv locals head newArgs =
 
                                 selfClosure : Value
                                 selfClosure =
+                                    -- See partial-application branch for
+                                    -- why `paLocalEnv` is preserved here.
                                     PartiallyApplied
-                                        (Environment.empty [])
+                                        paLocalEnv
                                         []
                                         []
                                         debugName
@@ -1333,8 +1442,12 @@ applyClosure env head newArgs =
                                 -- recursive calls has no applied args — it's
                                 -- what the user wrote as `f`, not what they
                                 -- wrote as `f 5` part-way through a call.
+                                -- Preserve `paLocalEnv` so the bridge stays
+                                -- reachable when this self-closure escapes
+                                -- to the OLD evaluator. See
+                                -- `applyClosureStep` for the same fix.
                                 PartiallyApplied
-                                    (Environment.empty [])
+                                    paLocalEnv
                                     []
                                     []
                                     debugName
@@ -1344,7 +1457,7 @@ applyClosure env head newArgs =
                         if totalCount < arity then
                             EvOk
                                 (PartiallyApplied
-                                    (Environment.empty [])
+                                    paLocalEnv
                                     totalArgs
                                     []
                                     debugName
@@ -1373,33 +1486,80 @@ applyClosure env head newArgs =
 
                     _ ->
                         {- AstImpl / KernelImpl: delegate to the old
-                           evaluator's `evalFunction`, which already handles
-                           pattern binding for AstImpl and calls the kernel
-                           function directly for KernelImpl. This is the
-                           path that lets higher-order core callbacks like
-                           `List.foldl (+) 0 xs` work — `(+)` is a KernelImpl
-                           PA, and the dispatcher in `NativeDispatchHO`
-                           calls this with the fully-applied args list.
+                           evaluator's `evalFunction`, but handle all three
+                           application cases (partial / exact / over) the
+                           same way the `RExprImpl` branch above does.
 
-                           For partial application (total < arity) we could
-                           return a PA here too, but the old evaluator's
-                           `evalFunction` already handles that case (it
-                           returns `Value.mkPartiallyApplied` when
-                           `oldArgsLength < patternsLength`).
+                           `evalFunction` itself ONLY handles partial and
+                           exact application — it bails with "Could not
+                           match lambda patterns" on over-application
+                           because it pattern-binds the full arg list
+                           against the full pattern list, which have
+                           different lengths. Over-application in the old
+                           evaluator is handled by `evalApplicationGeneral`,
+                           not `evalFunction`, so callers of `applyClosure`
+                           must split the args themselves.
+
+                           The composeR bug surfaced here: a top-level
+                           `fuzz2Like = (\f (a, b) -> f a b) >> identity`
+                           is a composeR partial application (2 of 3 args),
+                           and `fuzz2Like plus (3, 4)` over-applies it
+                           with two more args. Without the split, the
+                           full `[lambda, identity, plus, (3,4)]` list hit
+                           composeR's 3-pattern binding and errored.
                         -}
                         let
                             totalArgs : List Value
                             totalArgs =
                                 appliedArgs ++ newArgs
+
+                            totalCount : Int
+                            totalCount =
+                                List.length totalArgs
                         in
-                        Eval.Expression.evalFunction
-                            totalArgs
-                            patterns
-                            arity
-                            debugName
-                            impl
-                            env.fallbackConfig
-                            paLocalEnv
+                        if totalCount < arity then
+                            EvOk
+                                (PartiallyApplied
+                                    paLocalEnv
+                                    totalArgs
+                                    patterns
+                                    debugName
+                                    impl
+                                    arity
+                                )
+
+                        else if totalCount == arity then
+                            Eval.Expression.evalFunction
+                                totalArgs
+                                patterns
+                                arity
+                                debugName
+                                impl
+                                env.fallbackConfig
+                                paLocalEnv
+
+                        else
+                            let
+                                bodyArgs : List Value
+                                bodyArgs =
+                                    List.take arity totalArgs
+
+                                extraArgs : List Value
+                                extraArgs =
+                                    List.drop arity totalArgs
+                            in
+                            Eval.Expression.evalFunction
+                                bodyArgs
+                                patterns
+                                arity
+                                debugName
+                                impl
+                                env.fallbackConfig
+                                paLocalEnv
+                                |> andThenValue
+                                    (\intermediate ->
+                                        applyClosure env intermediate extraArgs
+                                    )
 
             Custom qualRef existingArgs ->
                 -- Constructor application: treat as arg accumulation.
@@ -1559,54 +1719,59 @@ intercept-checked.
 -}
 dispatchGlobalApplyNoIntercept : REnv -> IR.GlobalId -> List Value -> EvalResult Value
 dispatchGlobalApplyNoIntercept env id argValues =
-    case FastDict.get id env.resolvedBodies of
-        Just body ->
-            {- Depth-budget fallback: `evalR` is direct-style and
-               blows the JS stack on deeply-nested real Elm code.
-               Before we run a resolved body, check how deep the
-               call chain is; if it's past the budget, hand off
-               to the old evaluator whose trampolined `call`
-               machinery handles arbitrary depth. The old
-               evaluator's `ResolveBridge` closes the loop in
-               the other direction.
-            -}
-            if env.callDepth >= evalRCallDepthBudget then
-                case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
-                    Just result ->
-                        EvOk result
-
-                    Nothing ->
-                        case tryHigherOrderDispatch env id argValues of
-                            Just result ->
-                                result
-
-                            Nothing ->
-                                delegateCoreApply env id argValues
-
-            else
-                let
-                    topLevelEnv : REnv
-                    topLevelEnv =
-                        { env | locals = [] }
-                in
-                evalR topLevelEnv body
-                    |> andThenValue
-                        (\headValue ->
-                            applyClosure env headValue argValues
-                        )
+    case FastDict.get id env.globals of
+        Just cached ->
+            applyClosure env cached argValues
 
         Nothing ->
-            case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
-                Just result ->
-                    EvOk result
+            case FastDict.get id env.resolvedBodies of
+                Just body ->
+                    {- Depth-budget fallback: `evalR` is direct-style and
+                       blows the JS stack on deeply-nested real Elm code.
+                       Before we run a resolved body, check how deep the
+                       call chain is; if it's past the budget, hand off
+                       to the old evaluator whose trampolined `call`
+                       machinery handles arbitrary depth. The old
+                       evaluator's `ResolveBridge` closes the loop in
+                       the other direction.
+                    -}
+                    if env.callDepth >= evalRCallDepthBudget then
+                        case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
+                            Just result ->
+                                EvOk result
+
+                            Nothing ->
+                                case tryHigherOrderDispatch env id argValues of
+                                    Just result ->
+                                        result
+
+                                    Nothing ->
+                                        delegateCoreApply env id argValues
+
+                    else
+                        let
+                            topLevelEnv : REnv
+                            topLevelEnv =
+                                { env | locals = [] }
+                        in
+                        evalR topLevelEnv body
+                            |> andThenValue
+                                (\headValue ->
+                                    applyClosure env headValue argValues
+                                )
 
                 Nothing ->
-                    case tryHigherOrderDispatch env id argValues of
+                    case NativeDispatch.tryDispatch env.nativeDispatchers id argValues of
                         Just result ->
-                            result
+                            EvOk result
 
                         Nothing ->
-                            delegateCoreApply env id argValues
+                            case tryHigherOrderDispatch env id argValues of
+                                Just result ->
+                                    result
+
+                                Nothing ->
+                                    delegateCoreApply env id argValues
 
 
 {-| Soft stack budget for `evalR`'s direct-style recursion. When a

@@ -350,7 +350,27 @@ resolveFunctionOrValue ctx moduleName name =
                                             Ok (RCtor { moduleName = canonicalModule, name = name })
 
                                 Nothing ->
-                                    Ok (RCtor { moduleName = [], name = name })
+                                    {- No local top-level and no exposed
+                                       import match: assume the constructor
+                                       is defined in the current module.
+                                       Mirrors OLD eval's `evalVariant`,
+                                       which resolves unqualified custom-
+                                       type constructors to `env.currentModule`
+                                       so `==` comparisons against qualified
+                                       references from other modules (e.g.
+                                       `Foo.Hearts` vs an unqualified `Hearts`
+                                       inside `Foo`) produce consistent
+                                       `Custom { moduleName, name }` values.
+                                       Previously this branch dropped
+                                       `moduleName` to `[]`, which caused
+                                       the 5 `OrderTests` failures in the
+                                       core-extra bench whenever a wrapper
+                                       module qualified the ctor reference
+                                       and the defining module's let-rec
+                                       body compared it against an
+                                       unqualified reference.
+                                    -}
+                                    Ok (RCtor { moduleName = ctx.currentModule, name = name })
 
                 else
                     -- Unqualified value: try the current module first

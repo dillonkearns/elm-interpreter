@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -79,6 +79,7 @@ type alias ResolvedProject =
     , nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
     , higherOrderDispatchers : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
     , kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
+    , globals : Dict.Dict IR.GlobalId Value
     , errors : List ResolveErrorEntry
     }
 
@@ -109,6 +110,66 @@ through its own code path inside this module.
 projectEnvResolved : ProjectEnv -> ResolvedProject
 projectEnvResolved (ProjectEnv projectEnv) =
     projectEnv.resolved
+
+
+{-| Rebuild `ResolvedProject.globals` from `env.shared.precomputedValues`,
+mapping each `(moduleKey, name)` pair through `resolved.globalIds` to
+find the matching `GlobalId`. Entries whose module or name isn't in
+`globalIds` are silently dropped — the resolver's user-module pass may
+not have picked them up, and the precomputed cache is always a best-
+effort optimization.
+
+Phase 2 of the OLD-evaluator migration plan: the resolved-IR evaluator
+(`Eval.ResolvedExpression.evalGlobal`) already checks `env.globals`
+before walking a resolved body, so by populating this dict at project-
+load / normalization time, we move the precomputed-value fast path
+from OLD eval's `evalFunctionOrValue` to RE's `evalGlobal`. That in
+turn replaces the per-eval `precomputedGlobalsCache` construction
+inside `evalWithResolvedIRFromFilesAndIntercepts` with a one-shot
+build at project-env time, amortizing the cost across every later
+eval instead of paying it per call.
+
+Called at every site that mutates `env.shared.precomputedValues`:
+initial `buildProjectEnv*` completion, `extendResolvedWithFiles`,
+`extendWithFilesNormalized`, `normalizeOneModuleInEnv`,
+`normalizeUserModulesInEnv`, `replaceModuleInEnv`, etc. The call is
+pure and idempotent — safe to invoke whenever the ProjectEnv passes
+through a public boundary.
+
+-}
+refreshResolvedGlobals : ProjectEnv -> ProjectEnv
+refreshResolvedGlobals (ProjectEnv projectEnv) =
+    let
+        newGlobals : Dict.Dict IR.GlobalId Value
+        newGlobals =
+            projectEnv.env.shared.precomputedValues
+                |> Dict.foldl
+                    (\moduleKey moduleVals outer ->
+                        let
+                            mn : ModuleName
+                            mn =
+                                String.split "." moduleKey
+                        in
+                        Dict.foldl
+                            (\name value inner ->
+                                case Dict.get ( mn, name ) projectEnv.resolved.globalIds of
+                                    Just id ->
+                                        Dict.insert id value inner
+
+                                    Nothing ->
+                                        inner
+                            )
+                            outer
+                            moduleVals
+                    )
+                    Dict.empty
+
+        resolved : ResolvedProject
+        resolved =
+            projectEnv.resolved
+    in
+    ProjectEnv
+        { projectEnv | resolved = { resolved | globals = newGlobals } }
 
 
 {-| Evaluate a top-level expression via the new resolved-IR evaluator.
@@ -207,6 +268,7 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                 renv : RE.REnv
                 renv =
                     { locals = []
+                    , globals = projectEnv.resolved.globals
                     , resolvedBodies = projectEnv.resolved.bodies
                     , globalIdToName = projectEnv.resolved.globalIdToName
                     , nativeDispatchers = projectEnv.resolved.nativeDispatchers
@@ -428,26 +490,32 @@ resolveProject summaries =
             RE.buildHigherOrderRegistry
                 (\key -> Dict.get key globalIds)
 
-        {- Build the kernel dispatcher registry by walking EVERY kernel
-           function from `Eval.Expression.kernelFunctions` and mapping
-           each one to its user-facing `GlobalId`. This covers:
+        {- Build the kernel dispatcher registry from `kernelFunctions`.
+           Only register entries whose module key is a user-facing name
+           (like `Dict`, `String`, `Basics`) — NOT ones under the
+           `Elm.Kernel.*` prefix.
 
-           1. `Elm.Kernel.*` functions (e.g. `Elm.Kernel.Basics.add`)
-              → mapped to the core module (`Basics.add`) via prefix strip
-           2. User-level module kernels (e.g. `Dict.empty`, `Dict.insert`)
-              → mapped directly by module name
+           The previous behavior also mapped `Elm.Kernel.X.fn` →
+           `X.fn` via prefix strip, on the assumption that the Core
+           wrapper for `X.fn` was a trivial pass-through. That
+           assumption is WRONG for any Core wrapper that adapts
+           argument types across the kernel boundary, e.g.:
 
-           Previously only covered direct 0-arg kernel aliases found
-           by `extractKernelReference`. The widened version registers
-           ALL kernel functions, which means evalR's `delegateCoreApply`
-           can dispatch via int-keyed `FastDict.get id` instead of
-           falling through to the string-keyed `delegateByName` path.
+             String.join sep chunks =
+                 Elm.Kernel.String.join sep (Elm.Kernel.List.toArray chunks)
 
-           The profile shows `_Utils_cmp` (string comparison for Dict
-           key ordering) at 18.5% of total time, with 85% of that
-           coming from `Dict.get` in `evalKernelFunction`'s string-keyed
-           lookup. This change eliminates that entire string-comparison
-           cost path for kernel functions.
+           The user-level `String.join` takes a `List String`, but the
+           kernel `Elm.Kernel.String.join` takes a `jsArray string`
+           (JsArray). Short-circuiting `String.join` to the kernel
+           dispatcher bypasses the `toArray chunks` conversion, the
+           kernel sees a `List` where it expects a `JsArray`, and fires
+           "Expected the second argument to be List String".
+
+           User-level kernel entries (`( [ "Dict" ], ... )`,
+           `( [ "String" ], ... )`, etc.) are DELIBERATELY registered
+           as drop-in replacements for the Core wrapper — they are
+           safe to short-circuit. `Elm.Kernel.*` entries are only safe
+           when the caller has already done any arg marshalling.
         -}
         kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
         kernelDispatchers =
@@ -455,38 +523,32 @@ resolveProject summaries =
                 |> Dict.foldl
                     (\moduleKey moduleDict outer ->
                         let
-                            -- Map kernel module key back to a ModuleName
-                            -- for globalIds lookup. kernelFunctions keys
-                            -- are joined strings like "Elm.Kernel.Basics"
-                            -- or "Dict". Split and strip the Elm.Kernel prefix.
-                            coreModuleName : ModuleName
-                            coreModuleName =
-                                let
-                                    parts =
-                                        String.split "." moduleKey
-                                in
-                                case parts of
-                                    "Elm" :: "Kernel" :: rest ->
-                                        rest
-
-                                    _ ->
-                                        parts
+                            parts : List String
+                            parts =
+                                String.split "." moduleKey
                         in
-                        moduleDict
-                            |> Dict.foldl
-                                (\funcName ( arity, kernelFn ) acc ->
-                                    case Dict.get ( coreModuleName, funcName ) globalIds of
-                                        Just id ->
-                                            Dict.insert id
-                                                { arity = arity
-                                                , kernelFn = kernelFn
-                                                }
-                                                acc
-
-                                        Nothing ->
-                                            acc
-                                )
+                        case parts of
+                            "Elm" :: "Kernel" :: _ ->
+                                -- Kernel-internal entries; don't short-
+                                -- circuit user-level calls to these.
                                 outer
+
+                            _ ->
+                                moduleDict
+                                    |> Dict.foldl
+                                        (\funcName ( arity, kernelFn ) acc ->
+                                            case Dict.get ( parts, funcName ) globalIds of
+                                                Just id ->
+                                                    Dict.insert id
+                                                        { arity = arity
+                                                        , kernelFn = kernelFn
+                                                        }
+                                                        acc
+
+                                                Nothing ->
+                                                    acc
+                                        )
+                                        outer
                     )
                     Dict.empty
 
@@ -502,6 +564,7 @@ resolveProject summaries =
             , nativeDispatchers = nativeDispatchers
             , higherOrderDispatchers = higherOrderDispatchers
             , kernelDispatchers = kernelDispatchers
+            , globals = Dict.empty
             , errors = []
             }
     in
@@ -819,6 +882,7 @@ rebuildResolvedForModules changedModules env allInterfaces base =
             , nativeDispatchers = base.nativeDispatchers
             , higherOrderDispatchers = base.higherOrderDispatchers
             , kernelDispatchers = base.kernelDispatchers
+            , globals = base.globals
             , errors = purgedErrors
             }
     in
@@ -1412,11 +1476,13 @@ buildProjectEnvFromSummaries summaries =
             }
     in
     Ok
-        (ProjectEnv
-            { env = env
-            , allInterfaces = allInterfaces
-            , resolved = resolveProject summaries
-            }
+        (refreshResolvedGlobals
+            (ProjectEnv
+                { env = env
+                , allInterfaces = allInterfaces
+                , resolved = resolveProject summaries
+                }
+            )
         )
 
 
@@ -4373,16 +4439,18 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
     buildModuleEnv updatedInterfaces newModule cleanedEnv
         |> Result.map
             (\env ->
-                ProjectEnv
-                    { env = env
-                    , allInterfaces = updatedInterfaces
-                    , resolved =
-                        rebuildResolvedForModules
-                            [ newModule.moduleName ]
-                            env
-                            updatedInterfaces
-                            projectEnv.resolved
-                    }
+                refreshResolvedGlobals
+                    (ProjectEnv
+                        { env = env
+                        , allInterfaces = updatedInterfaces
+                        , resolved =
+                            rebuildResolvedForModules
+                                [ newModule.moduleName ]
+                                env
+                                updatedInterfaces
+                                projectEnv.resolved
+                        }
+                    )
             )
 
 
@@ -4398,6 +4466,24 @@ evalWithEnv projectEnv additionalSources expression =
 {-| Like `evalWithEnv`, but with an optional step limit to prevent hangs
 on large computations. Pass `Just n` to limit evaluation to `n` trampoline
 steps, or `Nothing` for unlimited.
+
+**Phase 4 status:** this function stays on the OLD-evaluator path for
+now. The original Phase 4 plan was to route it through the resolved-IR
+trampoline (`evalWithResolvedIRFromFilesAndInterceptsAndLimit` exists
+for exactly that purpose), but the RE trampoline lacks an
+`Eval.Expression.tcoLoop` equivalent: OLD eval's `tcoLoop` runs a
+JS-level while-loop for detected tail-recursive calls and never
+re-enters the step counter, so `tcoProofTests`' tight budgets (e.g.
+110 000 for a 100 000-iteration `countdown`) fit easily. RE's
+trampoline charges one step per `rRecThen` (for the `RIf` condition,
+for each argument eval, etc.), so the same 100 000-iteration loop
+costs ~600 000 counted steps and blows the budget. Routing the test
+through RE would cause `tcoProofTests` to regress — the Phase 4
+rollback signal — so we leave this entry point on OLD eval until RE
+grows a `tcoLoop`-equivalent. The `runRecWithBudget` infrastructure
+added in Phase 4 is ready to be used by a future phase when that
+lands.
+
 -}
 evalWithEnvAndLimit : Maybe Int -> ProjectEnv -> List String -> Expression -> Result Error Value
 evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expression =
@@ -4446,7 +4532,6 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                         |> List.map (\m -> ( m.moduleName, m.interface ))
                         |> ElmDict.fromList
 
-                -- User interfaces take precedence (first arg of union)
                 allInterfaces : ElmDict.Dict ModuleName (List Exposed)
                 allInterfaces =
                     ElmDict.union additionalInterfaces projectEnv.allInterfaces
@@ -4520,6 +4605,10 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
 {-| Like `evalWithEnvFromFiles`, but with an optional step limit.
 Pass `Just n` to limit evaluation to `n` trampoline steps (prevents infinite
 loops from consuming unbounded memory). Pass `Nothing` for unlimited.
+
+**Phase 4 status:** stays on the OLD-evaluator path for the same
+reason `evalWithEnvAndLimit` does — see that function's docstring.
+
 -}
 evalWithEnvFromFilesAndLimit : Maybe Int -> ProjectEnv -> List File -> Expression -> Result Error Value
 evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles expression =
@@ -5229,9 +5318,13 @@ deepHashArgs args =
         args
 
 
-{-| Combined: injected Values + intercepts + raw EvalResult.
-Used by the BackendTask yield driver when both Value injection and
-intercept handling are needed in the same evaluation.
+{-| Combined: injected Values + intercepts + raw EvalResult. Used by
+the BackendTask yield driver when both Value injection and intercept
+handling are needed in the same evaluation.
+
+**Phase 6 status:** stays on OLD eval for the same reason
+`evalWithInterceptsRaw` does — see that function's docstring.
+
 -}
 evalWithEnvFromFilesAndValuesAndInterceptsRaw :
     ProjectEnv
@@ -5353,8 +5446,10 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw (ProjectEnv projectEnv) add
                 finalEnv
 
 
-{-| Resolved-IR variant of `evalWithEnvFromFilesAndValuesAndInterceptsRaw`.
+{-| Unlimited-budget delegate for
+`evalWithResolvedIRFromFilesAndInterceptsAndLimit`.
 
+Resolved-IR variant of `evalWithEnvFromFilesAndValuesAndInterceptsRaw`.
 Takes the same inputs (additional Files to register, injected Values,
 intercepts dict, entry Expression) and routes them through the new
 `Eval.ResolvedExpression.evalR` path instead of `Eval.Expression`.
@@ -5392,7 +5487,33 @@ evalWithResolvedIRFromFilesAndIntercepts :
     -> Dict.Dict String Types.Intercept
     -> Expression
     -> Types.EvalResult Value
-evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
+evalWithResolvedIRFromFilesAndIntercepts projectEnv additionalFiles injectedValues intercepts expression =
+    evalWithResolvedIRFromFilesAndInterceptsAndLimit
+        Nothing
+        projectEnv
+        additionalFiles
+        injectedValues
+        intercepts
+        expression
+
+
+{-| Step-budgeted variant. When `maxSteps` is `Just n`, the resolved-IR
+evaluator's trampoline (`runRecWithBudget`) decrements a counter per
+dispatch and returns "Step limit exceeded" when it reaches zero.
+`Nothing` means unlimited — cheap single-compare overhead per dispatch.
+
+This is the Phase 4 entry point that `evalWithEnvAndLimit` and
+`evalWithEnvFromFilesAndLimit` delegate to.
+-}
+evalWithResolvedIRFromFilesAndInterceptsAndLimit :
+    Maybe Int
+    -> ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> Types.EvalResult Value
+evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
     let
         parsedModules =
             additionalFiles
@@ -5629,6 +5750,33 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                    mutable cache, which isn't worth the complexity until
                    we see it dominate in profiles.
                 -}
+                {- Pre-built `globals` cache from the project env's
+                   `ResolvedProject.globals`, shared between the main
+                   `renv` and the `installedBridge`'s per-call
+                   `bridgeRenv`. Phase 2 of the OLD-evaluator migration
+                   plan: previously this dict was rebuilt per call by
+                   walking `env.shared.precomputedValues` and mapping
+                   each entry through `mergedGlobalIds`. Now the
+                   project env carries the pre-built dict, so repeated
+                   calls amortize the build cost to zero.
+
+                   `mergedGlobalIds` is a superset of
+                   `baseResolved.globalIds` (new additional-file ids
+                   extend the map rather than replace it), so any
+                   entry already in `projectEnv.resolved.globals`
+                   stays valid under the merged map. Additional files
+                   aren't normalized at this point, so they don't
+                   contribute new `precomputedValues` entries — the
+                   cache is complete with the base set.
+
+                   Critical for `RemoveAccentsTest`-shape workloads
+                   where a 65 K-iteration `Array.initialize` callback
+                   references `lookupTable` on every iteration.
+                -}
+                precomputedGlobalsCache : Dict.Dict IR.GlobalId Value
+                precomputedGlobalsCache =
+                    projectEnv.resolved.globals
+
                 installedBridge : Types.ResolveBridge
                 installedBridge =
                     Types.ResolveBridge
@@ -5646,6 +5794,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                                 bridgeRenv : RE.REnv
                                 bridgeRenv =
                                     { locals = bodyLocals
+                                    , globals = precomputedGlobalsCache
                                     , resolvedBodies = mergedBodies
                                     , globalIdToName = mergedGlobalIdToName
                                     , nativeDispatchers = baseResolved.nativeDispatchers
@@ -5702,7 +5851,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                     { trace = False
                     , coverage = False
                     , coverageProbeLines = Set.empty
-                    , maxSteps = Nothing
+                    , maxSteps = maxSteps
                     , tcoTarget = Nothing
                     , callCounts = Nothing
                     , intercepts = intercepts
@@ -5713,7 +5862,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
 
                 resolverCtx : Resolver.ResolverContext
                 resolverCtx =
-                    Resolver.initContext lastModule mergedGlobalIds
+                    Resolver.initContextWithImports lastModule mergedGlobalIds finalImports
             in
             case Resolver.resolveExpression resolverCtx (fakeNode expression) of
                 Err resolveError ->
@@ -5730,6 +5879,7 @@ evalWithResolvedIRFromFilesAndIntercepts (ProjectEnv projectEnv) additionalFiles
                         renv : RE.REnv
                         renv =
                             { locals = []
+                            , globals = precomputedGlobalsCache
                             , resolvedBodies = mergedBodies
                             , globalIdToName = mergedGlobalIdToName
                             , nativeDispatchers = baseResolved.nativeDispatchers
@@ -5781,6 +5931,22 @@ intercepts Dict, the intercept function is called instead of the AST.
 
 This is the general-purpose hook for framework callbacks (BackendTask, Test)
 and for memoization/caching (elm-review cache markers).
+
+**Phase 6 status:** stays on OLD eval. A Phase 6 attempt routed this
+through `evalWithResolvedIRFromFilesAndIntercepts`, but the bridge
+function runs a full `resolveProject` pass 2 on the additional files
+**every call**, resolving every user-module body into `RExpr`. For the
+test-runner workload (one call per test module), that fixed per-call
+cost dominates the per-iteration eval savings and regresses the bench
+(`bench/testrunner-ab.sh` 1088 ms → 1220 ms on the 8-file subset;
+`bench/core-extra-full.sh` 8.04 s → 8.69 s on the 11-file suite).
+
+A future phase will need to make the resolved-project-extension cost
+amortize across repeated `evalWithIntercepts` calls — e.g. by caching
+the resolved view of the additional files keyed by content hash, or
+by letting the caller pre-extend once via `extendResolvedWithFiles`
+and pass an already-resolved `ProjectEnv` in. Until then, this entry
+point stays on OLD eval.
 
 -}
 evalWithIntercepts :
@@ -5896,6 +6062,25 @@ evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expressi
 
 The framework driver should handle EvYield in a loop (yield → handle effect →
 resume with result → check for more yields).
+
+**Phase 6 status:** stays on the OLD-evaluator path. A direct pass-
+through to `evalWithResolvedIRFromFilesAndIntercepts` would return
+only the first yield from an expression that yields multiple times
+(e.g. `myMap (\\n -> Helpers.marker n) [1, 2, 3]` with a yielding
+intercept on `Helpers.marker`). RE's `runRec` trampoline collapses
+`EvYield` up through `andThenValue` but doesn't re-enter the
+suspended computation when the driver resumes — the continuation
+captured at yield time only covers the innermost sub-expression, not
+the outer `List.map` / `myMap` loop. OLD eval's `evalExpression`
+propagates yields correctly because the whole recursion is
+`runRecursion`-based and each step re-enters at the right point.
+
+A future phase (likely alongside the `tcoLoop`-equivalent work that
+blocks Phases 3/4's entry-point migrations) will need to thread
+`EvYield` through `runRec`'s continuation stack so that a resumed
+yield re-enters the outer loop. Until then, `evalWithInterceptsRaw`
+must stay on OLD eval — all 10 yield-sequence tests in
+`tests/IncrementalEnvTests.elm` regress otherwise.
 
 -}
 evalWithInterceptsRaw :
@@ -6065,16 +6250,18 @@ extendWithFiles (ProjectEnv projectEnv) additionalFiles =
     envResult
         |> Result.map
             (\env ->
-                ProjectEnv
-                    { env = env
-                    , allInterfaces = allInterfaces
-                    , resolved =
-                        rebuildResolvedForModules
-                            (List.map .moduleName parsedModules)
-                            env
-                            allInterfaces
-                            projectEnv.resolved
-                    }
+                refreshResolvedGlobals
+                    (ProjectEnv
+                        { env = env
+                        , allInterfaces = allInterfaces
+                        , resolved =
+                            rebuildResolvedForModules
+                                (List.map .moduleName parsedModules)
+                                env
+                                allInterfaces
+                                projectEnv.resolved
+                        }
+                    )
             )
 
 
@@ -6103,7 +6290,6 @@ extendWithFilesNormalized projectEnv additionalFiles =
                 in
                 normalizeUserModulesInEnv userModuleNames extendedProjectEnv
             )
-
 
 {-| Resolve every function in `additionalFiles` into the resolved-IR
 representation and merge the new bodies + GlobalIds into the project
@@ -6257,9 +6443,7 @@ extendResolvedWithFiles additionalFiles (ProjectEnv projectEnv) =
                 , bodies = mergedBodies
             }
     in
-    ProjectEnv { projectEnv | resolved = newResolved }
-
-
+    refreshResolvedGlobals (ProjectEnv { projectEnv | resolved = newResolved })
 {-| Check whether a function body is worth trying to normalize. Functions that
 obviously produce a `Test`, `Fuzzer`, `Expectation`, or other closure-carrying
 value would only succeed at evaluation to be rejected by `isLosslessValue`,
@@ -6541,19 +6725,21 @@ setModulePrecomputedValues moduleName values (ProjectEnv projectEnv) =
         key =
             Environment.moduleKey moduleName
     in
-    ProjectEnv
-        { projectEnv
-            | env =
-                { env
-                    | shared =
-                        { functions = env.shared.functions
-                        , moduleImports = env.shared.moduleImports
-                        , resolveBridge = env.shared.resolveBridge
-                        , precomputedValues = Dict.insert key values env.shared.precomputedValues
-                        , tcoAnalyses = env.shared.tcoAnalyses
-                        }
-                }
-        }
+    refreshResolvedGlobals
+        (ProjectEnv
+            { projectEnv
+                | env =
+                    { env
+                        | shared =
+                            { functions = env.shared.functions
+                            , moduleImports = env.shared.moduleImports
+                            , resolveBridge = env.shared.resolveBridge
+                            , precomputedValues = Dict.insert key values env.shared.precomputedValues
+                            , tcoAnalyses = env.shared.tcoAnalyses
+                            }
+                    }
+            }
+        )
 
 
 {-| Read the current normalized function dict for a single module out of a
@@ -6714,7 +6900,7 @@ normalizeOneModuleInEnvSelected normalizationTargets moduleName (ProjectEnv proj
                     }
             }
     in
-    ( ProjectEnv { projectEnv | env = newEnv }, delta, selectedPrecomputed )
+    ( refreshResolvedGlobals (ProjectEnv { projectEnv | env = newEnv }), delta, selectedPrecomputed )
 
 
 normalizeOneModuleInEnv :
@@ -6862,8 +7048,10 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                     }
             }
     in
-    ProjectEnv
-        { projectEnv | env = newEnv }
+    refreshResolvedGlobals
+        (ProjectEnv
+            { projectEnv | env = newEnv }
+        )
 
 
 {-| Like `evalWithEnv`, but returns trace information (call tree + log lines)

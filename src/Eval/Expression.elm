@@ -1843,10 +1843,16 @@ evalApplication first rest cfg env =
                     LT ->
                         -- Under-application: fewer args than patterns.
                         -- Eval all args and build one PartiallyApplied with
-                        -- the accumulated args; no closure chain.
+                        -- the accumulated args; no closure chain. Pass
+                        -- `patternsLength` explicitly for arity instead
+                        -- of going through `mkPartiallyApplied` (which
+                        -- would derive arity from `List.length patterns`
+                        -- and silently zero it out for `RExprImpl`
+                        -- closures whose patterns list is always empty).
                         evalArgsThen rest cfg env
                             (\args ->
-                                Types.succeedPartial <| Value.mkPartiallyApplied localEnv args patterns maybeQualifiedName implementation
+                                Types.succeedPartial <|
+                                    PartiallyApplied localEnv args patterns maybeQualifiedName implementation patternsLength
                             )
 
                     GT ->
@@ -1969,8 +1975,10 @@ evalApplicationGeneral rest oldArgs oldArgsLength patternsLength localEnv patter
                         oldArgs ++ values
                 in
                 if oldArgsLength + restLength < patternsLength then
-                    -- Still not enough
-                    Types.succeedPartial <| Value.mkPartiallyApplied localEnv args patterns maybeQualifiedName implementation
+                    -- Still not enough. See line ~1844 for why we avoid
+                    -- `mkPartiallyApplied` here.
+                    Types.succeedPartial <|
+                        PartiallyApplied localEnv args patterns maybeQualifiedName implementation patternsLength
 
                 else
                     -- Just right, we special case this for TCO
@@ -2003,8 +2011,11 @@ evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg en
             let
                 selfClosure : Value
                 selfClosure =
+                    -- Preserve `localEnv` so the self-closure carries
+                    -- the current bridge. See the matching fix in
+                    -- `evalFunction`'s RExprImpl branch.
                     PartiallyApplied
-                        (Environment.empty [])
+                        localEnv
                         []
                         []
                         maybeQualifiedName
@@ -2322,7 +2333,7 @@ call maybeQualifiedName implementation cfg env =
                                                 n
 
                                             Nothing ->
-                                                500000
+                                                5000000
 
                                     strategy : TcoAnalysis.TcoStrategy
                                     strategy =
@@ -2352,7 +2363,7 @@ call maybeQualifiedName implementation cfg env =
                                                 n
 
                                             Nothing ->
-                                                500000
+                                                5000000
 
                                     strategy : TcoAnalysis.TcoStrategy
                                     strategy =
@@ -2404,8 +2415,12 @@ call maybeQualifiedName implementation cfg env =
             let
                 selfClosure : Value
                 selfClosure =
+                    -- Preserve `env` so the self-closure carries the
+                    -- current bridge, in case the body's evaluation
+                    -- escapes through a kernel callback. See the matching
+                    -- fix in `evalFunction`'s RExprImpl branch.
                     PartiallyApplied
-                        (Environment.empty [])
+                        env
                         []
                         []
                         maybeQualifiedName
@@ -3620,8 +3635,17 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
             List.length oldArgs
     in
     if oldArgsLength < patternsLength then
-        -- Still not enough
-        EvalResult.succeed <| Value.mkPartiallyApplied localEnv oldArgs patterns functionName implementation
+        -- Still not enough. Build the partial-application `Value`
+        -- directly rather than going through `Value.mkPartiallyApplied`,
+        -- which derives arity from `List.length patterns`. For
+        -- `RExprImpl` closures that arity is always 0 (the new evaluator
+        -- carries an empty `patterns` list and tracks arity separately)
+        -- and the mkPartiallyApplied detour silently clobbers the real
+        -- arity. Passing `patternsLength` explicitly preserves the
+        -- closure's intended arity across partial-application
+        -- boundaries.
+        EvalResult.succeed <|
+            PartiallyApplied localEnv oldArgs patterns functionName implementation patternsLength
 
     else
         case implementation of
@@ -3649,8 +3673,17 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                 let
                     selfClosure : Value
                     selfClosure =
+                        -- Preserve `localEnv` (the closure's captured env)
+                        -- so that if the body uses self-reference and
+                        -- passes it to a kernel callback, the resulting
+                        -- PA still has the bridge installed. Using
+                        -- `Environment.empty []` here was the source of
+                        -- the "RExprImpl encountered with noResolveBridge"
+                        -- regression on RemoveAccentsTest / ListTests
+                        -- after `extendResolvedWithFiles` started routing
+                        -- user functions through the resolved-IR path.
                         PartiallyApplied
-                            (Environment.empty [])
+                            localEnv
                             []
                             []
                             functionName

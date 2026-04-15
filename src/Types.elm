@@ -308,7 +308,10 @@ noResolveBridge =
                 , callStack = env.callStack
                 , error =
                     Unsupported
-                        "RExprImpl encountered with noResolveBridge — useResolvedIR misrouted, or new evaluator state not installed"
+                        ("RExprImpl encountered with noResolveBridge — useResolvedIR misrouted, or new evaluator state not installed (currentModule = "
+                            ++ String.join "." env.currentModule
+                            ++ ")"
+                        )
                 }
         )
 
