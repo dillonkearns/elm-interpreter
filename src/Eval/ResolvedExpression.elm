@@ -680,9 +680,220 @@ evalRStep staticEnv state expr =
                                     (List.length newLocals - List.length state.locals)
                                     state.tailLoopClosureSelfIndex
                           }
-                        , letBody
+                            , letBody
                         )
                 )
+
+        RNegate inner ->
+            rRecThen ( state, inner )
+                (\innerResult ->
+                    case innerResult of
+                        EvOk (Int i) ->
+                            rBase (EvOk (Int -i))
+
+                        EvOk (Float f) ->
+                            rBase (EvOk (Float -f))
+
+                        EvOk other ->
+                            rBase
+                                (evErr (envWithState staticEnv state)
+                                    (TypeError
+                                        ("negate applied to non-numeric "
+                                            ++ Value.toString other
+                                        )
+                                    )
+                                )
+
+                        _ ->
+                            rBase innerResult
+                )
+
+        RList items ->
+            evalArgsStep state items []
+                (\values ->
+                    rBase (EvOk (List values))
+                )
+
+        RTuple2 a b ->
+            evalArgsStepSmall state [ a, b ]
+                (\values ->
+                    case values of
+                        [ left, right ] ->
+                            rBase (EvOk (Tuple left right))
+
+                        _ ->
+                            rBase
+                                (evErr (envWithState staticEnv state)
+                                    (TypeError "RTuple2 expected exactly 2 values")
+                                )
+                )
+
+        RTuple3 a b c ->
+            evalArgsStepSmall state [ a, b, c ]
+                (\values ->
+                    case values of
+                        [ first, second, third ] ->
+                            rBase (EvOk (Triple first second third))
+
+                        _ ->
+                            rBase
+                                (evErr (envWithState staticEnv state)
+                                    (TypeError "RTuple3 expected exactly 3 values")
+                                )
+                )
+
+        RAnd l r ->
+            rRecThen ( state, l )
+                (\lResult ->
+                    case lResult of
+                        EvOk (Bool False) ->
+                            rBase (EvOk (Bool False))
+
+                        EvOk (Bool True) ->
+                            rRecThen ( state, r )
+                                (\rResult ->
+                                    case rResult of
+                                        EvOk (Bool _) ->
+                                            rBase rResult
+
+                                        EvOk other ->
+                                            rBase
+                                                (evErr (envWithState staticEnv state)
+                                                    (TypeError
+                                                        ("&& right not Bool: "
+                                                            ++ Value.toString other
+                                                        )
+                                                    )
+                                                )
+
+                                        _ ->
+                                            rBase rResult
+                                )
+
+                        EvOk other ->
+                            rBase
+                                (evErr (envWithState staticEnv state)
+                                    (TypeError ("&& left not Bool: " ++ Value.toString other))
+                                )
+
+                        _ ->
+                            rBase lResult
+                )
+
+        ROr l r ->
+            rRecThen ( state, l )
+                (\lResult ->
+                    case lResult of
+                        EvOk (Bool True) ->
+                            rBase (EvOk (Bool True))
+
+                        EvOk (Bool False) ->
+                            rRecThen ( state, r )
+                                (\rResult ->
+                                    case rResult of
+                                        EvOk (Bool _) ->
+                                            rBase rResult
+
+                                        EvOk other ->
+                                            rBase
+                                                (evErr (envWithState staticEnv state)
+                                                    (TypeError
+                                                        ("|| right not Bool: "
+                                                            ++ Value.toString other
+                                                        )
+                                                    )
+                                                )
+
+                                        _ ->
+                                            rBase rResult
+                                )
+
+                        EvOk other ->
+                            rBase
+                                (evErr (envWithState staticEnv state)
+                                    (TypeError ("|| left not Bool: " ++ Value.toString other))
+                                )
+
+                        _ ->
+                            rBase lResult
+                )
+
+        RRecord fields ->
+            evalRecordFieldsStep state fields []
+                (\newFields ->
+                    rBase (EvOk (Record (FastDict.fromList newFields)))
+                )
+
+        RRecordAccess recordExpr fieldName ->
+            rRecThen ( state, recordExpr )
+                (\recordResult ->
+                    case recordResult of
+                        EvOk (Record dict) ->
+                            case FastDict.get fieldName dict of
+                                Just value ->
+                                    rBase (EvOk value)
+
+                                Nothing ->
+                                    rBase
+                                        (evErr (envWithState staticEnv state)
+                                            (TypeError ("record has no field ." ++ fieldName))
+                                        )
+
+                        EvOk other ->
+                            rBase
+                                (evErr (envWithState staticEnv state)
+                                    (TypeError
+                                        (".field access on non-record: "
+                                            ++ Value.toString other
+                                        )
+                                    )
+                                )
+
+                        _ ->
+                            rBase recordResult
+                )
+
+        RRecordUpdate slotIdx setters ->
+            case localAt slotIdx locals of
+                Just (Record originalDict) ->
+                    evalRecordFieldsStep state setters []
+                        (\newFields ->
+                            rBase
+                                (EvOk
+                                    (Record
+                                        (List.foldl
+                                            (\( fieldName, value ) acc ->
+                                                FastDict.insert fieldName value acc
+                                            )
+                                            originalDict
+                                            newFields
+                                        )
+                                    )
+                                )
+                        )
+
+                Just other ->
+                    rBase
+                        (evErr (envWithState staticEnv state)
+                            (TypeError
+                                ("record update target (slot "
+                                    ++ String.fromInt slotIdx
+                                    ++ ") is not a record: "
+                                    ++ Value.toString other
+                                )
+                            )
+                        )
+
+                Nothing ->
+                    rBase
+                        (evErr (envWithState staticEnv state)
+                            (TypeError
+                                ("record update slot "
+                                    ++ String.fromInt slotIdx
+                                    ++ " out of bounds"
+                                )
+                            )
+                        )
 
         -- Trivial cases handled inline to avoid the `envWithLocals`
         -- record copy that the fallback path would pay. These are
@@ -738,12 +949,11 @@ evalRStep staticEnv state expr =
                     )
                 )
 
-        _ ->
-            -- Remaining complex cases: RNegate, RList, RTuple2/3,
-            -- RRecord, RRecordAccess, RRecordUpdate, RAnd, ROr, RGLSL.
-            -- These are bounded by body structure, not recursion
-            -- depth, so the envWithState copy is acceptable.
-            rBase (evalRDirect (envWithState staticEnv state) expr)
+        RGLSL ->
+            rBase
+                (evErr (envWithState staticEnv state)
+                    (Unsupported "RGLSL (not supported)")
+                )
 
 
 {-| Rec-aware case branch matcher. Walks branches in order; on the first
@@ -1215,6 +1425,29 @@ evalArgsStepSmall state args k =
 
         _ ->
             evalArgsStep state args [] k
+
+
+evalRecordFieldsStep :
+    EvalState
+    -> List ( String, RExpr )
+    -> List ( String, Value )
+    -> (List ( String, Value ) -> Rec ( EvalState, RExpr ) (EvalResult Value) (EvalResult Value))
+    -> Rec ( EvalState, RExpr ) (EvalResult Value) (EvalResult Value)
+evalRecordFieldsStep state remaining accRev k =
+    case remaining of
+        [] ->
+            k (List.reverse accRev)
+
+        ( fieldName, fieldExpr ) :: rest ->
+            rRecThen ( state, fieldExpr )
+                (\fieldResult ->
+                    case fieldResult of
+                        EvOk value ->
+                            evalRecordFieldsStep state rest (( fieldName, value ) :: accRev) k
+
+                        _ ->
+                            rBase fieldResult
+                )
 
 
 {-| Rec-aware dispatch for `RApply (RGlobal id) args`. Mirrors
