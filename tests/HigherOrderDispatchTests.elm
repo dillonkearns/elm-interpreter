@@ -39,6 +39,10 @@ suite =
             , dictValuesSortedOrder
             , dictValuesEmpty
             ]
+        , describe "Kernel callback bridge shortcuts"
+            [ parserChompWhileResolvedClosure
+            , regexReplaceResolvedClosure
+            ]
         ]
 
 
@@ -286,6 +290,66 @@ dictValuesEmpty =
                 Ok projectEnv ->
                     Eval.Module.evalWithResolvedIR projectEnv "Dict.values Dict.empty"
                         |> expectValue (List [])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+parserChompWhileResolvedClosure : Test
+parserChompWhileResolvedClosure =
+    test "Parser.chompWhile with a resolved lambda predicate works through the kernel bridge" <|
+        \_ ->
+            let
+                source : String
+                source =
+                    """module Foo exposing (result)
+
+import Parser
+
+result : Result (List Parser.DeadEnd) String
+result =
+    Parser.run
+        (Parser.getChompedString
+            (Parser.chompWhile (\\c -> Char.isAlphaNum c || c == '-' || c == '_'))
+        )
+        "a_b-123!"
+"""
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Foo.result"
+                        |> expectValue (Custom { moduleName = [ "Result" ], name = "Ok" } [ String "a_b-123" ])
+
+                Err _ ->
+                    Expect.fail "buildProjectEnv failed"
+
+
+regexReplaceResolvedClosure : Test
+regexReplaceResolvedClosure =
+    test "Regex.replace with a resolved lambda callback works through the kernel bridge" <|
+        \_ ->
+            let
+                source : String
+                source =
+                    """module Foo exposing (result)
+
+import Regex
+import String
+
+result : String
+result =
+    Regex.replace
+        (Regex.fromString "[a-z]+"
+            |> Maybe.withDefault Regex.never
+        )
+        (\\match -> String.toUpper match.match)
+        "abc 123 def"
+"""
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Ok projectEnv ->
+                    Eval.Module.evalWithResolvedIR projectEnv "Foo.result"
+                        |> expectValue (String "ABC 123 DEF")
 
                 Err _ ->
                     Expect.fail "buildProjectEnv failed"

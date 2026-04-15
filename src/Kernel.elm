@@ -40,7 +40,7 @@ import Kernel.String
 import Kernel.Utils
 import Maybe.Extra
 import Syntax exposing (fakeNode)
-import Types exposing (Eval, EvalErrorData, EvalResult, Implementation(..), JsonDecoder(..), Value(..))
+import Types exposing (Eval, EvalErrorData, EvalResult, Implementation(..), JsonDecoder(..), ResolveBridge(..), Value(..))
 import Value exposing (typeError)
 
 
@@ -1772,7 +1772,7 @@ regexReplaceAtMost evalFn _ =
                         let
                             applyReplacer : Value -> Eval Value
                             applyReplacer matchVal c _ =
-                                evalFn (oldArgs ++ [ matchVal ]) patterns cachedArity maybeName implementation c closureEnv
+                                applyPartiallyApplied evalFn env closureEnv oldArgs patterns maybeName implementation cachedArity [ matchVal ] c
                         in
                         Kernel.Regex.replaceAtMost n regexVal applyReplacer str cfg env
                             |> EvalResult.map String
@@ -1938,12 +1938,12 @@ bytesDecodeKernel evalFn _ =
                         let
                             applyDecoder : Value -> Eval (Value -> Eval Value)
                             applyDecoder arg c _ =
-                                evalFn (oldArgs ++ [ arg ]) patterns cachedArity maybeName implementation c closureEnv
+                                applyPartiallyApplied evalFn env closureEnv oldArgs patterns maybeName implementation cachedArity [ arg ] c
                                     |> EvalResult.onValue
                                         (\result ->
                                             case result of
                                                 PartiallyApplied cEnv oArgs pats mName impl innerArity ->
-                                                    Ok (\arg2 c2 _ -> evalFn (oArgs ++ [ arg2 ]) pats innerArity mName impl c2 cEnv)
+                                                    Ok (\arg2 c2 _ -> applyPartiallyApplied evalFn env cEnv oArgs pats mName impl innerArity [ arg2 ] c2)
 
                                                 _ ->
                                                     Err (typeError env "Bytes.decode: decoder did not return a function")
@@ -2061,18 +2061,94 @@ writeStub4 _ _ =
 
 applyPredicate : EvalFunction -> Value -> Value -> Types.Config -> Types.Env -> Types.EvalResult Bool
 applyPredicate evalFn predicate charArg cfg env =
-    case predicate of
-        PartiallyApplied closureEnv oldArgs patterns maybeName implementation cachedArity ->
-            evalFn (oldArgs ++ [ charArg ]) patterns cachedArity maybeName implementation cfg closureEnv
-                |> EvalResult.onValue
-                    (\result ->
-                        case result of
-                            Bool b ->
-                                Ok b
+    case fastPredicateResult predicate charArg of
+        Just matched ->
+            EvalResult.succeed matched
 
-                            _ ->
-                                Err (typeError env "isSubChar predicate must return Bool")
-                    )
+        Nothing ->
+            case predicate of
+                PartiallyApplied closureEnv oldArgs patterns maybeName implementation cachedArity ->
+                    applyPartiallyApplied evalFn env closureEnv oldArgs patterns maybeName implementation cachedArity [ charArg ] cfg
+                        |> EvalResult.onValue
+                            (\result ->
+                                case result of
+                                    Bool b ->
+                                        Ok b
+
+                                    _ ->
+                                        Err (typeError env "isSubChar predicate must return Bool")
+                            )
+
+                _ ->
+                    EvalResult.fail <| typeError env "isSubChar: expected a predicate function"
+
+
+applyPartiallyApplied :
+    EvalFunction
+    -> Types.Env
+    -> Types.Env
+    -> List Value
+    -> List (Node Pattern)
+    -> Maybe QualifiedNameRef
+    -> Implementation
+    -> Int
+    -> List Value
+    -> Types.Config
+    -> Types.EvalResult Value
+applyPartiallyApplied evalFn currentEnv closureEnv oldArgs patterns maybeName implementation cachedArity newArgs cfg =
+    case implementation of
+        RExprImpl payload ->
+            let
+                selfClosure : Value
+                selfClosure =
+                    PartiallyApplied
+                        currentEnv
+                        []
+                        []
+                        maybeName
+                        implementation
+                        cachedArity
+
+                (ResolveBridge bridge) =
+                    currentEnv.shared.resolveBridge
+            in
+            bridge payload selfClosure (oldArgs ++ newArgs) cfg currentEnv
 
         _ ->
-            EvalResult.fail <| typeError env "isSubChar: expected a predicate function"
+            evalFn (oldArgs ++ newArgs) patterns cachedArity maybeName implementation cfg closureEnv
+
+
+fastPredicateResult : Value -> Value -> Maybe Bool
+fastPredicateResult predicate charArg =
+    case ( predicate, charArg ) of
+        ( PartiallyApplied _ oldArgs _ (Just qualifiedName) _ _, Char c ) ->
+            case ( qualifiedName.moduleName, qualifiedName.name, oldArgs ) of
+                ( [ "Basics" ], "always", [ Bool b ] ) ->
+                    Just b
+
+                ( [ "Char" ], "isAlpha", [] ) ->
+                    Just (Char.isAlpha c)
+
+                ( [ "Char" ], "isAlphaNum", [] ) ->
+                    Just (Char.isAlphaNum c)
+
+                ( [ "Char" ], "isDigit", [] ) ->
+                    Just (Char.isDigit c)
+
+                ( [ "Char" ], "isHexDigit", [] ) ->
+                    Just (Char.isHexDigit c)
+
+                ( [ "Char" ], "isLower", [] ) ->
+                    Just (Char.isLower c)
+
+                ( [ "Char" ], "isOctDigit", [] ) ->
+                    Just (Char.isOctDigit c)
+
+                ( [ "Char" ], "isUpper", [] ) ->
+                    Just (Char.isUpper c)
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing

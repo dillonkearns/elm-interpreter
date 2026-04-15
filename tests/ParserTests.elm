@@ -553,6 +553,46 @@ main =
         "no marker here"
 """
             (ok (String "no marker here"))
+        , parserTest "chompUntil tracks row and column across newline"
+            """module Test exposing (main)
+
+import Parser
+
+main =
+    case
+        Parser.run
+            (Parser.chompUntil "}"
+                |> Parser.andThen (\\_ -> Parser.getPosition)
+            )
+            "a\\nbc}"
+    of
+        Ok ( row, col ) ->
+            String.fromInt row ++ ":" ++ String.fromInt col
+
+        Err _ ->
+            "error"
+"""
+            (String "2:4")
+        , parserTest "token tracks column across surrogate pairs"
+            """module Test exposing (main)
+
+import Parser
+
+main =
+    case
+        Parser.run
+            (Parser.token "😀x"
+                |> Parser.andThen (\\_ -> Parser.getPosition)
+            )
+            "😀x!"
+    of
+        Ok ( row, col ) ->
+            String.fromInt row ++ ":" ++ String.fromInt col
+
+        Err _ ->
+            "error"
+"""
+            (String "1:4")
         ]
 
 

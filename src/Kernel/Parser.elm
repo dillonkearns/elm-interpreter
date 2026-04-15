@@ -92,8 +92,18 @@ isSubString smallString offset row col bigString =
         smallLength =
             String.length smallString
     in
-    if String.slice offset (offset + smallLength) bigString == smallString then
-        isSubStringAdvance offset (offset + smallLength) row col bigString
+    if smallLength == 0 then
+        ( offset, row, col )
+
+    else if String.startsWith smallString (String.dropLeft offset bigString) then
+        let
+            endPos =
+                offset + smallLength
+
+            ( newRow, newCol ) =
+                advancePosition offset row col endPos bigString
+        in
+        ( endPos, newRow, newCol )
 
     else
         ( -1, row, col )
@@ -101,30 +111,18 @@ isSubString smallString offset row col bigString =
 
 isSubStringAdvance : Int -> Int -> Int -> Int -> String -> ( Int, Int, Int )
 isSubStringAdvance pos endPos row col bigString =
-    if pos >= endPos then
-        ( endPos, row, col )
-
-    else
-        case charCodeAt pos bigString of
-            Just code ->
-                if code == 0x0A then
-                    isSubStringAdvance (pos + 1) endPos (row + 1) 1 bigString
-
-                else if Bitwise.and code 0xF800 == 0xD800 then
-                    isSubStringAdvance (pos + 2) endPos row (col + 1) bigString
-
-                else
-                    isSubStringAdvance (pos + 1) endPos row (col + 1) bigString
-
-            Nothing ->
-                ( endPos, row, col )
+    let
+        ( newRow, newCol ) =
+            advancePosition pos row col endPos bigString
+    in
+    ( endPos, newRow, newCol )
 
 
 findSubString : String -> Int -> Int -> Int -> String -> ( Int, Int, Int )
 findSubString smallString offset row col bigString =
     let
         newOffset =
-            indexOfFrom smallString offset bigString
+            findOffset smallString offset bigString
 
         target =
             if newOffset < 0 then
@@ -139,23 +137,17 @@ findSubString smallString offset row col bigString =
     ( newOffset, finalRow, finalCol )
 
 
-indexOfFrom : String -> Int -> String -> Int
-indexOfFrom small offset big =
-    let
-        smallLen =
-            String.length small
-
-        bigLen =
-            String.length big
-    in
-    if offset + smallLen > bigLen then
-        -1
-
-    else if String.slice offset (offset + smallLen) big == small then
+findOffset : String -> Int -> String -> Int
+findOffset small offset big =
+    if String.isEmpty small then
         offset
 
     else
-        indexOfFrom small (offset + 1) big
+        String.dropLeft offset big
+            |> String.indexes small
+            |> List.head
+            |> Maybe.map ((+) offset)
+            |> Maybe.withDefault -1
 
 
 advancePosition : Int -> Int -> Int -> Int -> String -> ( Int, Int )
@@ -164,19 +156,26 @@ advancePosition offset row col target string =
         ( row, col )
 
     else
-        case charCodeAt offset string of
-            Just code ->
-                if code == 0x0A then
-                    advancePosition (offset + 1) (row + 1) 1 target string
+        let
+            chunk =
+                String.slice offset target string
+        in
+        if String.contains "\n" chunk then
+            let
+                parts =
+                    String.split "\n" chunk
+            in
+            case List.reverse parts of
+                [] ->
+                    ( row, col )
 
-                else if Bitwise.and code 0xF800 == 0xD800 then
-                    advancePosition (offset + 2) row (col + 1) target string
+                lastLine :: previousLines ->
+                    ( row + List.length previousLines
+                    , String.length lastLine + 1
+                    )
 
-                else
-                    advancePosition (offset + 1) row (col + 1) target string
-
-            Nothing ->
-                ( row, col )
+        else
+            ( row, col + String.length chunk )
 
 
 {-| isSubChar needs to be called from Kernel.elm with evalFunction,
