@@ -5403,9 +5403,28 @@ exposeExplicitItem allInterfaces (( moduleName, _ ) as moduleNameWithKey) (Node 
         FunctionExpose name ->
             { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
 
-        TypeOrAliasExpose _ ->
-            -- Type name without constructors - doesn't add values
-            acc
+        TypeOrAliasExpose name ->
+            case ElmDict.get moduleName allInterfaces of
+                Nothing ->
+                    acc
+
+                Just interface ->
+                    if
+                        List.any
+                            (\exposed ->
+                                case exposed of
+                                    Elm.Interface.Alias aliasName ->
+                                        aliasName == name
+
+                                    _ ->
+                                        False
+                            )
+                            interface
+                    then
+                        { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
+
+                    else
+                        acc
 
         TypeExpose { name, open } ->
             case open of

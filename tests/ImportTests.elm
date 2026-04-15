@@ -19,6 +19,7 @@ suite =
         , shadowingTests
         , multiModuleTests
         , userCustomTypeTests
+        , userTypeAliasTests
         , moduleAliasCollisionTests
         , arrayExtraAliasTests
         ]
@@ -426,6 +427,34 @@ main =
 """
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (Float 5.0))
+        ]
+
+
+userTypeAliasTests : Test
+userTypeAliasTests =
+    describe "User type alias constructors"
+        [ test "Explicitly exposed record alias constructor resolves as a value" <|
+            \_ ->
+                Eval.Module.evalProject
+                    [ """module Types exposing (Point)
+
+type alias Point =
+    { x : Int, y : Int }
+"""
+                    , """module Main exposing (main)
+
+import Types exposing (Point)
+
+main =
+    let
+        point =
+            Point 1 2
+    in
+    point.x + point.y
+"""
+                    ]
+                    (Expression.FunctionOrValue [] "main")
+                    |> Expect.equal (Ok (Int 3))
         ]
 
 

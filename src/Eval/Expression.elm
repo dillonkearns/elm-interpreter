@@ -108,6 +108,82 @@ fingerprintValue value =
             0
 
 
+valueTag : Value -> String
+valueTag value =
+    case value of
+        String _ ->
+            "String"
+
+        Int _ ->
+            "Int"
+
+        Float _ ->
+            "Float"
+
+        Char _ ->
+            "Char"
+
+        Bool _ ->
+            "Bool"
+
+        Unit ->
+            "Unit"
+
+        Tuple _ _ ->
+            "Tuple"
+
+        Triple _ _ _ ->
+            "Triple"
+
+        Record _ ->
+            "Record"
+
+        Custom qualifiedName _ ->
+            "Custom(" ++ String.join "." (qualifiedName.moduleName ++ [ qualifiedName.name ]) ++ ")"
+
+        PartiallyApplied _ _ _ maybeName _ _ ->
+            case maybeName of
+                Just qualifiedName ->
+                    "Function(" ++ String.join "." (qualifiedName.moduleName ++ [ qualifiedName.name ]) ++ ")"
+
+                Nothing ->
+                    "Function(<anonymous>)"
+
+        JsArray _ ->
+            "JsArray"
+
+        List _ ->
+            "List"
+
+        JsonValue _ ->
+            "JsonValue"
+
+        JsonDecoderValue _ ->
+            "JsonDecoderValue"
+
+        RegexValue _ ->
+            "RegexValue"
+
+        BytesValue _ ->
+            "BytesValue"
+
+
+describeValue : Value -> String
+describeValue value =
+    let
+        rendered =
+            Value.toString value
+    in
+    valueTag value
+        ++ " "
+        ++ (if String.length rendered > 160 then
+                String.left 160 rendered ++ "..."
+
+            else
+                rendered
+           )
+
+
 {-| Cheap size estimate of argument values — sum of top-level sizes.
 Used to detect Category B loops (args change but total size grows
 monotonically, meaning no argument is getting structurally smaller).
@@ -1176,8 +1252,14 @@ evalOrRecurse ( (Node _ expr) as fullExpr, cfg, env ) continuation =
                         Nothing ->
                             Types.failPartial <| typeError env <| "Field " ++ field ++ " not found [record access]"
 
-                Just _ ->
-                    Types.failPartial <| typeError env "Trying to access a field on a non-record value"
+                Just other ->
+                    Types.failPartial <|
+                        typeError env
+                            ("Trying to access field ."
+                                ++ field
+                                ++ " on non-record value: "
+                                ++ describeValue other
+                            )
 
                 Nothing ->
                     Types.recurseThenWithEval evalExpression ( fullExpr, cfg, env ) continuation
@@ -3231,7 +3313,12 @@ findRecordAliasConstructor moduleName name env =
     let
         ( resolvedModule, resolvedModuleKey ) =
             if List.isEmpty moduleName then
-                ( env.currentModule, env.currentModuleKey )
+                case Dict.get name env.imports.exposedValues of
+                    Just canonicalWithKey ->
+                        canonicalWithKey
+
+                    Nothing ->
+                        ( env.currentModule, env.currentModuleKey )
 
             else
                 fixModuleName moduleName env
@@ -3247,7 +3334,7 @@ findRecordAliasConstructor moduleName name env =
 
         maybeFunc : Maybe Expression.FunctionImplementation
         maybeFunc =
-            if List.isEmpty moduleName then
+            if resolvedModuleKey == env.currentModuleKey then
                 Dict.get name env.currentModuleFunctions
 
             else
@@ -4349,8 +4436,14 @@ evalRecordAccess recordExpr (Node _ field) cfg env =
                         Nothing ->
                             Types.failPartial <| typeError env <| "Field " ++ field ++ " not found [record access]"
 
-                _ ->
-                    Types.failPartial <| typeError env "Trying to access a field on a non-record value"
+                other ->
+                    Types.failPartial <|
+                        typeError env
+                            ("Trying to access field ."
+                                ++ field
+                                ++ " on non-record value: "
+                                ++ describeValue other
+                            )
         )
 
 
