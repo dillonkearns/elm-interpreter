@@ -136,32 +136,42 @@ pure and idempotent — safe to invoke whenever the ProjectEnv passes
 through a public boundary.
 
 -}
+resolvedGlobalsFromPrecomputedValues :
+    Dict.Dict ( ModuleName, String ) IR.GlobalId
+    -> Dict.Dict String (Dict.Dict String Value)
+    -> Dict.Dict IR.GlobalId Value
+resolvedGlobalsFromPrecomputedValues globalIds precomputedValues =
+    precomputedValues
+        |> Dict.foldl
+            (\moduleKey moduleVals outer ->
+                let
+                    mn : ModuleName
+                    mn =
+                        String.split "." moduleKey
+                in
+                Dict.foldl
+                    (\name value inner ->
+                        case Dict.get ( mn, name ) globalIds of
+                            Just id ->
+                                Dict.insert id value inner
+
+                            Nothing ->
+                                inner
+                    )
+                    outer
+                    moduleVals
+            )
+            Dict.empty
+
+
 refreshResolvedGlobals : ProjectEnv -> ProjectEnv
 refreshResolvedGlobals (ProjectEnv projectEnv) =
     let
         newGlobals : Dict.Dict IR.GlobalId Value
         newGlobals =
-            projectEnv.env.shared.precomputedValues
-                |> Dict.foldl
-                    (\moduleKey moduleVals outer ->
-                        let
-                            mn : ModuleName
-                            mn =
-                                String.split "." moduleKey
-                        in
-                        Dict.foldl
-                            (\name value inner ->
-                                case Dict.get ( mn, name ) projectEnv.resolved.globalIds of
-                                    Just id ->
-                                        Dict.insert id value inner
-
-                                    Nothing ->
-                                        inner
-                            )
-                            outer
-                            moduleVals
-                    )
-                    Dict.empty
+            resolvedGlobalsFromPrecomputedValues
+                projectEnv.resolved.globalIds
+                projectEnv.env.shared.precomputedValues
 
         resolved : ResolvedProject
         resolved =
@@ -229,41 +239,121 @@ already has an AST, to avoid the per-call parse overhead.
 -}
 evalWithResolvedIRExpression : ProjectEnv -> Expression -> Result Error Value
 evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
+    evalResolvedExpressionInModuleContext
+        "evalWithResolvedIR"
+        { trace = False
+        , coverage = False
+        , coverageProbeLines = Set.empty
+        , maxSteps = Nothing
+        , tcoTarget = Nothing
+        , callCounts = Nothing
+        , intercepts = Dict.empty
+        , memoizedFunctions = MemoSpec.emptyRegistry
+        , collectMemoStats = False
+        , useResolvedIR = False
+        }
+        (ProjectEnv projectEnv)
+        [ "ResolvedEntry" ]
+        emptyImports
+        expression
+
+
+evalResolvedExpressionInModuleContext :
+    String
+    -> Types.Config
+    -> ProjectEnv
+    -> ModuleName
+    -> ImportedNames
+    -> Expression
+    -> Result Error Value
+evalResolvedExpressionInModuleContext context cfg (ProjectEnv projectEnv) moduleName importedNames expression =
     let
+        moduleKey : String
+        moduleKey =
+            Environment.moduleKey moduleName
+
+        fallbackConfig : Types.Config
+        fallbackConfig =
+            { cfg | useResolvedIR = False }
+
+        baseEnv : Env
+        baseEnv =
+            projectEnv.env
+
+        baseShared : Types.SharedContext
+        baseShared =
+            baseEnv.shared
+
+        installedBridge : Types.ResolveBridge
+        installedBridge =
+            Types.ResolveBridge
+                (\payload selfClosure argValues bridgeCfg bridgeEnv ->
+                    let
+                        withSelf : List Value
+                        withSelf =
+                            List.repeat payload.selfSlots selfClosure
+                                ++ payload.capturedLocals
+
+                        bodyLocals : List Value
+                        bodyLocals =
+                            List.foldl (::) withSelf argValues
+
+                        bridgeRenv : RE.REnv
+                        bridgeRenv =
+                            { locals = bodyLocals
+                            , globals = projectEnv.resolved.globals
+                            , resolvedBodies = projectEnv.resolved.bodies
+                            , globalIdToName = projectEnv.resolved.globalIdToName
+                            , nativeDispatchers = projectEnv.resolved.nativeDispatchers
+                            , higherOrderDispatchers = projectEnv.resolved.higherOrderDispatchers
+                            , kernelDispatchers = projectEnv.resolved.kernelDispatchers
+                            , interceptsByGlobal = Dict.empty
+                            , fallbackEnv = bridgeEnv
+                            , fallbackConfig = bridgeCfg
+                            , currentModule = bridgeEnv.currentModule
+                            , callStack = bridgeEnv.callStack
+                            , callDepth = bridgeEnv.callDepth
+                            , tailLoopTarget = Nothing
+                            , tailLoopClosureSelfIndex = Nothing
+                            , suspendStepBudget = False
+                            }
+                    in
+                    RE.evalR bridgeRenv payload.body
+                )
+
+        fallbackEnv : Env
+        fallbackEnv =
+            { baseEnv
+                | currentModule = moduleName
+                , currentModuleKey = moduleKey
+                , currentModuleFunctions =
+                    Dict.get moduleKey baseEnv.shared.functions
+                        |> Maybe.withDefault Dict.empty
+                , imports = importedNames
+                , shared = { baseShared | resolveBridge = installedBridge }
+            }
+
         resolverCtx : Resolver.ResolverContext
         resolverCtx =
-            Resolver.initContext
-                [ "ResolvedEntry" ]
+            Resolver.initContextWithImports
+                moduleName
                 projectEnv.resolved.globalIds
+                importedNames
     in
     case Resolver.resolveExpression resolverCtx (fakeNode expression) of
         Err resolveError ->
             Err
                 (EvalError
-                    { currentModule = [ "ResolvedEntry" ]
+                    { currentModule = moduleName
                     , callStack = []
                     , error =
                         Types.Unsupported
-                            ("resolver error: " ++ resolverErrorToString resolveError)
+                            ("resolver error in " ++ context ++ ": " ++ resolverErrorToString resolveError)
                     }
                 )
 
         Ok rexpr ->
             let
-                dispatchConfig : Types.Config
-                dispatchConfig =
-                    { trace = False
-                    , coverage = False
-                    , coverageProbeLines = Set.empty
-                    , maxSteps = Nothing
-                    , tcoTarget = Nothing
-                    , callCounts = Nothing
-                    , intercepts = Dict.empty
-                    , memoizedFunctions = MemoSpec.emptyRegistry
-                    , collectMemoStats = False
-                    , useResolvedIR = False
-                    }
-
                 renv : RE.REnv
                 renv =
                     { locals = []
@@ -274,30 +364,92 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                     , higherOrderDispatchers = projectEnv.resolved.higherOrderDispatchers
                     , kernelDispatchers = projectEnv.resolved.kernelDispatchers
                     , interceptsByGlobal = Dict.empty
-                    , fallbackEnv = projectEnv.env
-                    , fallbackConfig = dispatchConfig
-                    , currentModule = [ "ResolvedEntry" ]
+                    , fallbackEnv = fallbackEnv
+                    , fallbackConfig = fallbackConfig
+                    , currentModule = moduleName
                     , callStack = []
                     , callDepth = 0
+                    , tailLoopTarget = Nothing
+                    , tailLoopClosureSelfIndex = Nothing
+                    , suspendStepBudget = False
                     }
             in
-            case RE.evalR renv rexpr of
-                EvOk value ->
-                    Ok value
+            evalResultToSynchronousResult context (RE.evalR renv rexpr)
 
-                EvErr errorData ->
-                    Err (EvalError errorData)
 
-                _ ->
-                    Err
-                        (EvalError
-                            { currentModule = [ "ResolvedEntry" ]
-                            , callStack = []
-                            , error =
-                                Types.Unsupported
-                                    "EvalResult with trace/yield/memo — not supported through evalWithResolvedIR yet"
-                            }
-                        )
+evalResultToSynchronousResult : String -> Types.EvalResult Value -> Result Error Value
+evalResultToSynchronousResult context evalResult =
+    case evalResult of
+        EvOk value ->
+            Ok value
+
+        EvErr errorData ->
+            Err (EvalError errorData)
+
+        EvOkTrace value _ _ ->
+            Ok value
+
+        EvErrTrace errorData _ _ ->
+            Err (EvalError errorData)
+
+        EvOkCoverage value _ ->
+            Ok value
+
+        EvErrCoverage errorData _ ->
+            Err (EvalError errorData)
+
+        EvYield tag _ _ ->
+            Err
+                (EvalError
+                    { currentModule = []
+                    , callStack = []
+                    , error =
+                        Types.Unsupported
+                            ("Unexpected EvYield '"
+                                ++ tag
+                                ++ "' in synchronous path ("
+                                ++ context
+                                ++ ")"
+                            )
+                    }
+                )
+
+        EvMemoLookup _ _ ->
+            Err
+                (EvalError
+                    { currentModule = []
+                    , callStack = []
+                    , error =
+                        Types.Unsupported
+                            ("Unexpected EvMemoLookup in synchronous path (" ++ context ++ ")")
+                    }
+                )
+
+        EvMemoStore _ _ ->
+            Err
+                (EvalError
+                    { currentModule = []
+                    , callStack = []
+                    , error =
+                        Types.Unsupported
+                            ("Unexpected EvMemoStore in synchronous path (" ++ context ++ ")")
+                    }
+                )
+
+
+type alias ResolvedIREvalOptions =
+    { maxSteps : Maybe Int
+    , memoizedFunctions : MemoSpec.Registry
+    , collectMemoStats : Bool
+    }
+
+
+defaultResolvedIREvalOptions : ResolvedIREvalOptions
+defaultResolvedIREvalOptions =
+    { maxSteps = Nothing
+    , memoizedFunctions = MemoSpec.emptyRegistry
+    , collectMemoStats = False
+    }
 
 
 resolverErrorToString : Resolver.ResolveError -> String
@@ -654,11 +806,40 @@ resolveProject summaries =
 
 eval : String -> Expression -> Result Error Value
 eval source expression =
-    let
-        ( result, _, _ ) =
-            traceOrEvalModule { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } source expression
-    in
-    result
+    parseProjectSources [ source ]
+        |> Result.andThen
+            (\parsedModules ->
+                buildProjectEnvFromParsed parsedModules
+                    |> Result.andThen
+                        (\projectEnv ->
+                            let
+                                lastModule : ModuleName
+                                lastModule =
+                                    parsedModules
+                                        |> List.reverse
+                                        |> List.head
+                                        |> Maybe.map .moduleName
+                                        |> Maybe.withDefault [ "Main" ]
+                            in
+                            evalResolvedExpressionInModuleContext
+                                "eval"
+                                { trace = False
+                                , coverage = False
+                                , coverageProbeLines = Set.empty
+                                , maxSteps = Nothing
+                                , tcoTarget = Nothing
+                                , callCounts = Nothing
+                                , intercepts = Dict.empty
+                                , memoizedFunctions = MemoSpec.emptyRegistry
+                                , collectMemoStats = False
+                                , useResolvedIR = False
+                                }
+                                projectEnv
+                                lastModule
+                                (projectImportsForModule projectEnv lastModule)
+                                expression
+                        )
+            )
 
 
 trace : String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
@@ -668,6 +849,43 @@ trace source expression =
 
 traceOrEvalModule : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 traceOrEvalModule cfg source expression =
+    if cfg.trace || cfg.coverage then
+        traceOrEvalModuleLegacy cfg source expression
+
+    else
+        case parseProjectSources [ source ] of
+            Err e ->
+                ( Err e, Rope.empty, Rope.empty )
+
+            Ok parsedModules ->
+                case buildProjectEnvFromParsed parsedModules of
+                    Err e ->
+                        ( Err e, Rope.empty, Rope.empty )
+
+                    Ok projectEnv ->
+                        let
+                            lastModule : ModuleName
+                            lastModule =
+                                parsedModules
+                                    |> List.reverse
+                                    |> List.head
+                                    |> Maybe.map .moduleName
+                                    |> Maybe.withDefault [ "Main" ]
+                        in
+                        ( evalResolvedExpressionInModuleContext
+                            "traceOrEvalModule"
+                            cfg
+                            projectEnv
+                            lastModule
+                            (projectImportsForModule projectEnv lastModule)
+                            expression
+                        , Rope.empty
+                        , Rope.empty
+                        )
+
+
+traceOrEvalModuleLegacy : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
+traceOrEvalModuleLegacy cfg source expression =
     let
         maybeEnv : Result Error Env
         maybeEnv =
@@ -953,8 +1171,12 @@ normalizeSummaries summaries =
                     )
                 |> Dict.fromList
 
+        resolvedProject : ResolvedProject
+        resolvedProject =
+            resolveProject summaries
+
         ( normalizedFunctions, _ ) =
-            normalizeTopLevelConstants summaries sharedFunctionsBefore sharedModuleImports
+            normalizeTopLevelConstants resolvedProject summaries sharedFunctionsBefore sharedModuleImports
     in
     summaries
         |> List.map
@@ -1006,14 +1228,15 @@ AST. Same for functions that fail to eval (Debug.todo, circular refs, etc).
 
 -}
 normalizeTopLevelConstants :
-    List CachedModuleSummary
+    ResolvedProject
+    -> List CachedModuleSummary
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
     -> Dict.Dict String ImportedNames
     ->
         ( Dict.Dict String (Dict.Dict String FunctionImplementation)
         , Dict.Dict String (Dict.Dict String Value)
         )
-normalizeTopLevelConstants summaries initialFunctions sharedImports =
+normalizeTopLevelConstants resolvedProject summaries initialFunctions sharedImports =
     List.foldl
         (\summary ( currentFunctions, currentPrecomputed ) ->
             let
@@ -1042,6 +1265,7 @@ normalizeTopLevelConstants summaries initialFunctions sharedImports =
                             if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
                                 case
                                     tryNormalizeConstant
+                                        resolvedProject
                                         summary.moduleName
                                         moduleKey
                                         summary.importedNames
@@ -1074,6 +1298,176 @@ normalizeTopLevelConstants summaries initialFunctions sharedImports =
         summaries
 
 
+resolvedProjectFromEnv : Env -> ResolvedProject
+resolvedProjectFromEnv env =
+    env.shared.functions
+        |> Dict.foldl
+            (\moduleKey moduleFns acc ->
+                if Dict.member moduleKey coreFunctions then
+                    acc
+
+                else
+                    { moduleName = String.split "." moduleKey
+                    , interface = []
+                    , importedNames =
+                        Dict.get moduleKey env.shared.moduleImports
+                            |> Maybe.withDefault emptyImports
+                    , functions =
+                        moduleFns
+                            |> Dict.foldl (\_ impl fnAcc -> impl :: fnAcc) []
+                    }
+                        :: acc
+            )
+            []
+        |> resolveProject
+
+
+evalResolvedNodeInEnv :
+    String
+    -> ResolvedProject
+    -> Config
+    -> Env
+    -> Node Expression
+    -> EvalResult Value
+evalResolvedNodeInEnv context resolvedProject cfg env node =
+    let
+        precomputedGlobals : Dict.Dict IR.GlobalId Value
+        precomputedGlobals =
+            resolvedGlobalsFromPrecomputedValues
+                resolvedProject.globalIds
+                env.shared.precomputedValues
+
+        nextInitialId : IR.GlobalId
+        nextInitialId =
+            Dict.foldl (\id _ acc -> max id acc) -1 resolvedProject.globalIdToName
+                + 1
+
+        ambientIdAssignment : { next : Int, ids : Dict.Dict String IR.GlobalId }
+        ambientIdAssignment =
+            env.values
+                |> Dict.foldl
+                    (\name _ inner ->
+                        { next = inner.next + 1
+                        , ids = Dict.insert name inner.next inner.ids
+                        }
+                    )
+                    { next = nextInitialId
+                    , ids = Dict.empty
+                    }
+
+        ambientGlobals : Dict.Dict String IR.GlobalId
+        ambientGlobals =
+            ambientIdAssignment.ids
+
+        runtimeGlobals : Dict.Dict IR.GlobalId Value
+        runtimeGlobals =
+            ambientGlobals
+                |> Dict.foldl
+                    (\name id acc ->
+                        case Dict.get name env.values of
+                            Just value ->
+                                Dict.insert id value acc
+
+                            Nothing ->
+                                acc
+                    )
+                    precomputedGlobals
+
+        runtimeGlobalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
+        runtimeGlobalIdToName =
+            ambientGlobals
+                |> Dict.foldl
+                    (\name id acc -> Dict.insert id ( [], name ) acc)
+                    resolvedProject.globalIdToName
+
+        installedBridge : Types.ResolveBridge
+        installedBridge =
+            Types.ResolveBridge
+                (\payload selfClosure argValues bridgeCfg bridgeEnv ->
+                    let
+                        withSelf : List Value
+                        withSelf =
+                            List.repeat payload.selfSlots selfClosure
+                                ++ payload.capturedLocals
+
+                        bodyLocals : List Value
+                        bodyLocals =
+                            List.foldl (::) withSelf argValues
+
+                        bridgeRenv : RE.REnv
+                        bridgeRenv =
+                            { locals = bodyLocals
+                            , globals = runtimeGlobals
+                            , resolvedBodies = resolvedProject.bodies
+                            , globalIdToName = runtimeGlobalIdToName
+                            , nativeDispatchers = resolvedProject.nativeDispatchers
+                            , higherOrderDispatchers = resolvedProject.higherOrderDispatchers
+                            , kernelDispatchers = resolvedProject.kernelDispatchers
+                            , interceptsByGlobal = Dict.empty
+                            , fallbackEnv = bridgeEnv
+                            , fallbackConfig = bridgeCfg
+                            , currentModule = bridgeEnv.currentModule
+                            , callStack = bridgeEnv.callStack
+                            , callDepth = bridgeEnv.callDepth
+                            , tailLoopTarget = Nothing
+                            , tailLoopClosureSelfIndex = Nothing
+                            , suspendStepBudget = False
+                            }
+                    in
+                    RE.evalR bridgeRenv payload.body
+                )
+
+        sharedContext : Types.SharedContext
+        sharedContext =
+            env.shared
+
+        fallbackEnv : Env
+        fallbackEnv =
+            { env
+                | shared =
+                    { sharedContext | resolveBridge = installedBridge }
+            }
+
+        resolverCtx : Resolver.ResolverContext
+        resolverCtx =
+            Resolver.initContextWithImports
+                fallbackEnv.currentModule
+                resolvedProject.globalIds
+                fallbackEnv.imports
+                |> Resolver.withAmbientGlobals ambientGlobals
+    in
+    case Resolver.resolveExpression resolverCtx node of
+        Err resolveError ->
+            Types.EvErr
+                { currentModule = fallbackEnv.currentModule
+                , callStack = fallbackEnv.callStack
+                , error =
+                    Types.Unsupported
+                        ("resolver error in " ++ context ++ ": " ++ resolverErrorToString resolveError)
+                }
+
+        Ok rexpr ->
+            RE.evalR
+                { locals = []
+                , globals = runtimeGlobals
+                , resolvedBodies = resolvedProject.bodies
+                , globalIdToName = runtimeGlobalIdToName
+                , nativeDispatchers = resolvedProject.nativeDispatchers
+                , higherOrderDispatchers = resolvedProject.higherOrderDispatchers
+                , kernelDispatchers = resolvedProject.kernelDispatchers
+                , interceptsByGlobal = Dict.empty
+                , fallbackEnv = fallbackEnv
+                , fallbackConfig = cfg
+                , currentModule = fallbackEnv.currentModule
+                , callStack = fallbackEnv.callStack
+                , callDepth = fallbackEnv.callDepth
+                , tailLoopTarget = Nothing
+                , tailLoopClosureSelfIndex = Nothing
+                , suspendStepBudget = False
+                }
+                rexpr
+
+
 {-| Try to normalize a single zero-arg function. Returns `Just (funcImpl,
 value)` if eval succeeded and the result is losslessly round-trippable;
 `Nothing` if we should leave the AST alone. Callers persist both the
@@ -1081,7 +1475,8 @@ rewritten expression (so the AST path is fast) and the `Value` (so the
 runtime precomputed cache hits for module-level references).
 -}
 tryNormalizeConstant :
-    ModuleName
+    ResolvedProject
+    -> ModuleName
     -> String
     -> ImportedNames
     -> FunctionImplementation
@@ -1089,7 +1484,7 @@ tryNormalizeConstant :
     -> Dict.Dict String ImportedNames
     -> Dict.Dict String (Dict.Dict String Value)
     -> Maybe ( FunctionImplementation, Value )
-tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions sharedModuleImports sharedPrecomputedValues =
+tryNormalizeConstant resolvedProject moduleName moduleKey moduleImports funcImpl sharedFunctions sharedModuleImports sharedPrecomputedValues =
     let
         env : Env
         env =
@@ -1129,7 +1524,7 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
 
         result : EvalResult Value
         result =
-            Eval.Expression.evalExpression funcImpl.expression cfg env
+            evalResolvedNodeInEnv "tryNormalizeConstant" resolvedProject cfg env funcImpl.expression
     in
     case EvalResult.toResult result of
         Ok value ->
@@ -1170,7 +1565,8 @@ dict. All three are keyed on the simple function name.
 
 -}
 runModuleNormalizationToFixpoint :
-    ModuleName
+    ResolvedProject
+    -> ModuleName
     -> String
     -> ImportedNames
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
@@ -1183,7 +1579,7 @@ runModuleNormalizationToFixpoint :
         , Dict.Dict String FunctionImplementation
         , Dict.Dict String Value
         )
-runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
+runModuleNormalizationToFixpoint resolvedProject moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
     let
         -- Flags read from the single `NormalizationFlags.experimental`
         -- knob. Edit that value + rebuild to run a new A/B experiment.
@@ -1222,6 +1618,7 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
                         else if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
                             case
                                 tryNormalizeConstant
+                                    resolvedProject
                                     moduleName
                                     moduleKey
                                     moduleImports
@@ -1275,6 +1672,7 @@ runModuleNormalizationToFixpoint moduleName moduleKey moduleImports sharedFuncti
         ( fixpointFns, fixpointDelta, fixpointPrecomputed ) =
             if flags.runFixpoint then
                 normalizeInDepOrder
+                    resolvedProject
                     moduleName
                     moduleKey
                     moduleImports
@@ -1359,7 +1757,8 @@ but the guard keeps the pass safe on malformed input.
 
 -}
 normalizeInDepOrder :
-    ModuleName
+    ResolvedProject
+    -> ModuleName
     -> String
     -> ImportedNames
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
@@ -1372,7 +1771,7 @@ normalizeInDepOrder :
         , Dict.Dict String FunctionImplementation
         , Dict.Dict String Value
         )
-normalizeInDepOrder moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
+normalizeInDepOrder resolvedProject moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
     let
         candidateNames : Set String
         candidateNames =
@@ -1426,7 +1825,7 @@ normalizeInDepOrder moduleName moduleKey moduleImports sharedFunctions sharedImp
         finalState =
             candidateNames
                 |> Set.foldl
-                    (\name state -> processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state)
+                    (\name state -> processCandidate resolvedProject moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state)
                     initialState
     in
     ( finalState.fns, finalState.delta, finalState.precomputed )
@@ -1442,7 +1841,8 @@ type alias NormalizeDepState =
 
 
 processCandidate :
-    ModuleName
+    ResolvedProject
+    -> ModuleName
     -> String
     -> ImportedNames
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
@@ -1453,7 +1853,7 @@ processCandidate :
     -> String
     -> NormalizeDepState
     -> NormalizeDepState
-processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state =
+processCandidate resolvedProject moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state =
     if Set.member name state.visited then
         state
 
@@ -1475,7 +1875,7 @@ processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImport
             afterDeps : NormalizeDepState
             afterDeps =
                 Set.foldl
-                    (\dep s -> processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph dep s)
+                    (\dep s -> processCandidate resolvedProject moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph dep s)
                     withPath
                     deps
 
@@ -1493,6 +1893,7 @@ processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImport
             Just priorFn ->
                 case
                     tryNormalizeConstant
+                        resolvedProject
                         moduleName
                         moduleKey
                         moduleImports
@@ -1596,17 +1997,18 @@ foldWithFlags :
     -> Node Expression
     -> Node Expression
 foldWithFlags flags env cfg node =
-    foldConstantSubExpressionsHelp 3 flags env cfg node
+    foldConstantSubExpressionsHelp (resolvedProjectFromEnv env) 3 flags env cfg node
 
 
 foldConstantSubExpressionsHelp :
-    Int
+    ResolvedProject
+    -> Int
     -> NormalizationFlags.NormalizationFlags
     -> Env
     -> Config
     -> Node Expression
     -> Node Expression
-foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
+foldConstantSubExpressionsHelp resolvedProject depth flags env cfg ((Node range expr) as node) =
     if depth <= 0 then
         node
 
@@ -1614,7 +2016,7 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
         let
             tryFold : Node Expression -> Node Expression
             tryFold foldedNode =
-                case Eval.Expression.evalExpression foldedNode cfg env |> EvalResult.toResult of
+                case evalResolvedNodeInEnv "foldConstantSubExpressionsHelp" resolvedProject cfg env foldedNode |> EvalResult.toResult of
                     Ok value ->
                         if isLosslessValue value then
                             Value.toExpression value
@@ -1670,17 +2072,17 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
         in
         case expr of
             ListExpr items ->
-                Node range (ListExpr (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
+                Node range (ListExpr (List.map (foldConstantSubExpressionsHelp resolvedProject depth flags env cfg) items))
 
             TupledExpression items ->
-                Node range (TupledExpression (List.map (foldConstantSubExpressionsHelp depth flags env cfg) items))
+                Node range (TupledExpression (List.map (foldConstantSubExpressionsHelp resolvedProject depth flags env cfg) items))
 
             RecordExpr fields ->
                 Node range
                     (RecordExpr
                         (List.map
                             (\(Node fRange ( name, value )) ->
-                                Node fRange ( name, foldConstantSubExpressionsHelp depth flags env cfg value )
+                                Node fRange ( name, foldConstantSubExpressionsHelp resolvedProject depth flags env cfg value )
                             )
                             fields
                         )
@@ -1689,7 +2091,7 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
             Application ((Node _ (FunctionOrValue moduleName funcName)) :: args) ->
                 let
                     foldedArgs =
-                        List.map (foldConstantSubExpressionsHelp depth flags env cfg) args
+                        List.map (foldConstantSubExpressionsHelp resolvedProject depth flags env cfg) args
 
                     foldedNode =
                         Node range (Application (Node range (FunctionOrValue moduleName funcName) :: foldedArgs))
@@ -1704,7 +2106,7 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
                 else if flags.inlineFunctions then
                     case tryInlineFunction env moduleName funcName foldedArgs of
                         Just inlinedExpr ->
-                            foldConstantSubExpressionsHelp (depth - 1) flags env cfg inlinedExpr
+                            foldConstantSubExpressionsHelp resolvedProject (depth - 1) flags env cfg inlinedExpr
 
                         Nothing ->
                             foldedNode
@@ -1715,18 +2117,18 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
             IfBlock cond thenBranch elseBranch ->
                 Node range
                     (IfBlock
-                        (foldConstantSubExpressionsHelp depth flags env cfg cond)
-                        (foldConstantSubExpressionsHelp depth flags env cfg thenBranch)
-                        (foldConstantSubExpressionsHelp depth flags env cfg elseBranch)
+                        (foldConstantSubExpressionsHelp resolvedProject depth flags env cfg cond)
+                        (foldConstantSubExpressionsHelp resolvedProject depth flags env cfg thenBranch)
+                        (foldConstantSubExpressionsHelp resolvedProject depth flags env cfg elseBranch)
                     )
 
             CaseExpression { expression, cases } ->
                 Node range
                     (CaseExpression
-                        { expression = foldConstantSubExpressionsHelp depth flags env cfg expression
+                        { expression = foldConstantSubExpressionsHelp resolvedProject depth flags env cfg expression
                         , cases =
                             List.map
-                                (\( pat, body ) -> ( pat, foldConstantSubExpressionsHelp depth flags env cfg body ))
+                                (\( pat, body ) -> ( pat, foldConstantSubExpressionsHelp resolvedProject depth flags env cfg body ))
                                 cases
                         }
                     )
@@ -1749,26 +2151,26 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
                                                             in
                                                             Node implRange
                                                                 { impl
-                                                                    | expression = foldConstantSubExpressionsHelp depth flags env cfg impl.expression
+                                                                    | expression = foldConstantSubExpressionsHelp resolvedProject depth flags env cfg impl.expression
                                                                 }
                                                     }
 
                                             LetDestructuring pat val ->
-                                                LetDestructuring pat (foldConstantSubExpressionsHelp depth flags env cfg val)
+                                                LetDestructuring pat (foldConstantSubExpressionsHelp resolvedProject depth flags env cfg val)
                                         )
                                 )
                                 declarations
-                        , expression = foldConstantSubExpressionsHelp depth flags env cfg expression
+                        , expression = foldConstantSubExpressionsHelp resolvedProject depth flags env cfg expression
                         }
                     )
 
             OperatorApplication op dir left right ->
                 let
                     foldedLeft =
-                        foldConstantSubExpressionsHelp depth flags env cfg left
+                        foldConstantSubExpressionsHelp resolvedProject depth flags env cfg left
 
                     foldedRight =
-                        foldConstantSubExpressionsHelp depth flags env cfg right
+                        foldConstantSubExpressionsHelp resolvedProject depth flags env cfg right
                 in
                 if flags.foldConstantApplications && isConstantLeaf ((\(Node _ e) -> e) foldedLeft) && isConstantLeaf ((\(Node _ e) -> e) foldedRight) then
                     tryFold (Node range (OperatorApplication op dir foldedLeft foldedRight))
@@ -1779,7 +2181,7 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
             Negation inner ->
                 let
                     foldedInner =
-                        foldConstantSubExpressionsHelp depth flags env cfg inner
+                        foldConstantSubExpressionsHelp resolvedProject depth flags env cfg inner
                 in
                 if isConstantLeaf ((\(Node _ e) -> e) foldedInner) then
                     tryFold (Node range (Negation foldedInner))
@@ -1788,12 +2190,12 @@ foldConstantSubExpressionsHelp depth flags env cfg ((Node range expr) as node) =
                     Node range (Negation foldedInner)
 
             ParenthesizedExpression inner ->
-                Node range (ParenthesizedExpression (foldConstantSubExpressionsHelp depth flags env cfg inner))
+                Node range (ParenthesizedExpression (foldConstantSubExpressionsHelp resolvedProject depth flags env cfg inner))
 
             LambdaExpression lambda ->
                 Node range
                     (LambdaExpression
-                        { lambda | expression = foldConstantSubExpressionsHelp depth flags env cfg lambda.expression }
+                        { lambda | expression = foldConstantSubExpressionsHelp resolvedProject depth flags env cfg lambda.expression }
                     )
 
             FunctionOrValue [] name ->
@@ -2438,7 +2840,7 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
     buildModuleEnv updatedInterfaces newModule cleanedEnv
         |> Result.map
             (\env ->
-                refreshResolvedGlobals
+                refreshResolvedModulesByName [ newModule.moduleName ]
                     (ProjectEnv
                         { env = env
                         , allInterfaces = updatedInterfaces
@@ -2454,30 +2856,15 @@ The expression is evaluated in the context of the last additional source.
 -}
 evalWithEnv : ProjectEnv -> List String -> Expression -> Result Error Value
 evalWithEnv projectEnv additionalSources expression =
-    evalWithEnvAndLimit Nothing projectEnv additionalSources expression
+    parseProjectSources additionalSources
+        |> Result.map (List.map .file)
+        |> Result.andThen (\files -> evalWithEnvFromFiles projectEnv files expression)
 
 
 {-| Like `evalWithEnv`, but with an optional step limit to prevent hangs
-on large computations. Pass `Just n` to limit evaluation to `n` trampoline
-steps, or `Nothing` for unlimited.
-
-**Phase 4 status:** this function stays on the OLD-evaluator path for
-now. The original Phase 4 plan was to route it through the resolved-IR
-trampoline (`evalWithResolvedIRFromFilesAndInterceptsAndLimit` exists
-for exactly that purpose), but the RE trampoline lacks an
-`Eval.Expression.tcoLoop` equivalent: OLD eval's `tcoLoop` runs a
-JS-level while-loop for detected tail-recursive calls and never
-re-enters the step counter, so `tcoProofTests`' tight budgets (e.g.
-110 000 for a 100 000-iteration `countdown`) fit easily. RE's
-trampoline charges one step per `rRecThen` (for the `RIf` condition,
-for each argument eval, etc.), so the same 100 000-iteration loop
-costs ~600 000 counted steps and blows the budget. Routing the test
-through RE would cause `tcoProofTests` to regress — the Phase 4
-rollback signal — so we leave this entry point on OLD eval until RE
-grows a `tcoLoop`-equivalent. The `runRecWithBudget` infrastructure
-added in Phase 4 is ready to be used by a future phase when that
-lands.
-
+on large computations. Pass `Just n` to limit evaluation to `n`
+tail-loop iterations / trampoline steps, or `Nothing` for the default
+unlimited behavior.
 -}
 evalWithEnvAndLimit : Maybe Int -> ProjectEnv -> List String -> Expression -> Result Error Value
 evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expression =
@@ -2519,169 +2906,32 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
             Err e
 
         Ok parsedModules ->
-            let
-                additionalInterfaces : ElmDict.Dict ModuleName (List Exposed)
-                additionalInterfaces =
-                    parsedModules
-                        |> List.map (\m -> ( m.moduleName, m.interface ))
-                        |> ElmDict.fromList
-
-                allInterfaces : ElmDict.Dict ModuleName (List Exposed)
-                allInterfaces =
-                    ElmDict.union additionalInterfaces projectEnv.allInterfaces
-
-                envResult : Result Error Env
-                envResult =
-                    parsedModules
-                        |> Result.MyExtra.combineFoldl
-                            (\parsedModule envAcc ->
-                                buildModuleEnv allInterfaces parsedModule envAcc
-                            )
-                            (Ok projectEnv.env)
-            in
-            case envResult of
-                Err e ->
-                    Err e
-
-                Ok env ->
-                    let
-                        lastModule : ModuleName
-                        lastModule =
-                            parsedModules
-                                |> List.reverse
-                                |> List.head
-                                |> Maybe.map .moduleName
-                                |> Maybe.withDefault [ "Main" ]
-
-                        lastFile : Maybe File
-                        lastFile =
-                            parsedModules
-                                |> List.reverse
-                                |> List.head
-                                |> Maybe.map .file
-
-                        finalImports : ImportedNames
-                        finalImports =
-                            case lastFile of
-                                Just file ->
-                                    (defaultImports ++ file.imports)
-                                        |> List.foldl (processImport allInterfaces) emptyImports
-
-                                Nothing ->
-                                    emptyImports
-
-                        lastModuleKey : String
-                        lastModuleKey =
-                            Environment.moduleKey lastModule
-
-                        finalEnv : Env
-                        finalEnv =
-                            { env
-                                | currentModule = lastModule
-                                , currentModuleKey = lastModuleKey
-                                , currentModuleFunctions =
-                                    Dict.get lastModuleKey env.shared.functions
-                                        |> Maybe.withDefault Dict.empty
-                                , imports = finalImports
-                            }
-
-                        result : Result Types.EvalErrorData Value
-                        result =
-                            Eval.Expression.evalExpression
-                                (fakeNode expression)
-                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
-                                finalEnv
-                                |> EvalResult.toResult
-                    in
-                    Result.mapError Types.EvalError result
+            evalWithResolvedIRFromFilesAndInterceptsAndLimit
+                maxSteps
+                (ProjectEnv projectEnv)
+                (List.map .file parsedModules)
+                Dict.empty
+                Dict.empty
+                expression
+                |> EvalResult.toResult
+                |> Result.mapError Types.EvalError
 
 
 {-| Like `evalWithEnvFromFiles`, but with an optional step limit.
-Pass `Just n` to limit evaluation to `n` trampoline steps (prevents infinite
-loops from consuming unbounded memory). Pass `Nothing` for unlimited.
-
-**Phase 4 status:** stays on the OLD-evaluator path for the same
-reason `evalWithEnvAndLimit` does — see that function's docstring.
-
+Pass `Just n` to limit evaluation to `n` tail-loop iterations /
+trampoline steps. Pass `Nothing` for the default unlimited behavior.
 -}
 evalWithEnvFromFilesAndLimit : Maybe Int -> ProjectEnv -> List File -> Expression -> Result Error Value
 evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles expression =
-    let
-        parsedModules =
-            additionalFiles
-                |> List.map
-                    (\file ->
-                        { file = file
-                        , moduleName = fileModuleName file
-                        , interface = buildInterfaceFromFile file
-                        }
-                    )
-
-        additionalInterfaces =
-            parsedModules
-                |> List.map (\m -> ( m.moduleName, m.interface ))
-                |> ElmDict.fromList
-
-        allInterfaces =
-            ElmDict.union additionalInterfaces projectEnv.allInterfaces
-
-        envResult =
-            parsedModules
-                |> Result.MyExtra.combineFoldl
-                    (\parsedModule envAcc ->
-                        buildModuleEnv allInterfaces parsedModule envAcc
-                    )
-                    (Ok projectEnv.env)
-    in
-    case envResult of
-        Err e ->
-            Err e
-
-        Ok env ->
-            let
-                lastModule =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .moduleName
-                        |> Maybe.withDefault [ "Main" ]
-
-                lastFile =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .file
-
-                finalImports =
-                    case lastFile of
-                        Just file ->
-                            (defaultImports ++ file.imports)
-                                |> List.foldl (processImport allInterfaces) emptyImports
-
-                        Nothing ->
-                            emptyImports
-
-                lastModuleKey =
-                    Environment.moduleKey lastModule
-
-                finalEnv =
-                    { env
-                        | currentModule = lastModule
-                        , currentModuleKey = lastModuleKey
-                        , currentModuleFunctions =
-                            Dict.get lastModuleKey env.shared.functions
-                                |> Maybe.withDefault Dict.empty
-                        , imports = finalImports
-                    }
-
-                result =
-                    Eval.Expression.evalExpression
-                        (fakeNode expression)
-                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
-                        finalEnv
-                        |> EvalResult.toResult
-            in
-            Result.mapError Types.EvalError result
+    evalWithResolvedIRFromFilesAndInterceptsAndLimit
+        maxSteps
+        (ProjectEnv projectEnv)
+        additionalFiles
+        Dict.empty
+        Dict.empty
+        expression
+        |> EvalResult.toResult
+        |> Result.mapError Types.EvalError
 
 
 {-| Like `evalWithEnv`, but accepts pre-parsed `File` ASTs instead of source strings.
@@ -2690,7 +2940,13 @@ mutation testing, or incremental compilation where files are parsed once and reu
 -}
 evalWithEnvFromFiles : ProjectEnv -> List File -> Expression -> Result Error Value
 evalWithEnvFromFiles projectEnv additionalFiles expression =
-    evalWithEnvFromFilesAndLimit Nothing projectEnv additionalFiles expression
+    evalWithResolvedIRFromFilesAndIntercepts
+        projectEnv
+        additionalFiles
+        Dict.empty
+        Dict.empty
+        expression
+        |> evalResultToSynchronousResult "evalWithEnvFromFiles"
 
 
 {-| Like `evalWithEnvFromFiles`, but memoizes selected fully-applied top-level
@@ -2712,96 +2968,24 @@ evalWithEnvFromFilesAndMemo :
             , memoStats : MemoRuntime.MemoStats
             }
 evalWithEnvFromFilesAndMemo (ProjectEnv projectEnv) additionalFiles memoizedFunctions memoCache collectMemoStats expression =
-    let
-        parsedModules =
-            additionalFiles
-                |> List.map
-                    (\file ->
-                        { file = file
-                        , moduleName = fileModuleName file
-                        , interface = buildInterfaceFromFile file
-                        }
-                    )
+    evalWithResolvedIRFromFilesAndOptions
+        { maxSteps = Nothing
+        , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+        , collectMemoStats = collectMemoStats
+        }
+        (ProjectEnv projectEnv)
+        additionalFiles
+        Dict.empty
+        Dict.empty
+        expression
+        |> driveInternalMemo
+            memoCache
+            (if collectMemoStats then
+                MemoRuntime.emptyMemoStats
 
-        additionalInterfaces =
-            parsedModules
-                |> List.map (\m -> ( m.moduleName, m.interface ))
-                |> ElmDict.fromList
-
-        allInterfaces =
-            ElmDict.union additionalInterfaces projectEnv.allInterfaces
-
-        envResult =
-            parsedModules
-                |> Result.MyExtra.combineFoldl
-                    (\parsedModule envAcc ->
-                        buildModuleEnv allInterfaces parsedModule envAcc
-                    )
-                    (Ok projectEnv.env)
-    in
-    case envResult of
-        Err e ->
-            Err e
-
-        Ok env ->
-            let
-                lastModule =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .moduleName
-                        |> Maybe.withDefault [ "Main" ]
-
-                lastFile =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .file
-
-                finalImports =
-                    case lastFile of
-                        Just file ->
-                            (defaultImports ++ file.imports)
-                                |> List.foldl (processImport allInterfaces) emptyImports
-
-                        Nothing ->
-                            emptyImports
-
-                lastModuleKey =
-                    Environment.moduleKey lastModule
-
-                finalEnv =
-                    { env
-                        | currentModule = lastModule
-                        , currentModuleKey = lastModuleKey
-                        , currentModuleFunctions =
-                            Dict.get lastModuleKey env.shared.functions
-                                |> Maybe.withDefault Dict.empty
-                        , imports = finalImports
-                    }
-            in
-            Eval.Expression.evalExpression
-                (fakeNode expression)
-                { trace = False
-                , coverage = False
-                , coverageProbeLines = Set.empty
-                , maxSteps = Nothing
-                , tcoTarget = Nothing
-                , callCounts = Nothing
-                , intercepts = Dict.empty
-                , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
-                , collectMemoStats = collectMemoStats
-                , useResolvedIR = False
-                }
-                finalEnv
-                |> driveInternalMemo
-                    memoCache
-                    (if collectMemoStats then
-                        MemoRuntime.emptyMemoStats
-
-                     else
-                        MemoRuntime.disabledMemoStats
-                    )
+             else
+                MemoRuntime.disabledMemoStats
+            )
 
 
 {-| Like `evalWithEnvFromFiles`, but also injects pre-computed Values into the
@@ -2819,89 +3003,14 @@ evalWithEnvFromFilesAndValues :
     -> Dict.Dict String Value
     -> Expression
     -> Result Error Value
-evalWithEnvFromFilesAndValues (ProjectEnv projectEnv) additionalFiles injectedValues expression =
-    let
-        parsedModules =
-            additionalFiles
-                |> List.map
-                    (\file ->
-                        { file = file
-                        , moduleName = fileModuleName file
-                        , interface = buildInterfaceFromFile file
-                        }
-                    )
-
-        additionalInterfaces =
-            parsedModules
-                |> List.map (\m -> ( m.moduleName, m.interface ))
-                |> ElmDict.fromList
-
-        allInterfaces =
-            ElmDict.union additionalInterfaces projectEnv.allInterfaces
-
-        envResult =
-            parsedModules
-                |> Result.MyExtra.combineFoldl
-                    (\parsedModule envAcc ->
-                        buildModuleEnv allInterfaces parsedModule envAcc
-                    )
-                    (Ok projectEnv.env)
-    in
-    case envResult of
-        Err e ->
-            Err e
-
-        Ok env ->
-            let
-                lastModule =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .moduleName
-                        |> Maybe.withDefault [ "Main" ]
-
-                lastFile =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .file
-
-                finalImports =
-                    case lastFile of
-                        Just file ->
-                            (defaultImports ++ file.imports)
-                                |> List.foldl (processImport allInterfaces) emptyImports
-
-                        Nothing ->
-                            emptyImports
-
-                lastModuleKey =
-                    Environment.moduleKey lastModule
-
-                -- Inject pre-computed values into the env alongside the final env setup
-                finalEnv =
-                    { env
-                        | currentModule = lastModule
-                        , currentModuleKey = lastModuleKey
-                        , currentModuleFunctions =
-                            Dict.get lastModuleKey env.shared.functions
-                                |> Maybe.withDefault Dict.empty
-                        , imports = finalImports
-                        , values =
-                            Dict.foldl
-                                (\name value acc -> Dict.insert name value acc)
-                                env.values
-                                injectedValues
-                    }
-
-                result =
-                    Eval.Expression.evalExpression
-                        (fakeNode expression)
-                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
-                        finalEnv
-                        |> EvalResult.toResult
-            in
-            Result.mapError Types.EvalError result
+evalWithEnvFromFilesAndValues projectEnv additionalFiles injectedValues expression =
+    evalWithResolvedIRFromFilesAndIntercepts
+        projectEnv
+        additionalFiles
+        injectedValues
+        Dict.empty
+        expression
+        |> evalResultToSynchronousResult "evalWithEnvFromFilesAndValues"
 
 
 evalWithEnvFromFilesAndValuesAndMemo :
@@ -2920,101 +3029,24 @@ evalWithEnvFromFilesAndValuesAndMemo :
             , memoStats : MemoRuntime.MemoStats
             }
 evalWithEnvFromFilesAndValuesAndMemo (ProjectEnv projectEnv) additionalFiles injectedValues memoizedFunctions memoCache collectMemoStats expression =
-    let
-        parsedModules =
-            additionalFiles
-                |> List.map
-                    (\file ->
-                        { file = file
-                        , moduleName = fileModuleName file
-                        , interface = buildInterfaceFromFile file
-                        }
-                    )
+    evalWithResolvedIRFromFilesAndOptions
+        { maxSteps = Nothing
+        , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+        , collectMemoStats = collectMemoStats
+        }
+        (ProjectEnv projectEnv)
+        additionalFiles
+        injectedValues
+        Dict.empty
+        expression
+        |> driveInternalMemo
+            memoCache
+            (if collectMemoStats then
+                MemoRuntime.emptyMemoStats
 
-        additionalInterfaces =
-            parsedModules
-                |> List.map (\m -> ( m.moduleName, m.interface ))
-                |> ElmDict.fromList
-
-        allInterfaces =
-            ElmDict.union additionalInterfaces projectEnv.allInterfaces
-
-        envResult =
-            parsedModules
-                |> Result.MyExtra.combineFoldl
-                    (\parsedModule envAcc ->
-                        buildModuleEnv allInterfaces parsedModule envAcc
-                    )
-                    (Ok projectEnv.env)
-    in
-    case envResult of
-        Err e ->
-            Err e
-
-        Ok env ->
-            let
-                lastModule =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .moduleName
-                        |> Maybe.withDefault [ "Main" ]
-
-                lastFile =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .file
-
-                finalImports =
-                    case lastFile of
-                        Just file ->
-                            (defaultImports ++ file.imports)
-                                |> List.foldl (processImport allInterfaces) emptyImports
-
-                        Nothing ->
-                            emptyImports
-
-                lastModuleKey =
-                    Environment.moduleKey lastModule
-
-                finalEnv =
-                    { env
-                        | currentModule = lastModule
-                        , currentModuleKey = lastModuleKey
-                        , currentModuleFunctions =
-                            Dict.get lastModuleKey env.shared.functions
-                                |> Maybe.withDefault Dict.empty
-                        , imports = finalImports
-                        , values =
-                            Dict.foldl
-                                (\name value acc -> Dict.insert name value acc)
-                                env.values
-                                injectedValues
-                    }
-            in
-            Eval.Expression.evalExpression
-                (fakeNode expression)
-                { trace = False
-                , coverage = False
-                , coverageProbeLines = Set.empty
-                , maxSteps = Nothing
-                , tcoTarget = Nothing
-                , callCounts = Nothing
-                , intercepts = Dict.empty
-                , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
-                , collectMemoStats = collectMemoStats
-                , useResolvedIR = False
-                }
-                finalEnv
-                |> driveInternalMemo
-                    memoCache
-                    (if collectMemoStats then
-                        MemoRuntime.emptyMemoStats
-
-                     else
-                        MemoRuntime.disabledMemoStats
-                    )
+             else
+                MemoRuntime.disabledMemoStats
+            )
 
 
 {-| Like `evalWithIntercepts`, but drives interpreter-local memoization
@@ -3316,8 +3348,10 @@ deepHashArgs args =
 the BackendTask yield driver when both Value injection and intercept
 handling are needed in the same evaluation.
 
-**Phase 6 status:** stays on OLD eval for the same reason
-`evalWithInterceptsRaw` does — see that function's docstring.
+This is the raw-result companion to
+`evalWithResolvedIRFromFilesAndIntercepts`, so yielding intercepts can
+be driven by the caller instead of being collapsed into a synchronous
+`Result`.
 
 -}
 evalWithEnvFromFilesAndValuesAndInterceptsRaw :
@@ -3327,9 +3361,9 @@ evalWithEnvFromFilesAndValuesAndInterceptsRaw :
     -> Dict.Dict String Types.Intercept
     -> Expression
     -> Types.EvalResult Value
-evalWithEnvFromFilesAndValuesAndInterceptsRaw (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
+evalWithEnvFromFilesAndValuesAndInterceptsRaw projectEnv additionalFiles injectedValues intercepts expression =
     evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw
-        (ProjectEnv projectEnv)
+        projectEnv
         additionalFiles
         injectedValues
         intercepts
@@ -3345,99 +3379,17 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw :
     -> Set String
     -> Expression
     -> Types.EvalResult Value
-evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw (ProjectEnv projectEnv) additionalFiles injectedValues intercepts memoizedFunctions expression =
-    let
-        parsedModules =
-            additionalFiles
-                |> List.map
-                    (\file ->
-                        { file = file
-                        , moduleName = fileModuleName file
-                        , interface = buildInterfaceFromFile file
-                        }
-                    )
-
-        additionalInterfaces =
-            parsedModules
-                |> List.map (\m -> ( m.moduleName, m.interface ))
-                |> ElmDict.fromList
-
-        allInterfaces =
-            ElmDict.union additionalInterfaces projectEnv.allInterfaces
-
-        envResult =
-            parsedModules
-                |> Result.MyExtra.combineFoldl
-                    (\parsedModule envAcc ->
-                        buildModuleEnv allInterfaces parsedModule envAcc
-                    )
-                    (Ok projectEnv.env)
-    in
-    case envResult of
-        Err e ->
-            case e of
-                Types.ParsingError _ ->
-                    Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Env build error" }
-
-                Types.EvalError evalErr ->
-                    Types.EvErr evalErr
-
-        Ok env ->
-            let
-                lastModule =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .moduleName
-                        |> Maybe.withDefault [ "Main" ]
-
-                lastFile =
-                    parsedModules
-                        |> List.reverse
-                        |> List.head
-                        |> Maybe.map .file
-
-                finalImports =
-                    case lastFile of
-                        Just file ->
-                            (defaultImports ++ file.imports)
-                                |> List.foldl (processImport allInterfaces) emptyImports
-
-                        Nothing ->
-                            emptyImports
-
-                lastModuleKey =
-                    Environment.moduleKey lastModule
-
-                finalEnv =
-                    { env
-                        | currentModule = lastModule
-                        , currentModuleKey = lastModuleKey
-                        , currentModuleFunctions =
-                            Dict.get lastModuleKey env.shared.functions
-                                |> Maybe.withDefault Dict.empty
-                        , imports = finalImports
-                        , values =
-                            Dict.foldl
-                                (\name value acc -> Dict.insert name value acc)
-                                env.values
-                                injectedValues
-                    }
-            in
-            Eval.Expression.evalExpression
-                (fakeNode expression)
-                { trace = False
-                , coverage = False
-                , coverageProbeLines = Set.empty
-                , maxSteps = Nothing
-                , tcoTarget = Nothing
-                , callCounts = Nothing
-                , intercepts = intercepts
-                , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
-                , collectMemoStats = False
-                , useResolvedIR = False
-                }
-                finalEnv
+evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw projectEnv additionalFiles injectedValues intercepts memoizedFunctions expression =
+    evalWithResolvedIRFromFilesAndOptions
+        { maxSteps = Nothing
+        , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+        , collectMemoStats = False
+        }
+        projectEnv
+        additionalFiles
+        injectedValues
+        intercepts
+        expression
 
 
 {-| Unlimited-budget delegate for
@@ -3462,16 +3414,20 @@ Any intercept whose key doesn't match a known `(moduleName, name)` pair
 is silently dropped — this matches the old evaluator's behavior, which
 only fires intercepts on qualified function calls.
 
-Memoization is deliberately **not** supported in this path. Callers that
-need `memoizedFunctions` must route through the old entry point instead.
-This keeps the new path simple; Phase 4 Round 3 will port memo support.
+Dedicated memo wrappers thread a memo registry through the same pipeline.
+The raw intercept and intercept+memo entry points also route through this
+path; `runRec` now threads yield and memo continuations through the
+trampoline's pending continuation stack, so resumed effects re-enter the
+outer expression correctly.
 
-Injected Values are stored in `env.values` on the fallback env so that
-intercept callbacks invoking the fallback see them, matching the old
-path. They're **not** reachable from resolved-IR code directly — the
-new evaluator's `evalR` only looks up via `RLocal`/`RGlobal`, not by
-name. This matches the review runner's usage (injected values are
-consumed by intercept callbacks, not by user code).
+Injected values are installed in two places:
+
+  - On the fallback `env.values`, so OLD-eval delegation and intercept
+    callbacks see the same environment they saw before.
+  - In the resolver as synthetic ambient globals, so unqualified name
+    lookups inside resolved bodies can reference injected values
+    directly, with the same precedence OLD eval gave `env.values`
+    (after lexical locals, before current-module globals).
 
 -}
 evalWithResolvedIRFromFilesAndIntercepts :
@@ -3482,8 +3438,8 @@ evalWithResolvedIRFromFilesAndIntercepts :
     -> Expression
     -> Types.EvalResult Value
 evalWithResolvedIRFromFilesAndIntercepts projectEnv additionalFiles injectedValues intercepts expression =
-    evalWithResolvedIRFromFilesAndInterceptsAndLimit
-        Nothing
+    evalWithResolvedIRFromFilesAndOptions
+        defaultResolvedIREvalOptions
         projectEnv
         additionalFiles
         injectedValues
@@ -3507,7 +3463,25 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit :
     -> Dict.Dict String Types.Intercept
     -> Expression
     -> Types.EvalResult Value
-evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
+evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps projectEnv additionalFiles injectedValues intercepts expression =
+    evalWithResolvedIRFromFilesAndOptions
+        { defaultResolvedIREvalOptions | maxSteps = maxSteps }
+        projectEnv
+        additionalFiles
+        injectedValues
+        intercepts
+        expression
+
+
+evalWithResolvedIRFromFilesAndOptions :
+    ResolvedIREvalOptions
+    -> ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> Types.EvalResult Value
+evalWithResolvedIRFromFilesAndOptions options (ProjectEnv projectEnv) additionalFiles injectedValues intercepts expression =
     let
         parsedModules =
             additionalFiles
@@ -3613,6 +3587,71 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                 mergedGlobalIdToName =
                     idAssignment.reverseIds
 
+                nextInjectedId : IR.GlobalId
+                nextInjectedId =
+                    idAssignment.next
+
+                injectedIdAssignment : { next : Int, ids : Dict.Dict String IR.GlobalId }
+                injectedIdAssignment =
+                    injectedValues
+                        |> Dict.foldl
+                            (\name _ inner ->
+                                { next = inner.next + 1
+                                , ids = Dict.insert name inner.next inner.ids
+                                }
+                            )
+                            { next = nextInjectedId
+                            , ids = Dict.empty
+                            }
+
+                injectedGlobalIds : Dict.Dict String IR.GlobalId
+                injectedGlobalIds =
+                    injectedIdAssignment.ids
+
+                mergedGlobalIdToNameWithInjected : Dict.Dict IR.GlobalId ( ModuleName, String )
+                mergedGlobalIdToNameWithInjected =
+                    injectedGlobalIds
+                        |> Dict.foldl
+                            (\name id acc -> Dict.insert id ( [], name ) acc)
+                            mergedGlobalIdToName
+
+                moduleDataForBodies :
+                    List
+                        { moduleName : ModuleName
+                        , importedNames : ImportedNames
+                        , functions : List FunctionImplementation
+                        }
+                moduleDataForBodies =
+                    if Dict.isEmpty injectedValues then
+                        summaries
+                            |> List.map
+                                (\summary ->
+                                    { moduleName = summary.moduleName
+                                    , importedNames = summary.importedNames
+                                    , functions = summary.functions
+                                    }
+                                )
+
+                    else
+                        env.shared.functions
+                            |> Dict.foldl
+                                (\moduleKey moduleFns acc ->
+                                    if Dict.member moduleKey coreFunctions then
+                                        acc
+
+                                    else
+                                        { moduleName = String.split "." moduleKey
+                                        , importedNames =
+                                            Dict.get moduleKey env.shared.moduleImports
+                                                |> Maybe.withDefault emptyImports
+                                        , functions =
+                                            moduleFns
+                                                |> Dict.foldl (\_ impl fnAcc -> impl :: fnAcc) []
+                                        }
+                                            :: acc
+                                )
+                                []
+
                 {- Pass 2: resolve each new declaration's body against the
                    merged globalIds table. Silently drop resolve errors —
                    the entry expression resolution below will surface any
@@ -3636,7 +3675,7 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                 -}
                 mergedBodies : Dict.Dict IR.GlobalId IR.RExpr
                 mergedBodies =
-                    summaries
+                    moduleDataForBodies
                         |> List.foldl
                             (\summary outer ->
                                 summary.functions
@@ -3657,6 +3696,7 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                                                             summary.moduleName
                                                             mergedGlobalIds
                                                             summary.importedNames
+                                                            |> Resolver.withAmbientGlobals injectedGlobalIds
                                                 in
                                                 case Resolver.resolveDeclaration ctx impl of
                                                     Ok rexpr ->
@@ -3769,7 +3809,17 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                 -}
                 precomputedGlobalsCache : Dict.Dict IR.GlobalId Value
                 precomputedGlobalsCache =
-                    projectEnv.resolved.globals
+                    injectedGlobalIds
+                        |> Dict.foldl
+                            (\name id acc ->
+                                case Dict.get name injectedValues of
+                                    Just value ->
+                                        Dict.insert id value acc
+
+                                    Nothing ->
+                                        acc
+                            )
+                            projectEnv.resolved.globals
 
                 installedBridge : Types.ResolveBridge
                 installedBridge =
@@ -3790,7 +3840,7 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                                     { locals = bodyLocals
                                     , globals = precomputedGlobalsCache
                                     , resolvedBodies = mergedBodies
-                                    , globalIdToName = mergedGlobalIdToName
+                                    , globalIdToName = mergedGlobalIdToNameWithInjected
                                     , nativeDispatchers = baseResolved.nativeDispatchers
                                     , higherOrderDispatchers = baseResolved.higherOrderDispatchers
                                     , kernelDispatchers = baseResolved.kernelDispatchers
@@ -3799,7 +3849,10 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                                     , fallbackConfig = bridgeCfg
                                     , currentModule = bridgeEnv.currentModule
                                     , callStack = bridgeEnv.callStack
-                                    , callDepth = 0
+                                    , callDepth = bridgeEnv.callDepth
+                                    , tailLoopTarget = Nothing
+                                    , tailLoopClosureSelfIndex = Nothing
+                                    , suspendStepBudget = False
                                     }
                             in
                             RE.evalR bridgeRenv payload.body
@@ -3845,18 +3898,19 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                     { trace = False
                     , coverage = False
                     , coverageProbeLines = Set.empty
-                    , maxSteps = maxSteps
+                    , maxSteps = options.maxSteps
                     , tcoTarget = Nothing
                     , callCounts = Nothing
                     , intercepts = intercepts
-                    , memoizedFunctions = MemoSpec.emptyRegistry
-                    , collectMemoStats = False
+                    , memoizedFunctions = options.memoizedFunctions
+                    , collectMemoStats = options.collectMemoStats
                     , useResolvedIR = False
                     }
 
                 resolverCtx : Resolver.ResolverContext
                 resolverCtx =
                     Resolver.initContextWithImports lastModule mergedGlobalIds finalImports
+                        |> Resolver.withAmbientGlobals injectedGlobalIds
             in
             case Resolver.resolveExpression resolverCtx (fakeNode expression) of
                 Err resolveError ->
@@ -3875,7 +3929,7 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                             { locals = []
                             , globals = precomputedGlobalsCache
                             , resolvedBodies = mergedBodies
-                            , globalIdToName = mergedGlobalIdToName
+                            , globalIdToName = mergedGlobalIdToNameWithInjected
                             , nativeDispatchers = baseResolved.nativeDispatchers
                             , higherOrderDispatchers = baseResolved.higherOrderDispatchers
                             , kernelDispatchers = baseResolved.kernelDispatchers
@@ -3885,6 +3939,9 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                             , currentModule = lastModule
                             , callStack = []
                             , callDepth = 0
+                            , tailLoopTarget = Nothing
+                            , tailLoopClosureSelfIndex = Nothing
+                            , suspendStepBudget = False
                             }
                     in
                     RE.evalR renv rexpr
@@ -3926,21 +3983,11 @@ intercepts Dict, the intercept function is called instead of the AST.
 This is the general-purpose hook for framework callbacks (BackendTask, Test)
 and for memoization/caching (elm-review cache markers).
 
-**Phase 6 status:** stays on OLD eval. A Phase 6 attempt routed this
-through `evalWithResolvedIRFromFilesAndIntercepts`, but the bridge
-function runs a full `resolveProject` pass 2 on the additional files
-**every call**, resolving every user-module body into `RExpr`. For the
-test-runner workload (one call per test module), that fixed per-call
-cost dominates the per-iteration eval savings and regresses the bench
-(`bench/testrunner-ab.sh` 1088 ms → 1220 ms on the 8-file subset;
-`bench/core-extra-full.sh` 8.04 s → 8.69 s on the 11-file suite).
-
-A future phase will need to make the resolved-project-extension cost
-amortize across repeated `evalWithIntercepts` calls — e.g. by caching
-the resolved view of the additional files keyed by content hash, or
-by letting the caller pre-extend once via `extendResolvedWithFiles`
-and pass an already-resolved `ProjectEnv` in. Until then, this entry
-point stays on OLD eval.
+This synchronous adapter now routes through
+`evalWithResolvedIRFromFilesAndIntercepts`. Yielding intercepts still
+surface as an error at this boundary, matching the legacy
+`EvalResult.toResult` behavior; callers that need to drive yields
+explicitly should use `evalWithInterceptsRaw`.
 
 -}
 evalWithIntercepts :
@@ -3949,132 +3996,25 @@ evalWithIntercepts :
     -> Dict.Dict String Types.Intercept
     -> Expression
     -> Result Error Value
-evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expression =
-    let
-        parseResult =
-            additionalSources
-                |> List.map
-                    (\source ->
-                        Elm.Parser.parseToFile source
-                            |> Result.mapError Types.ParsingError
-                    )
-                |> combineResults
-    in
-    case parseResult of
-        Err e ->
-            Err e
-
-        Ok parsedModules ->
-            let
-                modulesWithMeta =
-                    parsedModules
-                        |> List.map
-                            (\file ->
-                                { file = file
-                                , moduleName = fileModuleName file
-                                , interface = buildInterfaceFromFile file
-                                }
-                            )
-
-                additionalInterfaces =
-                    modulesWithMeta
-                        |> List.map (\m -> ( m.moduleName, m.interface ))
-                        |> ElmDict.fromList
-
-                allInterfaces =
-                    ElmDict.union additionalInterfaces projectEnv.allInterfaces
-
-                envResult =
-                    modulesWithMeta
-                        |> Result.MyExtra.combineFoldl
-                            (\parsedModule envAcc ->
-                                buildModuleEnv allInterfaces parsedModule envAcc
-                            )
-                            (Ok projectEnv.env)
-            in
-            case envResult of
-                Err e ->
-                    Err e
-
-                Ok env ->
-                    let
-                        lastModule =
-                            modulesWithMeta
-                                |> List.reverse
-                                |> List.head
-                                |> Maybe.map .moduleName
-                                |> Maybe.withDefault [ "Main" ]
-
-                        lastFile =
-                            parsedModules
-                                |> List.reverse
-                                |> List.head
-
-                        finalImports =
-                            case lastFile of
-                                Just file ->
-                                    (defaultImports ++ file.imports)
-                                        |> List.foldl (processImport allInterfaces) emptyImports
-
-                                Nothing ->
-                                    emptyImports
-
-                        lastModuleKey =
-                            Environment.moduleKey lastModule
-
-                        finalEnv =
-                            { env
-                                | currentModule = lastModule
-                                , currentModuleKey = lastModuleKey
-                                , currentModuleFunctions =
-                                    Dict.get lastModuleKey env.shared.functions
-                                        |> Maybe.withDefault Dict.empty
-                                , imports = finalImports
-                            }
-
-                        result =
-                            Eval.Expression.evalExpression
-                                (fakeNode expression)
-                                { trace = False
-                                , coverage = False
-                                , coverageProbeLines = Set.empty
-                                , maxSteps = Nothing
-                                , tcoTarget = Nothing
-                                , callCounts = Nothing
-                                , intercepts = intercepts
-                                , memoizedFunctions = MemoSpec.emptyRegistry
-                                , collectMemoStats = False
-                                , useResolvedIR = False
-                                }
-                                finalEnv
-                                |> EvalResult.toResult
-                    in
-                    Result.mapError Types.EvalError result
+evalWithIntercepts projectEnv additionalSources intercepts expression =
+    parseProjectSources additionalSources
+        |> Result.map (List.map .file)
+        |> Result.andThen
+            (\files ->
+                evalWithResolvedIRFromFilesAndIntercepts
+                    projectEnv
+                    files
+                    Dict.empty
+                    intercepts
+                    expression
+                    |> evalResultToSynchronousResult "evalWithIntercepts"
+            )
 
 
 {-| Like evalWithIntercepts but returns the raw EvalResult, preserving EvYield.
 
 The framework driver should handle EvYield in a loop (yield → handle effect →
 resume with result → check for more yields).
-
-**Phase 6 status:** stays on the OLD-evaluator path. A direct pass-
-through to `evalWithResolvedIRFromFilesAndIntercepts` would return
-only the first yield from an expression that yields multiple times
-(e.g. `myMap (\\n -> Helpers.marker n) [1, 2, 3]` with a yielding
-intercept on `Helpers.marker`). RE's `runRec` trampoline collapses
-`EvYield` up through `andThenValue` but doesn't re-enter the
-suspended computation when the driver resumes — the continuation
-captured at yield time only covers the innermost sub-expression, not
-the outer `List.map` / `myMap` loop. OLD eval's `evalExpression`
-propagates yields correctly because the whole recursion is
-`runRecursion`-based and each step re-enters at the right point.
-
-A future phase (likely alongside the `tcoLoop`-equivalent work that
-blocks Phases 3/4's entry-point migrations) will need to thread
-`EvYield` through `runRec`'s continuation stack so that a resumed
-yield re-enters the outer loop. Until then, `evalWithInterceptsRaw`
-must stay on OLD eval — all 10 yield-sequence tests in
-`tests/IncrementalEnvTests.elm` regress otherwise.
 
 -}
 evalWithInterceptsRaw :
@@ -4083,9 +4023,9 @@ evalWithInterceptsRaw :
     -> Dict.Dict String Types.Intercept
     -> Expression
     -> Types.EvalResult Value
-evalWithInterceptsRaw (ProjectEnv projectEnv) additionalSources intercepts expression =
+evalWithInterceptsRaw projectEnv additionalSources intercepts expression =
     evalWithInterceptsAndMemoRaw
-        (ProjectEnv projectEnv)
+        projectEnv
         additionalSources
         intercepts
         Set.empty
@@ -4099,18 +4039,8 @@ evalWithInterceptsAndMemoRaw :
     -> Set String
     -> Expression
     -> Types.EvalResult Value
-evalWithInterceptsAndMemoRaw (ProjectEnv projectEnv) additionalSources intercepts memoizedFunctions expression =
-    let
-        parseResult =
-            additionalSources
-                |> List.map
-                    (\source ->
-                        Elm.Parser.parseToFile source
-                            |> Result.mapError Types.ParsingError
-                    )
-                |> combineResults
-    in
-    case parseResult of
+evalWithInterceptsAndMemoRaw projectEnv additionalSources intercepts memoizedFunctions expression =
+    case parseProjectSources additionalSources of
         Err e ->
             case e of
                 Types.ParsingError _ ->
@@ -4120,92 +4050,16 @@ evalWithInterceptsAndMemoRaw (ProjectEnv projectEnv) additionalSources intercept
                     Types.EvErr evalErr
 
         Ok parsedModules ->
-            let
-                modulesWithMeta =
-                    parsedModules
-                        |> List.map
-                            (\file ->
-                                { file = file
-                                , moduleName = fileModuleName file
-                                , interface = buildInterfaceFromFile file
-                                }
-                            )
-
-                additionalInterfaces =
-                    modulesWithMeta
-                        |> List.map (\m -> ( m.moduleName, m.interface ))
-                        |> ElmDict.fromList
-
-                allInterfaces =
-                    ElmDict.union additionalInterfaces projectEnv.allInterfaces
-
-                envResult =
-                    modulesWithMeta
-                        |> Result.MyExtra.combineFoldl
-                            (\parsedModule envAcc ->
-                                buildModuleEnv allInterfaces parsedModule envAcc
-                            )
-                            (Ok projectEnv.env)
-            in
-            case envResult of
-                Err e ->
-                    case e of
-                        Types.ParsingError _ ->
-                            Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Env build parse error" }
-
-                        Types.EvalError evalErr ->
-                            Types.EvErr evalErr
-
-                Ok env ->
-                    let
-                        lastModule =
-                            modulesWithMeta
-                                |> List.reverse
-                                |> List.head
-                                |> Maybe.map .moduleName
-                                |> Maybe.withDefault [ "Main" ]
-
-                        lastFile =
-                            parsedModules
-                                |> List.reverse
-                                |> List.head
-
-                        finalImports =
-                            case lastFile of
-                                Just file ->
-                                    (defaultImports ++ file.imports)
-                                        |> List.foldl (processImport allInterfaces) emptyImports
-
-                                Nothing ->
-                                    emptyImports
-
-                        lastModuleKey =
-                            Environment.moduleKey lastModule
-
-                        finalEnv =
-                            { env
-                                | currentModule = lastModule
-                                , currentModuleKey = lastModuleKey
-                                , currentModuleFunctions =
-                                    Dict.get lastModuleKey env.shared.functions
-                                        |> Maybe.withDefault Dict.empty
-                                , imports = finalImports
-                            }
-                    in
-                    Eval.Expression.evalExpression
-                        (fakeNode expression)
-                        { trace = False
-                        , coverage = False
-                        , coverageProbeLines = Set.empty
-                        , maxSteps = Nothing
-                        , tcoTarget = Nothing
-                        , callCounts = Nothing
-                        , intercepts = intercepts
-                        , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
-                        , collectMemoStats = False
-                        , useResolvedIR = False
-                        }
-                        finalEnv
+            evalWithResolvedIRFromFilesAndOptions
+                { maxSteps = Nothing
+                , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
+                , collectMemoStats = False
+                }
+                projectEnv
+                (List.map .file parsedModules)
+                Dict.empty
+                intercepts
+                expression
 
 
 {-| Extend a ProjectEnv with additional pre-parsed Files, without evaluating
@@ -4439,6 +4293,195 @@ extendResolvedWithFiles additionalFiles (ProjectEnv projectEnv) =
                 | globalIds = mergedGlobalIds
                 , globalIdToName = mergedGlobalIdToName
                 , bodies = mergedBodies
+            }
+    in
+    refreshResolvedGlobals (ProjectEnv { projectEnv | resolved = newResolved })
+
+
+refreshResolvedModulesByName : List ModuleName -> ProjectEnv -> ProjectEnv
+refreshResolvedModulesByName moduleNames (ProjectEnv projectEnv) =
+    let
+        env : Env
+        env =
+            projectEnv.env
+
+        baseResolved : ResolvedProject
+        baseResolved =
+            projectEnv.resolved
+
+        targetModuleKeys : Set String
+        targetModuleKeys =
+            moduleNames
+                |> List.map Environment.moduleKey
+                |> Set.fromList
+
+        isTargetModule : ModuleName -> Bool
+        isTargetModule moduleName =
+            Set.member (Environment.moduleKey moduleName) targetModuleKeys
+
+        strippedGlobalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+        strippedGlobalIds =
+            baseResolved.globalIds
+                |> Dict.filter (\( moduleName, _ ) _ -> not (isTargetModule moduleName))
+
+        nextInitialId : IR.GlobalId
+        nextInitialId =
+            Dict.foldl (\_ id acc -> max id acc) -1 strippedGlobalIds + 1
+
+        moduleData :
+            List
+                { moduleName : ModuleName
+                , importedNames : ImportedNames
+                , functions : List FunctionImplementation
+                }
+        moduleData =
+            moduleNames
+                |> List.map
+                    (\moduleName ->
+                        let
+                            moduleKey : String
+                            moduleKey =
+                                Environment.moduleKey moduleName
+                        in
+                        { moduleName = moduleName
+                        , importedNames =
+                            Dict.get moduleKey env.shared.moduleImports
+                                |> Maybe.withDefault emptyImports
+                        , functions =
+                            Dict.get moduleKey env.shared.functions
+                                |> Maybe.withDefault Dict.empty
+                                |> Dict.foldl (\_ impl acc -> impl :: acc) []
+                        }
+                    )
+
+        idAssignment : { next : Int, ids : Dict.Dict ( ModuleName, String ) IR.GlobalId }
+        idAssignment =
+            moduleData
+                |> List.foldl
+                    (\summary outer ->
+                        summary.functions
+                            |> List.foldl
+                                (\impl inner ->
+                                    if isCustomTypeConstructor impl then
+                                        inner
+
+                                    else
+                                        let
+                                            name : String
+                                            name =
+                                                Node.value impl.name
+                                        in
+                                        { next = inner.next + 1
+                                        , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
+                                        }
+                                )
+                                outer
+                    )
+                    { next = nextInitialId
+                    , ids = strippedGlobalIds
+                    }
+
+        mergedGlobalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+        mergedGlobalIds =
+            idAssignment.ids
+
+        mergedGlobalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
+        mergedGlobalIdToName =
+            mergedGlobalIds
+                |> Dict.foldl
+                    (\key id acc -> Dict.insert id key acc)
+                    Dict.empty
+
+        mergedBodies : Dict.Dict IR.GlobalId IR.RExpr
+        mergedBodies =
+            moduleData
+                |> List.foldl
+                    (\summary outer ->
+                        summary.functions
+                            |> List.foldl
+                                (\impl inner ->
+                                    if isCustomTypeConstructor impl then
+                                        inner
+
+                                    else
+                                        let
+                                            name : String
+                                            name =
+                                                Node.value impl.name
+
+                                            ctx : Resolver.ResolverContext
+                                            ctx =
+                                                Resolver.initContextWithImports
+                                                    summary.moduleName
+                                                    mergedGlobalIds
+                                                    summary.importedNames
+                                        in
+                                        case Resolver.resolveDeclaration ctx impl of
+                                            Ok rexpr ->
+                                                case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                    Just id ->
+                                                        Dict.insert id rexpr inner
+
+                                                    Nothing ->
+                                                        inner
+
+                                            Err _ ->
+                                                inner
+                                )
+                                outer
+                    )
+                    (baseResolved.bodies
+                        |> Dict.filter (\id _ -> Dict.member id mergedGlobalIdToName)
+                    )
+
+        mergedErrors : List ResolveErrorEntry
+        mergedErrors =
+            moduleData
+                |> List.foldl
+                    (\summary outer ->
+                        summary.functions
+                            |> List.foldl
+                                (\impl inner ->
+                                    if isCustomTypeConstructor impl then
+                                        inner
+
+                                    else
+                                        let
+                                            name : String
+                                            name =
+                                                Node.value impl.name
+
+                                            ctx : Resolver.ResolverContext
+                                            ctx =
+                                                Resolver.initContextWithImports
+                                                    summary.moduleName
+                                                    mergedGlobalIds
+                                                    summary.importedNames
+                                        in
+                                        case Resolver.resolveDeclaration ctx impl of
+                                            Ok _ ->
+                                                inner
+
+                                            Err err ->
+                                                { moduleName = summary.moduleName
+                                                , name = name
+                                                , error = err
+                                                }
+                                                    :: inner
+                                )
+                                outer
+                    )
+                    (baseResolved.errors
+                        |> List.filter (\entry -> not (isTargetModule entry.moduleName))
+                    )
+
+        newResolved : ResolvedProject
+        newResolved =
+            { baseResolved
+                | globalIds = mergedGlobalIds
+                , globalIdToName = mergedGlobalIdToName
+                , bodies = mergedBodies
+                , errors = mergedErrors
             }
     in
     refreshResolvedGlobals (ProjectEnv { projectEnv | resolved = newResolved })
@@ -4789,7 +4832,8 @@ replaceModuleFunctionsInEnv moduleName newFunctions (ProjectEnv projectEnv) =
                     }
             }
     in
-    ProjectEnv { projectEnv | env = newEnv }
+    refreshResolvedModulesByName [ moduleName ]
+        (ProjectEnv { projectEnv | env = newEnv })
 
 
 {-| Normalize a single module in place. Returns the updated `ProjectEnv`
@@ -4842,6 +4886,7 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
 
         ( normalizedModuleFns, delta, normalizedPrecomputedFns ) =
             runModuleNormalizationToFixpoint
+                projectEnv.resolved
                 moduleName
                 moduleKey
                 moduleImports
@@ -4874,7 +4919,10 @@ normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
                     }
             }
     in
-    ( refreshResolvedGlobals (ProjectEnv { projectEnv | env = newEnv }), delta )
+    ( refreshResolvedModulesByName [ moduleName ]
+        (ProjectEnv { projectEnv | env = newEnv })
+    , delta
+    )
 
 
 {-| Merge a pre-computed normalization delta into the env, overlaying the
@@ -4925,7 +4973,8 @@ mergeModuleFunctionsIntoEnv moduleName deltaFns (ProjectEnv projectEnv) =
                     }
             }
     in
-    ProjectEnv { projectEnv | env = newEnv }
+    refreshResolvedModulesByName [ moduleName ]
+        (ProjectEnv { projectEnv | env = newEnv })
 
 
 {-| Rewrite the bodies of zero-arg functions in the specified user modules by
@@ -4938,6 +4987,10 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
         env : Env
         env =
             projectEnv.env
+
+        resolvedProject : ResolvedProject
+        resolvedProject =
+            projectEnv.resolved
 
         sharedImports : Dict.Dict String ImportedNames
         sharedImports =
@@ -4973,6 +5026,7 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                                         if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
                                             case
                                                 tryNormalizeConstant
+                                                    resolvedProject
                                                     moduleName
                                                     moduleKey
                                                     moduleImports
@@ -5013,7 +5067,7 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                     }
             }
     in
-    refreshResolvedGlobals
+    refreshResolvedModulesByName moduleNames
         (ProjectEnv
             { projectEnv | env = newEnv }
         )
@@ -5494,141 +5548,52 @@ makeImport moduleName maybeAlias maybeExposing =
         }
 
 
+projectImportsForModule : ProjectEnv -> ModuleName -> ImportedNames
+projectImportsForModule (ProjectEnv projectEnv) moduleName =
+    Dict.get (Environment.moduleKey moduleName) projectEnv.env.shared.moduleImports
+        |> Maybe.withDefault emptyImports
+
+
 {-| Evaluate an expression in the context of multiple modules.
 Modules should be provided in dependency order (dependencies before dependents).
 The expression is evaluated in the context of the last module.
 -}
 evalProject : List String -> Expression -> Result Error Value
 evalProject sources expression =
-    let
-        parseResult :
-            Result
-                Error
-                (List
-                    { file : File
-                    , moduleName : ModuleName
-                    , interface : List Exposed
-                    }
-                )
-        parseResult =
-            sources
-                |> List.map
-                    (\source ->
-                        source
-                            |> Elm.Parser.parseToFile
-                            |> Result.mapError ParsingError
-                            |> Result.andThen
-                                (\file ->
-                                    let
-                                        modName : ModuleName
-                                        modName =
-                                            fileModuleName file
-                                    in
-                                    Ok
-                                        { file = file
-                                        , moduleName = modName
-                                        , interface = buildInterfaceFromFile file
-                                        }
-                                )
-                    )
-                |> combineResults
-    in
-    case parseResult of
-        Err e ->
-            Err e
-
-        Ok parsedModules ->
-            let
-                -- Build combined interfaces: core + all user modules
-                userInterfaces : ElmDict.Dict ModuleName (List Exposed)
-                userInterfaces =
-                    parsedModules
-                        |> List.map (\m -> ( m.moduleName, m.interface ))
-                        |> ElmDict.fromList
-
-                allInterfaces : ElmDict.Dict ModuleName (List Exposed)
-                allInterfaces =
-                    ElmDict.union userInterfaces Core.dependency.interfaces
-
-                -- Build env with all modules' functions
-                envResult : Result Error Env
-                envResult =
-                    parsedModules
-                        |> Result.MyExtra.combineFoldl
-                            (\parsedModule envAcc ->
-                                buildModuleEnv allInterfaces parsedModule envAcc
-                            )
-                            (Ok
-                                { currentModule = []
-                                , currentModuleKey = ""
-                                , callStack = []
-                                , shared = { functions = coreFunctions, moduleImports = Dict.empty, resolveBridge = Types.noResolveBridge, precomputedValues = Dict.empty, tcoAnalyses = Dict.empty }
-                                , currentModuleFunctions = Dict.empty
-                                , letFunctions = Dict.empty
-                                , values = Dict.empty
-                                , imports = emptyImports
-                                , callDepth = 0
-                                , recursionCheck = Nothing
+    parseProjectSources sources
+        |> Result.andThen
+            (\parsedModules ->
+                buildProjectEnvFromParsed parsedModules
+                    |> Result.andThen
+                        (\projectEnv ->
+                            let
+                                lastModule : ModuleName
+                                lastModule =
+                                    parsedModules
+                                        |> List.reverse
+                                        |> List.head
+                                        |> Maybe.map .moduleName
+                                        |> Maybe.withDefault [ "Main" ]
+                            in
+                            evalResolvedExpressionInModuleContext
+                                "evalProject"
+                                { trace = False
+                                , coverage = False
+                                , coverageProbeLines = Set.empty
+                                , maxSteps = Nothing
+                                , tcoTarget = Nothing
+                                , callCounts = Nothing
+                                , intercepts = Dict.empty
+                                , memoizedFunctions = MemoSpec.emptyRegistry
+                                , collectMemoStats = False
+                                , useResolvedIR = False
                                 }
-                            )
-            in
-            case envResult of
-                Err e ->
-                    Err e
-
-                Ok env ->
-                    let
-                        -- Use the last module as the evaluation context
-                        lastModule : ModuleName
-                        lastModule =
-                            parsedModules
-                                |> List.reverse
-                                |> List.head
-                                |> Maybe.map .moduleName
-                                |> Maybe.withDefault [ "Main" ]
-
-                        -- Process imports for the last module
-                        lastFile : Maybe File
-                        lastFile =
-                            parsedModules
-                                |> List.reverse
-                                |> List.head
-                                |> Maybe.map .file
-
-                        finalImports : ImportedNames
-                        finalImports =
-                            case lastFile of
-                                Just file ->
-                                    (defaultImports ++ file.imports)
-                                        |> List.foldl (processImport allInterfaces) emptyImports
-
-                                Nothing ->
-                                    emptyImports
-
-                        lastModuleKey : String
-                        lastModuleKey =
-                            Environment.moduleKey lastModule
-
-                        finalEnv : Env
-                        finalEnv =
-                            { env
-                                | currentModule = lastModule
-                                , currentModuleKey = lastModuleKey
-                                , currentModuleFunctions =
-                                    Dict.get lastModuleKey env.shared.functions
-                                        |> Maybe.withDefault Dict.empty
-                                , imports = finalImports
-                            }
-
-                        result : Result Types.EvalErrorData Value
-                        result =
-                            Eval.Expression.evalExpression
-                                (fakeNode expression)
-                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
-                                finalEnv
-                                |> EvalResult.toResult
-                    in
-                    Result.mapError Types.EvalError result
+                                projectEnv
+                                lastModule
+                                (projectImportsForModule projectEnv lastModule)
+                                expression
+                        )
+            )
 
 
 buildModuleEnv :

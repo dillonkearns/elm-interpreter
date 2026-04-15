@@ -5,7 +5,7 @@ module BridgeParityTests exposing (suite)
 Each test runs the same top-level binding through two evaluator entry
 points and asserts the resulting `Value` is equal:
 
-  - `Eval.Module.evalWithEnv` — OLD eval (string-keyed
+  - `Eval.Module.evalWithEnvAndLimit Nothing` — OLD eval (string-keyed
     `Eval.Expression`).
   - `Eval.Module.evalWithResolvedIRFromFilesAndIntercepts` — the bridge
     path (resolved-IR `Eval.ResolvedExpression`, with `installedBridge`
@@ -126,7 +126,7 @@ parity label body =
                     let
                         oldResult : Result Error Value
                         oldResult =
-                            Eval.Module.evalWithEnv projectEnv [] expression
+                            Eval.Module.evalWithEnvAndLimit Nothing projectEnv [] expression
 
                         bridgeResult : Result Error Value
                         bridgeResult =

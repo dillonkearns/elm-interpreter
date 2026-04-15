@@ -680,7 +680,7 @@ result =
 
 
 {-| Diagnostic companion to `orderExtraExplicitViaExtendResolved`: runs
-the exact same shape through the OLD-eval path (`evalWithEnvFromFiles`)
+the exact same shape through the OLD-eval path (`evalWithEnvFromFilesAndLimit Nothing`)
 instead of the resolved-IR bridge. If this passes, OLD eval handles
 mutual let-rec correctly and the bug is isolated to the resolved-IR
 path (`extendResolvedWithFiles` + `evalWithResolvedIRFromFilesAndIntercepts`).
@@ -688,7 +688,7 @@ If it also fails, the bug predates the resolved-IR work entirely.
 -}
 orderExtraExplicitViaOldEvalPath : Test
 orderExtraExplicitViaOldEvalPath =
-    test "Order.Extra.explicit shape via evalWithEnvFromFiles (OLD eval) returns LT" <|
+    test "Order.Extra.explicit shape via evalWithEnvFromFilesAndLimit Nothing (OLD eval) returns LT" <|
         \_ ->
             let
                 userSource : String
@@ -780,7 +780,8 @@ result =
 
                         Ok wrapperFile ->
                             case
-                                Eval.Module.evalWithEnvFromFiles
+                                Eval.Module.evalWithEnvFromFilesAndLimit
+                                    Nothing
                                     projectEnv
                                     [ wrapperFile ]
                                     (FunctionOrValue [] "result")
@@ -971,5 +972,4 @@ result =
     Foo.fuzz2Like Foo.plus ( 3, 4 )
 """
             (Int 7)
-
 

@@ -848,3 +848,6 @@ kindToString kind =
 
         TailCall _ ->
             "TailCall"
+
+        TailCallLocals _ ->
+            "TailCallLocals"

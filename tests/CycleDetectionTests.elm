@@ -191,6 +191,20 @@ main = loop 0
                     ]
                     (Expression.FunctionOrValue [] "main")
                     |> expectInfiniteRecursion
+        , test "let-bound infinite recursion is caught" <|
+            \_ ->
+                Eval.Module.evalProject
+                    [ """module Main exposing (main)
+
+main =
+    let
+        loop x = loop x
+    in
+    loop 0
+"""
+                    ]
+                    (Expression.FunctionOrValue [] "main")
+                    |> expectInfiniteRecursion
         , test "infinite recursion with unchanged function arg is caught" <|
             \_ ->
                 -- The function arg doesn't change AND there's no progress.
