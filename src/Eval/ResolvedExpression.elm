@@ -35,6 +35,7 @@ import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node exposing (Node)
 import Elm.Syntax.Pattern exposing (QualifiedNameRef)
 import Environment
+import Eval.DelegateCounter as DelegateCounter
 import Eval.Expression
 import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedIR as IR exposing (RExpr(..))
@@ -3326,6 +3327,12 @@ delegateByName env moduleName name args =
             }
     in
     Eval.Expression.evalExpression fullExpr env.fallbackConfig dispatchEnv
+        |> (if DelegateCounter.enabled env.interceptsByGlobal then
+                DelegateCounter.emit moduleName name
+
+            else
+                identity
+           )
 
 
 

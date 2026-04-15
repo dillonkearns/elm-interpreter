@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndDelegateCallCounter, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -20,6 +20,7 @@ import Elm.Syntax.Type
 import Elm.Syntax.TypeAlias exposing (TypeAlias)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
 import Environment
+import Eval.DelegateCounter as DelegateCounter
 import Eval.Expression
 import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedExpression as RE
@@ -441,6 +442,7 @@ type alias ResolvedIREvalOptions =
     { maxSteps : Maybe Int
     , memoizedFunctions : MemoSpec.Registry
     , collectMemoStats : Bool
+    , collectDelegateCalls : Bool
     }
 
 
@@ -449,6 +451,7 @@ defaultResolvedIREvalOptions =
     { maxSteps = Nothing
     , memoizedFunctions = MemoSpec.emptyRegistry
     , collectMemoStats = False
+    , collectDelegateCalls = False
     }
 
 
@@ -2972,6 +2975,7 @@ evalWithEnvFromFilesAndMemo (ProjectEnv projectEnv) additionalFiles memoizedFunc
         { maxSteps = Nothing
         , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
         , collectMemoStats = collectMemoStats
+        , collectDelegateCalls = False
         }
         (ProjectEnv projectEnv)
         additionalFiles
@@ -3033,6 +3037,7 @@ evalWithEnvFromFilesAndValuesAndMemo (ProjectEnv projectEnv) additionalFiles inj
         { maxSteps = Nothing
         , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
         , collectMemoStats = collectMemoStats
+        , collectDelegateCalls = False
         }
         (ProjectEnv projectEnv)
         additionalFiles
@@ -3384,6 +3389,7 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw projectEnv additionalFiles 
         { maxSteps = Nothing
         , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
         , collectMemoStats = False
+        , collectDelegateCalls = False
         }
         projectEnv
         additionalFiles
@@ -3445,6 +3451,32 @@ evalWithResolvedIRFromFilesAndIntercepts projectEnv additionalFiles injectedValu
         injectedValues
         intercepts
         expression
+
+
+{-| Diagnostic companion to `evalWithResolvedIRFromFilesAndIntercepts`.
+
+Turns on the resolved evaluator's delegate counter and immediately strips
+the internal diagnostic yields before returning. For raw/yielding workflows,
+call `Eval.DelegateCounter.collect` after each resume to keep accumulating
+delegate counts across the whole evaluation.
+
+-}
+evalWithResolvedIRFromFilesAndInterceptsAndDelegateCallCounter :
+    ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> DelegateCounter.CollectedDelegateCalls Value
+evalWithResolvedIRFromFilesAndInterceptsAndDelegateCallCounter projectEnv additionalFiles injectedValues intercepts expression =
+    evalWithResolvedIRFromFilesAndOptions
+        { defaultResolvedIREvalOptions | collectDelegateCalls = True }
+        projectEnv
+        additionalFiles
+        injectedValues
+        intercepts
+        expression
+        |> DelegateCounter.collect
 
 
 {-| Step-budgeted variant. When `maxSteps` is `Just n`, the resolved-IR
@@ -3737,6 +3769,13 @@ evalWithResolvedIRFromFilesAndOptions options (ProjectEnv projectEnv) additional
                                         acc
                             )
                             Dict.empty
+                        |> (\resolvedIntercepts ->
+                                if options.collectDelegateCalls then
+                                    DelegateCounter.enableOnInterceptsByGlobal resolvedIntercepts
+
+                                else
+                                    resolvedIntercepts
+                           )
 
                 lastModule : ModuleName
                 lastModule =
@@ -4054,6 +4093,7 @@ evalWithInterceptsAndMemoRaw projectEnv additionalSources intercepts memoizedFun
                 { maxSteps = Nothing
                 , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                 , collectMemoStats = False
+                , collectDelegateCalls = False
                 }
                 projectEnv
                 (List.map .file parsedModules)
