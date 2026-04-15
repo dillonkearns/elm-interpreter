@@ -5876,6 +5876,8 @@ emptyImports =
     { aliases = Dict.empty
     , exposedValues = Dict.empty
     , exposedConstructors = Dict.empty
+    , qualifiedValues = Dict.empty
+    , qualifiedConstructors = Dict.empty
     }
 
 
@@ -5894,12 +5896,19 @@ processImport allInterfaces (Node _ imp) acc =
         canonicalPair =
             ( canonicalName, canonicalKey )
 
-        -- Always register the full module name as an alias to itself
+        visibleModuleKeys : List String
+        visibleModuleKeys =
+            case imp.moduleAlias of
+                Just (Node _ alias_) ->
+                    [ canonicalKey, Environment.moduleKey alias_ ]
+
+                Nothing ->
+                    [ canonicalKey ]
+
         withFullName : ImportedNames
         withFullName =
             { acc | aliases = Dict.insert canonicalKey canonicalPair acc.aliases }
 
-        -- If there's an alias, also register alias -> canonical
         withAlias : ImportedNames
         withAlias =
             case imp.moduleAlias of
@@ -5908,22 +5917,85 @@ processImport allInterfaces (Node _ imp) acc =
 
                 Nothing ->
                     withFullName
+
+        withQualifiedMembers : ImportedNames
+        withQualifiedMembers =
+            case ElmDict.get canonicalName allInterfaces of
+                Just interface ->
+                    List.foldl
+                        (registerQualifiedInterfaceItem canonicalPair visibleModuleKeys)
+                        withAlias
+                        interface
+
+                Nothing ->
+                    withAlias
     in
     case imp.exposingList of
         Nothing ->
-            withAlias
+            withQualifiedMembers
 
         Just (Node _ (All _)) ->
             -- exposing (..) - expose everything from the module's interface
             case ElmDict.get canonicalName allInterfaces of
                 Nothing ->
-                    withAlias
+                    withQualifiedMembers
 
                 Just interface ->
-                    List.foldl (exposeFromInterface canonicalPair) withAlias interface
+                    List.foldl (exposeFromInterface canonicalPair) withQualifiedMembers interface
 
         Just (Node _ (Explicit items)) ->
-            List.foldl (exposeExplicitItem allInterfaces canonicalPair) withAlias items
+            List.foldl (exposeExplicitItem allInterfaces canonicalPair) withQualifiedMembers items
+
+
+qualifiedImportKey : String -> String -> String
+qualifiedImportKey visibleModuleKey name =
+    visibleModuleKey ++ "." ++ name
+
+
+registerQualifiedInterfaceItem : ( ModuleName, String ) -> List String -> Exposed -> ImportedNames -> ImportedNames
+registerQualifiedInterfaceItem moduleNameWithKey visibleModuleKeys exposed acc =
+    let
+        insertQualifiedValue : String -> ImportedNames -> ImportedNames
+        insertQualifiedValue name importedNames =
+            { importedNames
+                | qualifiedValues =
+                    List.foldl
+                        (\visibleModuleKey dict ->
+                            Dict.insert (qualifiedImportKey visibleModuleKey name) moduleNameWithKey dict
+                        )
+                        importedNames.qualifiedValues
+                        visibleModuleKeys
+            }
+
+        insertQualifiedConstructors : List String -> ImportedNames -> ImportedNames
+        insertQualifiedConstructors constructors importedNames =
+            { importedNames
+                | qualifiedConstructors =
+                    constructors
+                        |> List.foldl
+                            (\name dict ->
+                                visibleModuleKeys
+                                    |> List.foldl
+                                        (\visibleModuleKey inner ->
+                                            Dict.insert (qualifiedImportKey visibleModuleKey name) moduleNameWithKey inner
+                                        )
+                                        dict
+                            )
+                            importedNames.qualifiedConstructors
+            }
+    in
+    case exposed of
+        Elm.Interface.Function name ->
+            insertQualifiedValue name acc
+
+        Elm.Interface.CustomType ( _, constructors ) ->
+            insertQualifiedConstructors constructors acc
+
+        Elm.Interface.Alias name ->
+            insertQualifiedValue name acc
+
+        Elm.Interface.Operator _ ->
+            acc
 
 
 exposeFromInterface : ( ModuleName, String ) -> Exposed -> ImportedNames -> ImportedNames

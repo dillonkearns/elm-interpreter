@@ -477,6 +477,145 @@ main =
             ]
             (list String)
             [ "visited: Rule1/MyProject/Page.elm" ]
+        , evalProjectTest "multi-arg function with constructor+as-pattern first param"
+            [ """module Types exposing (Node(..), Range)
+
+type alias Range =
+    { start : Int
+    , end : Int
+    }
+
+type Node a
+    = Node Range a
+"""
+            , """module Runner exposing (run)
+
+import Types exposing (Node(..))
+
+run ((Node range name) as whole) middle suffix =
+    let
+        repeated =
+            case whole of
+                Node _ value ->
+                    value
+    in
+    name
+        ++ ":"
+        ++ String.fromInt range.start
+        ++ ":"
+        ++ middle
+        ++ ":"
+        ++ suffix
+        ++ ":"
+        ++ repeated
+"""
+            , """module Main exposing (main)
+
+import Runner
+import Types exposing (Node(..))
+
+main =
+    Runner.run
+        (Node { start = 1, end = 2 } "Ctor")
+        "middle"
+        "suffix"
+"""
+            ]
+            String
+            "Ctor:1:middle:suffix:Ctor"
+        , evalProjectTest "valueConstructorOptimisticLayout callback shape evaluates correctly outside parser control flow"
+            [ """module Main exposing (main)
+
+import Elm.Syntax.Node exposing (Node(..))
+import Elm.Syntax.TypeAnnotation as TypeAnnotation
+
+prependComments left right =
+    left ++ right
+
+apply3 func a b c =
+    func a b c
+
+combine ((Node nameRange _) as name) commentsAfterName argumentsReverse =
+    let
+        fullRange =
+            case argumentsReverse.syntax of
+                (Node lastArgRange _) :: _ ->
+                    { start = nameRange.start, end = lastArgRange.end }
+
+                [] ->
+                    nameRange
+    in
+    { comments =
+        prependComments commentsAfterName argumentsReverse.comments
+    , syntax =
+        Node fullRange
+            { name = name
+            , arguments = List.reverse argumentsReverse.syntax
+            }
+    }
+
+main =
+    let
+        stringRange =
+            { start = { row = 3, column = 17 }, end = { row = 3, column = 23 } }
+
+        nameRange =
+            { start = { row = 3, column = 5 }, end = { row = 3, column = 16 } }
+
+        argNode =
+            Node stringRange (TypeAnnotation.Typed (Node stringRange ( [], "String" )) [])
+
+        result =
+            apply3 combine
+                (Node nameRange "Constructor")
+                []
+                { comments = []
+                , syntax = [ argNode ]
+                }
+    in
+    case result.syntax of
+        Node _ ctor ->
+            case ctor.arguments of
+                [ Node _ typeAnnotation ] ->
+                    case typeAnnotation of
+                        TypeAnnotation.Typed (Node _ ( [], "String" )) [] ->
+                            "ok"
+
+                        _ ->
+                            "wrong-type-annotation"
+
+                _ ->
+                    "wrong-arguments"
+"""
+            ]
+            String
+            "ok"
+        , evalProjectTest "partial application through `|>` preserves reducer accumulator shape"
+            [ """module Main exposing (main)
+
+reduce pResult ( commentsSoFar, itemsSoFar ) =
+    ( commentsSoFar ++ pResult.comments
+    , pResult.syntax :: itemsSoFar
+    )
+
+main =
+    let
+        pResult =
+            { comments = [ "c1" ]
+            , syntax = "item"
+            }
+
+        result =
+            ( [ "base" ], [] )
+                |> reduce pResult
+    in
+    case result of
+        ( comments, items ) ->
+            String.join ":" (comments ++ items)
+"""
+            ]
+            String
+            "base:c1:item"
         ]
 
 

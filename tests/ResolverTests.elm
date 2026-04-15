@@ -18,31 +18,54 @@ import Test exposing (Test, describe, test)
 {-| Build a ResolverContext with a hand-picked set of global ids. Covers the
 operators and helpers we reference in the test bodies below.
 -}
+commonGlobalIds : FastDict.Dict ( List String, String ) Int
+commonGlobalIds =
+    FastDict.fromList
+        -- Basics operators/functions the tests use
+        [ ( ( [ "Basics" ], "add" ), 1 )
+        , ( ( [ "Basics" ], "sub" ), 2 )
+        , ( ( [ "Basics" ], "mul" ), 3 )
+        , ( ( [ "Basics" ], "eq" ), 4 )
+        , ( ( [ "Basics" ], "neq" ), 5 )
+        , ( ( [ "Basics" ], "lt" ), 6 )
+        , ( ( [ "Basics" ], "append" ), 7 )
+        , ( ( [ "Basics" ], "apL" ), 8 )
+        , ( ( [ "Basics" ], "apR" ), 9 )
+        , ( ( [ "Basics" ], "and" ), 10 )
+        , ( ( [ "Basics" ], "or" ), 11 )
+        , ( ( [ "List" ], "cons" ), 20 )
+        , ( ( [ "List" ], "map" ), 21 )
+
+        -- User globals used in tests
+        , ( ( [ "Test" ], "helper" ), 100 )
+        , ( ( [ "Test" ], "value" ), 101 )
+        , ( ( [ "Other" ], "func" ), 200 )
+        , ( ( [ "Elm", "Parser" ], "parseToFile" ), 300 )
+        ]
+
+
 commonContext : ResolverContext
 commonContext =
-    Resolver.initContext [ "Test" ]
-        (FastDict.fromList
-            -- Basics operators/functions the tests use
-            [ ( ( [ "Basics" ], "add" ), 1 )
-            , ( ( [ "Basics" ], "sub" ), 2 )
-            , ( ( [ "Basics" ], "mul" ), 3 )
-            , ( ( [ "Basics" ], "eq" ), 4 )
-            , ( ( [ "Basics" ], "neq" ), 5 )
-            , ( ( [ "Basics" ], "lt" ), 6 )
-            , ( ( [ "Basics" ], "append" ), 7 )
-            , ( ( [ "Basics" ], "apL" ), 8 )
-            , ( ( [ "Basics" ], "apR" ), 9 )
-            , ( ( [ "Basics" ], "and" ), 10 )
-            , ( ( [ "Basics" ], "or" ), 11 )
-            , ( ( [ "List" ], "cons" ), 20 )
-            , ( ( [ "List" ], "map" ), 21 )
+    Resolver.initContext [ "Test" ] commonGlobalIds
 
-            -- User globals used in tests
-            , ( ( [ "Test" ], "helper" ), 100 )
-            , ( ( [ "Test" ], "value" ), 101 )
-            , ( ( [ "Other" ], "func" ), 200 )
-            ]
-        )
+
+parserQualifierContext : ResolverContext
+parserQualifierContext =
+    Resolver.initContextWithImports
+        [ "Review", "Test", "FailureMessage" ]
+        commonGlobalIds
+        { aliases =
+            FastDict.fromList
+                [ ( "Elm.Parser", ( [ "Elm", "Parser" ], "Elm.Parser" ) )
+                , ( "Parser", ( [ "Parser" ], "Parser" ) )
+                ]
+        , exposedValues = FastDict.empty
+        , exposedConstructors = FastDict.empty
+        , qualifiedValues =
+            FastDict.fromList
+                [ ( "Parser.parseToFile", ( [ "Elm", "Parser" ], "Elm.Parser" ) ) ]
+        , qualifiedConstructors = FastDict.empty
+        }
 
 
 {-| Parse a single Elm expression wrapped in a throwaway module. Extracts the
@@ -271,6 +294,19 @@ variableTests =
             \_ -> expectResolvesTo "helper" (RGlobal 100)
         , test "qualified global" <|
             \_ -> expectResolvesTo "Other.func" (RGlobal 200)
+        , test "qualified lookup can resolve by member when alias and module share a qualifier" <|
+            \_ ->
+                case parseExpr "Parser.parseToFile" of
+                    Ok expr ->
+                        case Resolver.resolveExpression parserQualifierContext expr of
+                            Ok actual ->
+                                Expect.equal (RGlobal 300) actual
+
+                            Err err ->
+                                Expect.fail ("resolve error: " ++ errorToString err)
+
+                    Err msg ->
+                        Expect.fail msg
         , test "uppercase unqualified → RCtor (canonical currentModule)" <|
             \_ ->
                 -- Unqualified `Nothing` in the `Test` module with no
@@ -565,10 +601,10 @@ caseTests =
                 expectResolvesTo
                     "case helper of\n        Just v -> v\n        Nothing -> 0"
                     (RCase (RGlobal 100)
-                        [ ( RPCtor { moduleName = [], name = "Just" } [ RPVar ]
+                        [ ( RPCtor { moduleName = [ "Test" ], name = "Just" } [ RPVar ]
                           , RLocal 0
                           )
-                        , ( RPCtor { moduleName = [], name = "Nothing" } []
+                        , ( RPCtor { moduleName = [ "Test" ], name = "Nothing" } []
                           , RInt 0
                           )
                         ]

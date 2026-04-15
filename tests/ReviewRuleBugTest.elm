@@ -112,12 +112,339 @@ suite =
 
                                     _ ->
                                         Expect.fail ("Unexpected EvalResult variant: " ++ Debug.toString evalResult)
+        , test "Parser.parseToFile keeps constructor argument types nested under custom type declarations" <|
+            \_ ->
+                case Eval.Module.buildProjectEnv packageSources of
+                    Err e ->
+                        Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)
+
+                    Ok projectEnv ->
+                        case Eval.Module.evalWithEnv projectEnv [ customTypeParseUserModule ] (Expression.FunctionOrValue [] "result") of
+                            Ok (String "ok") ->
+                                Expect.pass
+
+                            Ok value ->
+                                Expect.fail ("expected Ok (String \"ok\"), got: " ++ Debug.toString value)
+
+                            Err (Types.EvalError e) ->
+                                Expect.fail (Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                            Err e ->
+                                Expect.fail (Debug.toString e)
+        , test "ParserWithComments.manyWithoutReverse keeps a single element inside syntax list" <|
+            \_ ->
+                case Eval.Module.buildProjectEnv packageSources of
+                    Err e ->
+                        Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)
+
+                    Ok projectEnv ->
+                        case Eval.Module.evalWithEnv projectEnv [ manyWithoutReverseUserModule ] (Expression.FunctionOrValue [] "result") of
+                            Ok (String "ok") ->
+                                Expect.pass
+
+                            Ok value ->
+                                Expect.fail ("expected Ok (String \"ok\"), got: " ++ Debug.toString value)
+
+                            Err (Types.EvalError e) ->
+                                Expect.fail (Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                            Err e ->
+                                Expect.fail (Debug.toString e)
+        , test "ParserFast.map3 still wraps output when third parser comes from manyWithoutReverse" <|
+            \_ ->
+                case Eval.Module.buildProjectEnv packageSources of
+                    Err e ->
+                        Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)
+
+                    Ok projectEnv ->
+                        case Eval.Module.evalWithEnv projectEnv [ map3ManyUserModule ] (Expression.FunctionOrValue [] "result") of
+                            Ok (String "ok") ->
+                                Expect.pass
+
+                            Ok value ->
+                                Expect.fail ("expected Ok (String \"ok\"), got: " ++ Debug.toString value)
+
+                            Err (Types.EvalError e) ->
+                                Expect.fail (Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                            Err e ->
+                                Expect.fail (Debug.toString e)
+        , test "ParserWithComments.many keeps a single function declaration" <|
+            \_ ->
+                case Eval.Module.buildProjectEnv packageSources of
+                    Err e ->
+                        Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)
+
+                    Ok projectEnv ->
+                        case Eval.Module.evalWithEnv projectEnv [ manyFunctionDeclarationUserModule ] (Expression.FunctionOrValue [] "result") of
+                            Ok (String "ok") ->
+                                Expect.pass
+
+                            Ok value ->
+                                Expect.fail ("expected Ok (String \"ok\"), got: " ++ Debug.toString value)
+
+                            Err (Types.EvalError e) ->
+                                Expect.fail (Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                            Err e ->
+                                Expect.fail (Debug.toString e)
+        , test "ParserWithComments.many keeps a single custom type declaration" <|
+            \_ ->
+                case Eval.Module.buildProjectEnv packageSources of
+                    Err e ->
+                        Expect.fail ("buildProjectEnv failed: " ++ Debug.toString e)
+
+                    Ok projectEnv ->
+                        case Eval.Module.evalWithEnv projectEnv [ manyDeclarationUserModule ] (Expression.FunctionOrValue [] "result") of
+                            Ok (String "ok") ->
+                                Expect.pass
+
+                            Ok value ->
+                                Expect.fail ("expected Ok (String \"ok\"), got: " ++ Debug.toString value)
+
+                            Err (Types.EvalError e) ->
+                                Expect.fail (Debug.toString e.error ++ " [module: " ++ String.join "." e.currentModule ++ "]")
+
+                            Err e ->
+                                Expect.fail (Debug.toString e)
         ]
 
 
 userModule : String
 userModule =
     "module Main exposing (main)\n\nimport Review.Rule as Rule exposing (Rule)\nimport Review.Project as Project\n\nmain =\n    let\n        rule : Rule\n        rule =\n            Rule.newModuleRuleSchema \"TestRule\" ()\n                |> Rule.withSimpleExpressionVisitor (\\_ -> [])\n                |> Rule.fromModuleRuleSchema\n\n        project =\n            Project.new\n                |> Project.addModule { path = \"src/A.elm\", source = \"module A exposing (..)\\na = String.fromInt 42\\n\" }\n\n        result =\n            Rule.reviewV2 [ rule ] Nothing project\n    in\n    case result.errors of\n        [] -> \"OK_NO_ERRORS\"\n        _ -> \"GOT_ERRORS\"\n"
+
+
+customTypeParseUserModule : String
+customTypeParseUserModule =
+    """module Probe exposing (result)
+
+import Elm.Parser as Parser
+import Elm.Syntax.Declaration as Declaration
+import Elm.Syntax.Node exposing (Node(..))
+import Elm.Syntax.TypeAnnotation as TypeAnnotation
+
+
+sourceText : String
+sourceText =
+    \"\"\"module B exposing (SomeType(..))
+type SomeType
+  = Constructor String
+\"\"\"
+
+
+result : String
+result =
+    case Parser.parseToFile sourceText of
+        Ok file ->
+            case file.declarations of
+                [ Node _ declaration ] ->
+                    case declaration of
+                        Declaration.CustomTypeDeclaration { constructors } ->
+                            case constructors of
+                                [ Node _ constructor ] ->
+                                    case constructor.arguments of
+                                        [ Node _ typeAnnotation ] ->
+                                            case typeAnnotation of
+                                                TypeAnnotation.Typed (Node _ ( [], "String" )) [] ->
+                                                    "ok"
+
+                                                _ ->
+                                                    "wrong-type-annotation"
+
+                                        _ ->
+                                            "wrong-constructor-args"
+
+                                _ ->
+                                    "wrong-constructors:" ++ Debug.toString constructors
+
+                        _ ->
+                            "wrong-declaration:" ++ Debug.toString declaration
+
+                _ ->
+                    "wrong-declarations:" ++ Debug.toString file.declarations
+
+        Err _ ->
+            "parse-error"
+"""
+
+
+manyWithoutReverseUserModule : String
+manyWithoutReverseUserModule =
+    """module Probe exposing (result)
+
+import ParserFast
+import ParserWithComments
+
+
+result : String
+result =
+    case
+        ParserFast.run
+            (ParserWithComments.manyWithoutReverse
+                (ParserFast.symbol "A"
+                    { comments = []
+                    , syntax = "item"
+                    }
+                )
+            )
+            "A"
+    of
+        Ok parsed ->
+            case parsed.syntax of
+                [ "item" ] ->
+                    "ok"
+
+                _ ->
+                    Debug.toString parsed.syntax
+
+        Err _ ->
+            "parse-error"
+"""
+
+
+map3ManyUserModule : String
+map3ManyUserModule =
+    """module Probe exposing (result)
+
+import ParserFast
+import ParserWithComments
+
+
+result : String
+result =
+    case
+        ParserFast.run
+            (ParserFast.map3
+                (\\name _ argsReverse ->
+                    case ( name, argsReverse.syntax ) of
+                        ( "Ctor", [ "arg" ] ) ->
+                            "ok"
+
+                        _ ->
+                            "wrong:" ++ Debug.toString argsReverse
+                )
+                (ParserFast.symbol "Ctor" "Ctor")
+                (ParserFast.symbol "_" ())
+                (ParserWithComments.manyWithoutReverse
+                    (ParserFast.symbol "A"
+                        { comments = []
+                        , syntax = "arg"
+                        }
+                    )
+                )
+            )
+            "Ctor_A"
+    of
+        Ok parsed ->
+            parsed
+
+        Err _ ->
+            "parse-error"
+"""
+
+
+manyFunctionDeclarationUserModule : String
+manyFunctionDeclarationUserModule =
+    """module Probe exposing (result)
+
+import Elm.Parser.Declarations as Declarations
+import Elm.Syntax.Declaration as Declaration
+import Elm.Syntax.Expression exposing (Expression(..))
+import Elm.Syntax.Node as Node exposing (Node(..))
+import ParserFast
+import ParserWithComments
+
+
+sourceText : String
+sourceText =
+    \"\"\"a = 1
+\"\"\"
+
+
+result : String
+result =
+    case ParserFast.run (ParserWithComments.many Declarations.declaration) sourceText of
+        Ok parsed ->
+            case parsed.syntax of
+                [ Node _ declaration ] ->
+                    case declaration of
+                        Declaration.FunctionDeclaration function ->
+                            let
+                                (Node _ implementation) =
+                                    function.declaration
+                            in
+                            case Node.value implementation.expression of
+                                Integer 1 ->
+                                    "ok"
+
+                                _ ->
+                                    "wrong-expression"
+
+                        _ ->
+                            "wrong-declaration"
+
+                _ ->
+                    "wrong-declarations"
+
+        Err _ ->
+            "parse-error"
+"""
+
+
+manyDeclarationUserModule : String
+manyDeclarationUserModule =
+    """module Probe exposing (result)
+
+import Elm.Parser.Declarations as Declarations
+import Elm.Syntax.Declaration as Declaration
+import Elm.Syntax.Node exposing (Node(..))
+import Elm.Syntax.TypeAnnotation as TypeAnnotation
+import ParserFast
+import ParserWithComments
+
+
+sourceText : String
+sourceText =
+    \"\"\"type SomeType
+  = Constructor String
+\"\"\"
+
+
+result : String
+result =
+    case ParserFast.run (ParserWithComments.many Declarations.declaration) sourceText of
+        Ok parsed ->
+            case parsed.syntax of
+                [ Node _ declaration ] ->
+                    case declaration of
+                        Declaration.CustomTypeDeclaration { constructors } ->
+                            case constructors of
+                                [ Node _ constructor ] ->
+                                    case constructor.arguments of
+                                        [ Node _ typeAnnotation ] ->
+                                            case typeAnnotation of
+                                                TypeAnnotation.Typed (Node _ ( [], "String" )) [] ->
+                                                    "ok"
+
+                                                _ ->
+                                                    "wrong-type-annotation"
+
+                                        _ ->
+                                            "wrong-constructor-args"
+
+                                _ ->
+                                    "wrong-constructors"
+
+                        _ ->
+                            "wrong-declaration"
+
+                _ ->
+                    "wrong-declarations"
+
+        Err _ ->
+            "parse-error"
+"""
 
 
 packageSources : List String

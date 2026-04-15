@@ -3207,7 +3207,11 @@ evalUnqualifiedAfterLocalMiss name cfg env =
                                         Environment.callModuleFnNoStack
                             in
                             if List.isEmpty function.arguments then
-                                call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+                                Recursion.recurse
+                                    ( function.expression
+                                    , cfg
+                                    , callFn env.currentModule name env
+                                    )
 
                             else
                                 PartiallyApplied
@@ -3285,7 +3289,11 @@ evalQualifiedOrVariant moduleName name cfg env =
                                                 Environment.callModuleFnNoStack
                                     in
                                     if List.isEmpty function.arguments then
-                                        call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+                                        Recursion.recurse
+                                            ( function.expression
+                                            , cfg
+                                            , callFn env.currentModule name env
+                                            )
 
                                     else
                                         PartiallyApplied
@@ -3310,7 +3318,11 @@ evalQualifiedOrVariantSlow moduleName name cfg env =
         case findRecordAliasConstructor moduleName name env of
             Just ( resolvedModule, function ) ->
                 if List.isEmpty function.arguments then
-                    call (Just { moduleName = resolvedModule, name = name }) (AstImpl function.expression) cfg env
+                    Recursion.recurse
+                        ( function.expression
+                        , cfg
+                        , Environment.callModuleFn resolvedModule name env
+                        )
 
                 else
                     -- Record alias constructor — its body is a RecordExpr that
@@ -3399,6 +3411,41 @@ fixModuleName moduleName env =
                 ( moduleName, key )
 
 
+qualifiedImportKey : String -> String -> String
+qualifiedImportKey visibleModuleKey name =
+    visibleModuleKey ++ "." ++ name
+
+
+resolveQualifiedValueModule : ModuleName -> String -> Env -> ( ModuleName, String )
+resolveQualifiedValueModule moduleName name env =
+    let
+        visibleModuleKey : String
+        visibleModuleKey =
+            Environment.moduleKey moduleName
+    in
+    case Dict.get (qualifiedImportKey visibleModuleKey name) env.imports.qualifiedValues of
+        Just canonicalWithKey ->
+            canonicalWithKey
+
+        Nothing ->
+            fixModuleName moduleName env
+
+
+resolveQualifiedConstructorModule : ModuleName -> String -> Env -> ModuleName
+resolveQualifiedConstructorModule moduleName name env =
+    let
+        visibleModuleKey : String
+        visibleModuleKey =
+            Environment.moduleKey moduleName
+    in
+    case Dict.get (qualifiedImportKey visibleModuleKey name) env.imports.qualifiedConstructors of
+        Just ( canonicalModule, _ ) ->
+            canonicalModule
+
+        Nothing ->
+            Tuple.first (fixModuleName moduleName env)
+
+
 evalVariant : ModuleName -> Env -> String -> PartialResult Value
 evalVariant moduleName env name =
     -- True/False must remain as Bool values (not Custom) because
@@ -3461,7 +3508,7 @@ evalVariant moduleName env name =
                                 env.currentModule
 
                     else
-                        Tuple.first (fixModuleName moduleName env)
+                        resolveQualifiedConstructorModule moduleName name env
 
                 qualifiedNameRef : QualifiedNameRef
                 qualifiedNameRef =
@@ -3508,23 +3555,8 @@ evalNonVariant moduleName name cfg env =
                         env.currentModuleKey
 
                     else
-                        let
-                            rawKey : String
-                            rawKey =
-                                Environment.moduleKey moduleName
-                        in
-                        -- `import String.Diacritics as Diacritics` puts the
-                        -- raw key `"Diacritics"` in the AST but the cache is
-                        -- keyed on the canonical `"String.Diacritics"`.
-                        -- Resolve the alias before the cache lookup so
-                        -- aliased cross-module refs to heavy 0-arg constants
-                        -- don't silently re-walk the original AST.
-                        case Dict.get rawKey env.imports.aliases of
-                            Just ( _, canonicalKey ) ->
-                                canonicalKey
-
-                            Nothing ->
-                                rawKey
+                        resolveQualifiedValueModule moduleName name env
+                            |> Tuple.second
             in
             case
                 Dict.get precomputedModuleKey env.shared.precomputedValues
@@ -3559,39 +3591,12 @@ evalNonVariant moduleName name cfg env =
 
                                     else
                                         let
-                                            moduleNameKey : String
-                                            moduleNameKey =
-                                                Environment.moduleKey moduleName
+                                            ( resolvedModule, resolvedModuleKey ) =
+                                                resolveQualifiedValueModule moduleName name env
                                         in
-                                        -- Try direct lookup first (common case: module not aliased)
-                                        case Dict.get moduleNameKey env.shared.functions of
-                                            Just moduleDict ->
-                                                case Dict.get name moduleDict of
-                                                    Just f ->
-                                                        Just ( moduleName, moduleNameKey, f )
-
-                                                    Nothing ->
-                                                        -- Module exists but function not found.
-                                                        -- Could be aliased to a different module.
-                                                        case Dict.get moduleNameKey env.imports.aliases of
-                                                            Just ( canonical, canonicalKey ) ->
-                                                                Dict.get canonicalKey env.shared.functions
-                                                                    |> Maybe.andThen (Dict.get name)
-                                                                    |> Maybe.map (\f -> ( canonical, canonicalKey, f ))
-
-                                                            Nothing ->
-                                                                Nothing
-
-                                            Nothing ->
-                                                -- Module not found directly; try alias resolution
-                                                case Dict.get moduleNameKey env.imports.aliases of
-                                                    Just ( canonical, canonicalKey ) ->
-                                                        Dict.get canonicalKey env.shared.functions
-                                                            |> Maybe.andThen (Dict.get name)
-                                                            |> Maybe.map (\f -> ( canonical, canonicalKey, f ))
-
-                                                    Nothing ->
-                                                        Nothing
+                                        Dict.get resolvedModuleKey env.shared.functions
+                                            |> Maybe.andThen (Dict.get name)
+                                            |> Maybe.map (\f -> ( resolvedModule, resolvedModuleKey, f ))
                             in
                             case maybeFunction of
                                 Just ( resolvedModule, resolvedModuleKey, function ) ->
@@ -3606,7 +3611,19 @@ evalNonVariant moduleName name cfg env =
                                         -- below does — a top-level module function's body
                                         -- never references caller-site locals.
                                         if List.isEmpty function.arguments then
-                                            call (Just qualifiedNameRef) (AstImpl function.expression) cfg env
+                                            let
+                                                callFn =
+                                                    if cfg.trace then
+                                                        Environment.callModuleFn
+
+                                                    else
+                                                        Environment.callModuleFnNoStack
+                                            in
+                                            Recursion.recurse
+                                                ( function.expression
+                                                , cfg
+                                                , callFn resolvedModule name env
+                                                )
 
                                         else
                                             let

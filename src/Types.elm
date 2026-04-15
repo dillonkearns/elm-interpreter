@@ -334,6 +334,8 @@ type alias ImportedNames =
     { aliases : Dict String ( ModuleName, String )
     , exposedValues : Dict String ( ModuleName, String )
     , exposedConstructors : Dict String ( ModuleName, String )
+    , qualifiedValues : Dict String ( ModuleName, String )
+    , qualifiedConstructors : Dict String ( ModuleName, String )
     }
 
 

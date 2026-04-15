@@ -108,10 +108,12 @@ type TailLoopTarget
     = TailLoopGlobal
         { id : IR.GlobalId
         , arity : Int
+        , callDepth : Int
         , debugName : Maybe QualifiedNameRef
         }
     | TailLoopClosure
         { arity : Int
+        , callDepth : Int
         , prefixLocals : List Value
         , debugName : Maybe QualifiedNameRef
         }
@@ -2550,9 +2552,14 @@ tailLoopLocalsBuilder : REnv -> RExpr -> List RExpr -> Maybe (List Value -> List
 tailLoopLocalsBuilder env headExpr argExprs =
     case env.tailLoopTarget of
         Just (TailLoopGlobal target) ->
-            case headExpr of
-                RGlobal id ->
-                    if id == target.id && List.length argExprs == target.arity then
+            case ( headExpr, List.head env.callStack ) of
+                ( RGlobal id, currentFrame ) ->
+                    if
+                        id == target.id
+                            && List.length argExprs == target.arity
+                            && env.callDepth == target.callDepth
+                            && tailLoopTargetMatchesCurrentFrame target.debugName currentFrame
+                    then
                         Just (\argValues -> prependArgsToLocals [] argValues)
 
                     else
@@ -2564,7 +2571,12 @@ tailLoopLocalsBuilder env headExpr argExprs =
         Just (TailLoopClosure target) ->
             case ( env.tailLoopClosureSelfIndex, headExpr ) of
                 ( Just selfIndex, RLocal index ) ->
-                    if index == selfIndex && List.length argExprs == target.arity then
+                    if
+                        index == selfIndex
+                            && List.length argExprs == target.arity
+                            && env.callDepth == target.callDepth
+                            && tailLoopTargetMatchesCurrentFrame target.debugName (List.head env.callStack)
+                    then
                         Just (\argValues -> prependArgsToLocals target.prefixLocals argValues)
 
                     else
@@ -2575,6 +2587,16 @@ tailLoopLocalsBuilder env headExpr argExprs =
 
         Nothing ->
             Nothing
+
+
+tailLoopTargetMatchesCurrentFrame : Maybe QualifiedNameRef -> Maybe QualifiedNameRef -> Bool
+tailLoopTargetMatchesCurrentFrame targetDebugName currentFrame =
+    case targetDebugName of
+        Just qualifiedName ->
+            currentFrame == Just qualifiedName
+
+        Nothing ->
+            True
 
 
 maybeRunResolvedGlobalTailLoop :
@@ -2591,6 +2613,7 @@ maybeRunResolvedGlobalTailLoop env id lambda argValues =
                 (TailLoopGlobal
                     { id = id
                     , arity = lambda.arity
+                    , callDepth = env.callDepth + 1
                     , debugName = qualifiedNameForGlobal env id
                     }
                 )
@@ -2643,6 +2666,7 @@ maybeRunResolvedClosureTailLoop env debugName implBody selfClosure args =
                 env
                 (TailLoopClosure
                     { arity = List.length args
+                    , callDepth = env.callDepth + 1
                     , prefixLocals = prefixLocals
                     , debugName = debugName
                     }

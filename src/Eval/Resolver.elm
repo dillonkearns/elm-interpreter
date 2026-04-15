@@ -138,7 +138,14 @@ emptyImports =
     { aliases = FastDict.empty
     , exposedValues = FastDict.empty
     , exposedConstructors = FastDict.empty
+    , qualifiedValues = FastDict.empty
+    , qualifiedConstructors = FastDict.empty
     }
+
+
+qualifiedImportKey : String -> String -> String
+qualifiedImportKey visibleModuleKey name =
+    visibleModuleKey ++ "." ++ name
 
 
 {-| Resolve a top-level function declaration. Treats `let f a b = body in ...`
@@ -414,6 +421,10 @@ resolveFunctionOrValue ctx moduleName name =
 
     else
         let
+            visibleModuleKey : String
+            visibleModuleKey =
+                Environment.moduleKey moduleName
+
             -- Canonicalize the source module name through the imports
             -- alias table. `import Review.Project as Project` gives an
             -- `aliases` entry keyed by `"Project"` (the alias's module
@@ -425,23 +436,37 @@ resolveFunctionOrValue ctx moduleName name =
             -- qualified without an alias).
             canonicalModule : List String
             canonicalModule =
-                case FastDict.get (Environment.moduleKey moduleName) ctx.imports.aliases of
+                case FastDict.get (qualifiedImportKey visibleModuleKey name) ctx.imports.qualifiedValues of
                     Just ( canonical, _ ) ->
                         canonical
 
                     Nothing ->
-                        moduleName
+                        case FastDict.get visibleModuleKey ctx.imports.aliases of
+                            Just ( canonical, _ ) ->
+                                canonical
+
+                            Nothing ->
+                                moduleName
+
+            canonicalConstructorModule : List String
+            canonicalConstructorModule =
+                case FastDict.get (qualifiedImportKey visibleModuleKey name) ctx.imports.qualifiedConstructors of
+                    Just ( canonical, _ ) ->
+                        canonical
+
+                    Nothing ->
+                        canonicalModule
         in
         if isConstructorName name then
             -- Same `RGlobal`-first treatment as the unqualified branch
             -- so record aliases dispatch through their synthesized
             -- function body instead of getting wrapped in a `Custom`.
-            case FastDict.get ( canonicalModule, name ) ctx.globalIds of
+            case FastDict.get ( canonicalConstructorModule, name ) ctx.globalIds of
                 Just id ->
                     Ok (RGlobal id)
 
                 Nothing ->
-                    Ok (RCtor { moduleName = canonicalModule, name = name })
+                    Ok (RCtor { moduleName = canonicalConstructorModule, name = name })
 
         else
             resolveGlobal ctx canonicalModule name
@@ -1143,12 +1168,17 @@ canonicalizePatternConstructorModule ctx qualRef =
                 ctx.currentModule
 
     else
-        case FastDict.get (Environment.moduleKey qualRef.moduleName) ctx.imports.aliases of
+        case FastDict.get (qualifiedImportKey (Environment.moduleKey qualRef.moduleName) qualRef.name) ctx.imports.qualifiedConstructors of
             Just ( canonicalModule, _ ) ->
                 canonicalModule
 
             Nothing ->
-                qualRef.moduleName
+                case FastDict.get (Environment.moduleKey qualRef.moduleName) ctx.imports.aliases of
+                    Just ( canonicalModule, _ ) ->
+                        canonicalModule
+
+                    Nothing ->
+                        qualRef.moduleName
 
 
 {-| Prepend a list of bound names to an existing locals stack. `bindings` is

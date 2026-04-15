@@ -178,6 +178,8 @@ emptyImports =
     { aliases = Dict.empty
     , exposedValues = Dict.empty
     , exposedConstructors = Dict.empty
+    , qualifiedValues = Dict.empty
+    , qualifiedConstructors = Dict.empty
     }
 
 
