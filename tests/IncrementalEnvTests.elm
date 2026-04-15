@@ -32,7 +32,9 @@ suite =
             ]
         , describe "evalWithEnvFromFilesAndValues"
             [ valueInjectionSimple
+            , valueInjectionDirectLookup
             , valueInjectionOverridesLocal
+            , valueInjectionShadowsModuleBinding
             , valueInjectionWithModuleCode
             ]
         , describe "function intercepts"
@@ -277,6 +279,42 @@ valueInjectionSimple =
                     Expect.fail ("Eval error: " ++ Debug.toString e)
 
 
+{-| Test: a direct `FunctionOrValue` lookup can resolve an injected value
+without routing through a wrapper top-level declaration.
+-}
+valueInjectionDirectLookup : Test
+valueInjectionDirectLookup =
+    test "direct lookup of injected value works" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nplaceholder = 0\n"
+
+                injected =
+                    FastDict.singleton "injectedVal" (Int 41)
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Err e ->
+                    Expect.fail ("Build error: " ++ Debug.toString e)
+
+                Ok env ->
+                    case
+                        Eval.Module.evalWithEnvFromFilesAndValues
+                            env
+                            []
+                            injected
+                            (Expression.FunctionOrValue [] "injectedVal")
+                    of
+                        Ok (Int 41) ->
+                            Expect.pass
+
+                        Ok other ->
+                            Expect.fail ("Expected Int 41, got: " ++ Debug.toString other)
+
+                        Err e ->
+                            Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
 {-| Test: injected value overrides a local let binding.
 -}
 valueInjectionOverridesLocal : Test
@@ -289,6 +327,31 @@ valueInjectionOverridesLocal =
 
                 injected =
                     FastDict.singleton "injectedVal" (Int 32)
+            in
+            case evalWithInjectedValues [ source ] injected "results" of
+                Ok (Int 42) ->
+                    Expect.pass
+
+                Ok other ->
+                    Expect.fail ("Expected Int 42, got: " ++ Debug.toString other)
+
+                Err e ->
+                    Expect.fail ("Eval error: " ++ Debug.toString e)
+
+
+{-| Test: injected values shadow same-named module globals, matching OLD eval's
+`env.values` precedence over `currentModuleFunctions`.
+-}
+valueInjectionShadowsModuleBinding : Test
+valueInjectionShadowsModuleBinding =
+    test "injected value shadows same-named module binding" <|
+        \_ ->
+            let
+                source =
+                    "module Main exposing (..)\n\nx = 1\n\nresults = x + 1\n"
+
+                injected =
+                    FastDict.singleton "x" (Int 41)
             in
             case evalWithInjectedValues [ source ] injected "results" of
                 Ok (Int 42) ->

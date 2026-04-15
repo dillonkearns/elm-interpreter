@@ -119,10 +119,7 @@ innerCompare l r env =
 
 
         ( Custom lname lvalues, Custom rname rvalues ) ->
-            if lname.moduleName /= rname.moduleName then
-                inner lname.moduleName rname.moduleName
-
-            else if lname.name /= rname.name then
+            if lname.name /= rname.name then
                 -- Special case: Dict/Set nodes with different constructors
                 -- (e.g., RBNode vs RBEmpty). Convert to sorted lists for comparison,
                 -- mirroring Elm's _Utils_eqHelp which converts Dict/Set to lists.
@@ -350,9 +347,6 @@ equalValues l r =
 
                 else
                     False
-
-            else if lname.moduleName /= rname.moduleName then
-                False
 
             else
                 case lname.name of

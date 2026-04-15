@@ -11,6 +11,7 @@ targeted way.
 The `fixpoint*` and `listFusion*` flags gate the two passes that run
 unconditionally today in `runModuleNormalizationToFixpoint`. These
 are the knobs the A/B benchmark harness wants.
+
 -}
 
 
@@ -81,6 +82,7 @@ getting pre-computed at load time and fall back to runtime re-eval
 per reference. Callers who know their project hits this pattern
 (e.g. `String.Diacritics.lookupArray ← lookupTable`) can bump
 `fixpointPasses` to 2 or 3 via the flag plumbing.
+
 -}
 default : NormalizationFlags
 default =

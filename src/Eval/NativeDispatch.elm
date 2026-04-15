@@ -140,7 +140,7 @@ dispatcherList =
     , ( [ "Basics" ], "sub", binaryArith (-) (-) )
     , ( [ "Basics" ], "mul", binaryArith (*) (*) )
     , ( [ "Basics" ], "fdiv", floatOnly (/) )
-    , ( [ "Basics" ], "idiv", intOnly (//) )
+    , ( [ "Basics" ], "idiv", idivDispatcher )
     , ( [ "Basics" ], "negate", negateDispatcher )
     , ( [ "Basics" ], "eq", eqDispatcher )
     , ( [ "Basics" ], "neq", neqDispatcher )
@@ -196,6 +196,19 @@ intOnly op args =
     case args of
         [ Int a, Int b ] ->
             Just (Int (op a b))
+
+        _ ->
+            Nothing
+
+
+idivDispatcher : NativeDispatcher
+idivDispatcher args =
+    case args of
+        [ Int _, Int 0 ] ->
+            Nothing
+
+        [ Int a, Int b ] ->
+            Just (Int (a // b))
 
         _ ->
             Nothing

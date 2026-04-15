@@ -354,6 +354,7 @@ type EvalErrorKind
     | NameError String
     | Todo String
     | TailCall EnvValues
+    | TailCallLocals (List Value)
 
 
 evalErrorKindToString : EvalErrorKind -> String
@@ -373,6 +374,9 @@ evalErrorKindToString kind =
 
         TailCall _ ->
             "TailCall (internal TCO signal)"
+
+        TailCallLocals _ ->
+            "TailCallLocals (internal resolved TCO signal)"
 
 
 {-| Pack a Range into a single Int for use in Set Int.

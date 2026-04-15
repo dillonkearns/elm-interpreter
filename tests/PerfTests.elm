@@ -8,6 +8,7 @@ import Elm.Syntax.Node as Node exposing (Node(..))
 import Eval
 import Eval.Module
 import Expect
+import FastDict as Dict
 import ListFusion
 import TcoAnalysis
 import Test exposing (Test, describe, test)
@@ -26,6 +27,7 @@ suite =
         , dictInliningTests
         , listFusionTests
         , normalizationLosslessnessTests
+        , resolvedNormalizationTests
         , spineCollectionTests
         , overApplicationTests
         , aliasedPrecomputedLookupTests
@@ -280,6 +282,48 @@ normalizationLosslessnessTests =
 
                             _ ->
                                 Expect.pass
+        ]
+
+
+resolvedNormalizationTests : Test
+resolvedNormalizationTests =
+    describe "resolved-IR normalization"
+        [ test "extendWithFilesNormalized precomputes higher-order zero-arg constant" <|
+            \_ ->
+                let
+                    innerSource : String
+                    innerSource =
+                        """module Inner exposing (mapped)
+
+mapped : List Int
+mapped =
+    List.map (\\n -> n + 1) [ 1, 2, 3 ]
+"""
+
+                    parseFile : String -> Result String Elm.Syntax.File.File
+                    parseFile src =
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError (\_ -> "parse error")
+                in
+                case ( Eval.Module.buildProjectEnv [], parseFile innerSource ) of
+                    ( Ok baseEnv, Ok innerFile ) ->
+                        case Eval.Module.extendWithFilesNormalized baseEnv [ innerFile ] of
+                            Ok projectEnv ->
+                                case Eval.Module.getModulePrecomputedValues [ "Inner" ] projectEnv |> Dict.get "mapped" of
+                                    Just (List [ Int 2, Int 3, Int 4 ]) ->
+                                        Expect.pass
+
+                                    Just other ->
+                                        Expect.fail ("Expected precomputed [2,3,4], got: " ++ Debug.toString other)
+
+                                    Nothing ->
+                                        Expect.fail "mapped was not precomputed during normalization"
+
+                            Err e ->
+                                Expect.fail ("extendWithFilesNormalized failed: " ++ Debug.toString e)
+
+                    _ ->
+                        Expect.fail "setup failed (parse or buildProjectEnv)"
         ]
 
 
@@ -928,6 +972,39 @@ tcoProofTests =
                             [ source ]
                             (Expression.FunctionOrValue [] "main")
                             |> Expect.equal (Ok (Int 50005000))
+
+                    Err e ->
+                        Expect.fail (Debug.toString e)
+        , test "Eval.evalWithMaxSteps countdown 100000 within 110000 steps" <|
+            \_ ->
+                Eval.evalWithMaxSteps (Just 110000)
+                    "let countdown n = if n <= 0 then 0 else countdown (n - 1) in countdown 100000"
+                    |> Expect.equal (Ok (Int 0))
+        , test "let-defined case recursion within step budget" <|
+            \_ ->
+                let
+                    source =
+                        """module T exposing (main)
+main =
+    let
+        loop xs acc =
+            case xs of
+                [] ->
+                    acc
+
+                x :: rest ->
+                    loop rest (acc + x)
+    in
+    loop [1,2,3,4,5,6,7,8,9,10] 0
+"""
+                in
+                case Eval.Module.buildProjectEnv [] of
+                    Ok env ->
+                        Eval.Module.evalWithEnvAndLimit (Just 5000)
+                            env
+                            [ source ]
+                            (Expression.FunctionOrValue [] "main")
+                            |> Expect.equal (Ok (Int 55))
 
                     Err e ->
                         Expect.fail (Debug.toString e)

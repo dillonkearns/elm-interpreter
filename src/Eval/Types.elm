@@ -236,6 +236,9 @@ evalErrorToString { callStack, error } =
 
                 TailCall _ ->
                     "TailCall (internal TCO signal)"
+
+                TailCallLocals _ ->
+                    "TailCallLocals (internal resolved TCO signal)"
     in
     messageWithType
         ++ "\nCall stack:\n - "

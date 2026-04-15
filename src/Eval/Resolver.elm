@@ -6,6 +6,7 @@ module Eval.Resolver exposing
     , resolveDeclaration
     , resolveExpression
     , resolvePattern
+    , withAmbientGlobals
     )
 
 {-| Parse-time resolution pass: turn an `Elm.Syntax.Expression.Expression`
@@ -78,6 +79,7 @@ type alias ResolverContext =
     , globalIds : FastDict.Dict ( List String, String ) GlobalId
     , currentModule : List String
     , imports : ImportedNames
+    , ambientGlobals : FastDict.Dict String GlobalId
     }
 
 
@@ -98,6 +100,7 @@ initContext currentModule globalIds =
     , globalIds = globalIds
     , currentModule = currentModule
     , imports = emptyImports
+    , ambientGlobals = FastDict.empty
     }
 
 
@@ -121,7 +124,13 @@ initContextWithImports currentModule globalIds imports =
     , globalIds = globalIds
     , currentModule = currentModule
     , imports = imports
+    , ambientGlobals = FastDict.empty
     }
+
+
+withAmbientGlobals : FastDict.Dict String GlobalId -> ResolverContext -> ResolverContext
+withAmbientGlobals ambientGlobals ctx =
+    { ctx | ambientGlobals = ambientGlobals }
 
 
 emptyImports : ImportedNames
@@ -376,27 +385,32 @@ resolveFunctionOrValue ctx moduleName name =
                                     Ok (RCtor { moduleName = ctx.currentModule, name = name })
 
                 else
-                    -- Unqualified value: try the current module first
-                    -- (matches Elm's semantics for module-local references),
-                    -- then fall back to imported exposed values, then to
-                    -- the explicit-empty key that the caller may have
-                    -- pre-populated.
-                    case FastDict.get ( ctx.currentModule, name ) ctx.globalIds of
+                    case FastDict.get name ctx.ambientGlobals of
                         Just id ->
                             Ok (RGlobal id)
 
                         Nothing ->
-                            case FastDict.get name ctx.imports.exposedValues of
-                                Just ( canonicalModule, _ ) ->
-                                    case FastDict.get ( canonicalModule, name ) ctx.globalIds of
-                                        Just id ->
-                                            Ok (RGlobal id)
+                            -- Unqualified value: try the current module first
+                            -- (matches Elm's semantics for module-local references),
+                            -- then fall back to imported exposed values, then to
+                            -- the explicit-empty key that the caller may have
+                            -- pre-populated.
+                            case FastDict.get ( ctx.currentModule, name ) ctx.globalIds of
+                                Just id ->
+                                    Ok (RGlobal id)
+
+                                Nothing ->
+                                    case FastDict.get name ctx.imports.exposedValues of
+                                        Just ( canonicalModule, _ ) ->
+                                            case FastDict.get ( canonicalModule, name ) ctx.globalIds of
+                                                Just id ->
+                                                    Ok (RGlobal id)
+
+                                                Nothing ->
+                                                    resolveGlobal ctx [] name
 
                                         Nothing ->
                                             resolveGlobal ctx [] name
-
-                                Nothing ->
-                                    resolveGlobal ctx [] name
 
     else
         let
@@ -1058,9 +1072,14 @@ resolvePattern ctx (Node _ pat) =
             resolvePatternList ctx args
                 |> Result.map
                     (\{ patterns, bindings } ->
+                        let
+                            canonicalModule : List String
+                            canonicalModule =
+                                canonicalizePatternConstructorModule ctx qualRef
+                        in
                         { resolved =
                             RPCtor
-                                { moduleName = qualRef.moduleName
+                                { moduleName = canonicalModule
                                 , name = qualRef.name
                                 }
                                 patterns
@@ -1108,6 +1127,28 @@ resolvePatternList :
     -> Result ResolveError { patterns : List RPattern, bindings : List String }
 resolvePatternList =
     resolvePatterns
+
+
+canonicalizePatternConstructorModule :
+    ResolverContext
+    -> { moduleName : List String, name : String }
+    -> List String
+canonicalizePatternConstructorModule ctx qualRef =
+    if List.isEmpty qualRef.moduleName then
+        case FastDict.get qualRef.name ctx.imports.exposedConstructors of
+            Just ( canonicalModule, _ ) ->
+                canonicalModule
+
+            Nothing ->
+                ctx.currentModule
+
+    else
+        case FastDict.get (Environment.moduleKey qualRef.moduleName) ctx.imports.aliases of
+            Just ( canonicalModule, _ ) ->
+                canonicalModule
+
+            Nothing ->
+                qualRef.moduleName
 
 
 {-| Prepend a list of bound names to an existing locals stack. `bindings` is
