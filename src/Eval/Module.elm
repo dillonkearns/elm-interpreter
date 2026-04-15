@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndDelegateCallCounter, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndDelegateCallCounter, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithResolvedIRFromFilesAndInterceptsAndLogDelegateCalls, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, mergeNormalizedModulesIntoEnv, normalizeOneModuleInEnv, normalizeSummaries, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -75,6 +75,7 @@ coreFunctions =
 type alias ResolvedProject =
     { globalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
     , bodies : Dict.Dict IR.GlobalId IR.RExpr
+    , tailRecursiveGlobals : Dict.Dict IR.GlobalId Bool
     , globalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
     , nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
     , higherOrderDispatchers : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
@@ -304,6 +305,7 @@ evalResolvedExpressionInModuleContext context cfg (ProjectEnv projectEnv) module
                             { locals = bodyLocals
                             , globals = projectEnv.resolved.globals
                             , resolvedBodies = projectEnv.resolved.bodies
+                            , tailRecursiveGlobals = projectEnv.resolved.tailRecursiveGlobals
                             , globalIdToName = projectEnv.resolved.globalIdToName
                             , nativeDispatchers = projectEnv.resolved.nativeDispatchers
                             , higherOrderDispatchers = projectEnv.resolved.higherOrderDispatchers
@@ -317,6 +319,7 @@ evalResolvedExpressionInModuleContext context cfg (ProjectEnv projectEnv) module
                             , tailLoopTarget = Nothing
                             , tailLoopClosureSelfIndex = Nothing
                             , suspendStepBudget = False
+                            , logDelegateCalls = False
                             }
                     in
                     RE.evalR bridgeRenv payload.body
@@ -360,6 +363,7 @@ evalResolvedExpressionInModuleContext context cfg (ProjectEnv projectEnv) module
                     { locals = []
                     , globals = projectEnv.resolved.globals
                     , resolvedBodies = projectEnv.resolved.bodies
+                    , tailRecursiveGlobals = projectEnv.resolved.tailRecursiveGlobals
                     , globalIdToName = projectEnv.resolved.globalIdToName
                     , nativeDispatchers = projectEnv.resolved.nativeDispatchers
                     , higherOrderDispatchers = projectEnv.resolved.higherOrderDispatchers
@@ -373,6 +377,7 @@ evalResolvedExpressionInModuleContext context cfg (ProjectEnv projectEnv) module
                     , tailLoopTarget = Nothing
                     , tailLoopClosureSelfIndex = Nothing
                     , suspendStepBudget = False
+                    , logDelegateCalls = False
                     }
             in
             evalResultToSynchronousResult context (RE.evalR renv rexpr)
@@ -443,6 +448,7 @@ type alias ResolvedIREvalOptions =
     , memoizedFunctions : MemoSpec.Registry
     , collectMemoStats : Bool
     , collectDelegateCalls : Bool
+    , logDelegateCalls : Bool
     }
 
 
@@ -452,6 +458,7 @@ defaultResolvedIREvalOptions =
     , memoizedFunctions = MemoSpec.emptyRegistry
     , collectMemoStats = False
     , collectDelegateCalls = False
+    , logDelegateCalls = False
     }
 
 
@@ -513,9 +520,17 @@ self-referential application.
 isCustomTypeConstructor : FunctionImplementation -> Bool
 isCustomTypeConstructor impl =
     let
+        rawImplName : String
+        rawImplName =
+            Node.value impl.name
+
         implName : String
         implName =
-            Node.value impl.name
+            rawImplName
+                |> String.split "."
+                |> List.reverse
+                |> List.head
+                |> Maybe.withDefault rawImplName
 
         startsWithUppercase : Bool
         startsWithUppercase =
@@ -546,6 +561,11 @@ isCustomTypeConstructor impl =
     startsWithUppercase && bodyIsSelfApplication
 
 
+importsParserAdvanced : ImportedNames -> Bool
+importsParserAdvanced importedNames =
+    Dict.member "Parser.Advanced" importedNames.aliases
+
+
 {-| Walk every declaration — core and user — to assign `GlobalId`s, then
 walk user declarations again to resolve their bodies to `RExpr`. Core
 bodies are deliberately **not** resolved (they reference kernel functions
@@ -561,10 +581,21 @@ available when we resolve user declarations.
 resolveProject : List CachedModuleSummary -> ResolvedProject
 resolveProject summaries =
     let
-        -- Pass 1a: assign ids to every core declaration. Fold over
-        -- `Core.functions` (the authoritative source) rather than
+        -- Pass 1a: assign ids to every core declaration that should
+        -- resolve via `RGlobal`, EXCEPT custom type constructors. Fold
+        -- over `Core.functions` (the authoritative source) rather than
         -- coreFunctions (which is keyed by joined module string and
         -- loses the `ModuleName` shape needed by the resolver context).
+        --
+        -- Core modules synthesize their constructors into
+        -- `Core.functions` too (`Basics.True`, `Maybe.Nothing`,
+        -- `Result.Ok`, ...). If we intern those here, the resolver
+        -- emits `RGlobal id` for constructor references and the
+        -- resolved evaluator bounces back through `delegateByName`
+        -- instead of staying on the cheap `RCtor` path. Mirror the
+        -- user-module filter from pass 1b so ADT constructors fall
+        -- through to `RCtor`, while record-alias constructors still
+        -- keep their synthetic body via `RGlobal`.
         coreIdAssignment : { next : Int, ids : Dict.Dict ( ModuleName, String ) IR.GlobalId }
         coreIdAssignment =
             Core.functions
@@ -572,10 +603,14 @@ resolveProject summaries =
                     (\moduleName moduleDict outer ->
                         moduleDict
                             |> Dict.foldl
-                                (\name _ inner ->
-                                    { next = inner.next + 1
-                                    , ids = Dict.insert ( moduleName, name ) inner.next inner.ids
-                                    }
+                                (\name impl inner ->
+                                    if isCustomTypeConstructor impl then
+                                        inner
+
+                                    else
+                                        { next = inner.next + 1
+                                        , ids = Dict.insert ( moduleName, name ) inner.next inner.ids
+                                        }
                                 )
                                 outer
                     )
@@ -714,6 +749,7 @@ resolveProject summaries =
         initialAcc =
             { globalIds = globalIds
             , bodies = Dict.empty
+            , tailRecursiveGlobals = Dict.empty
             , globalIdToName = globalIdToName
             , nativeDispatchers = nativeDispatchers
             , higherOrderDispatchers = higherOrderDispatchers
@@ -722,89 +758,119 @@ resolveProject summaries =
             , errors = []
             }
     in
-    summaries
-        |> List.foldl
-            (\summary outer ->
-                summary.functions
-                    |> List.foldl
-                        (\impl inner ->
-                            if isCustomTypeConstructor impl then
-                                inner
+    let
+        resolvedProject =
+            summaries
+                |> List.foldl
+                    (\summary outer ->
+                        summary.functions
+                            |> List.foldl
+                                (\impl inner ->
+                                    if isCustomTypeConstructor impl then
+                                        inner
 
-                            else
-                                let
-                                    name : String
-                                    name =
-                                        Node.value impl.name
+                                    else
+                                        let
+                                            name : String
+                                            name =
+                                                Node.value impl.name
 
-                                    ctx : Resolver.ResolverContext
-                                    ctx =
-                                        {- Exclude modules whose resolved bodies
-                                           interact badly with the kernel
-                                           callback dispatching (via the bridge)
-                                           or cause massive iteration via
-                                           recursive parser combinators.
+                                            ctx : Resolver.ResolverContext
+                                            ctx =
+                                                {- Exclude modules whose resolved bodies
+                                                   interact badly with the kernel
+                                                   callback dispatching (via the bridge)
+                                                   or cause massive iteration via
+                                                   recursive parser combinators.
 
-                                           Parser.* — recursive combinator
-                                             bodies that generate massive
-                                             evalR iteration through the bridge.
-                                           Elm.Type — uses Parser.run internally
-                                             for type-string parsing; its
-                                             resolved body creates RExprImpl
-                                             closures that loop through the
-                                             parser's recursive walker.
-                                           Elm.Project — its decoder has
-                                             RExprImpl callbacks that silent-
-                                             drop via "Could not match lambda
-                                             patterns" in the Kernel.Json
-                                             walker's `applyFunction` path.
+                                                   Parser.* — recursive combinator
+                                                     bodies that generate massive
+                                                     evalR iteration through the bridge.
+                                                   Elm.Type — uses Parser.run internally
+                                                     for type-string parsing; its
+                                                     resolved body creates RExprImpl
+                                                     closures that loop through the
+                                                     parser's recursive walker.
+                                                   Elm.Project — its decoder has
+                                                     RExprImpl callbacks that silent-
+                                                     drop via "Could not match lambda
+                                                     patterns" in the Kernel.Json
+                                                     walker's `applyFunction` path.
 
-                                           Everything else benefits from the
-                                           flip (import canonicalization for
-                                           aliased imports → more user code
-                                           runs through evalR).
-                                        -}
-                                        case summary.moduleName of
-                                            "Parser" :: _ ->
-                                                Resolver.initContext summary.moduleName globalIds
+                                                   Everything else benefits from the
+                                                   flip (import canonicalization for
+                                                   aliased imports → more user code
+                                                   runs through evalR).
+                                                -}
+                                                case summary.moduleName of
+                                                    "Parser" :: _ ->
+                                                        Resolver.initContext summary.moduleName globalIds
 
-                                            [ "Elm", "Type" ] ->
-                                                Resolver.initContext summary.moduleName globalIds
+                                                    [ "Elm", "Type" ] ->
+                                                        Resolver.initContext summary.moduleName globalIds
 
-                                            [ "Elm", "Project" ] ->
-                                                Resolver.initContext summary.moduleName globalIds
+                                                    [ "Elm", "Project" ] ->
+                                                        Resolver.initContext summary.moduleName globalIds
 
-                                            _ ->
-                                                Resolver.initContextWithImports
-                                                    summary.moduleName
-                                                    globalIds
-                                                    summary.importedNames
-                                in
-                                case Resolver.resolveDeclaration ctx impl of
-                                    Ok rexpr ->
-                                        case Dict.get ( summary.moduleName, name ) inner.globalIds of
-                                            Just id ->
-                                                { inner
-                                                    | bodies = Dict.insert id rexpr inner.bodies
-                                                }
+                                                    _ ->
+                                                        Resolver.initContextWithImports
+                                                            summary.moduleName
+                                                            globalIds
+                                                            summary.importedNames
+                                        in
+                                        if importsParserAdvanced summary.importedNames then
+                                            inner
 
-                                            Nothing ->
-                                                -- Should be impossible — pass 1 added this entry.
-                                                inner
+                                        else
+                                            case Resolver.resolveDeclaration ctx impl of
+                                                Ok rexpr ->
+                                                    case Dict.get ( summary.moduleName, name ) inner.globalIds of
+                                                        Just id ->
+                                                            { inner
+                                                                | bodies = Dict.insert id rexpr inner.bodies
+                                                            }
 
-                                    Err err ->
-                                        { inner
-                                            | errors =
-                                                { moduleName = summary.moduleName
-                                                , name = name
-                                                , error = err
-                                                }
-                                                    :: inner.errors
-                                        }
-                        )
-                        outer
+                                                        Nothing ->
+                                                            -- Should be impossible — pass 1 added this entry.
+                                                            inner
+
+                                                Err err ->
+                                                    { inner
+                                                        | errors =
+                                                            { moduleName = summary.moduleName
+                                                            , name = name
+                                                            , error = err
+                                                            }
+                                                                :: inner.errors
+                                                    }
+                                )
+                                outer
+                    )
+                    initialAcc
+    in
+    finalizeResolvedProject resolvedProject
+
+
+finalizeResolvedProject : ResolvedProject -> ResolvedProject
+finalizeResolvedProject resolvedProject =
+    { resolvedProject
+        | tailRecursiveGlobals = resolvedTailRecursiveGlobalsFromBodies resolvedProject.bodies
+    }
+
+
+resolvedTailRecursiveGlobalsFromBodies : Dict.Dict IR.GlobalId IR.RExpr -> Dict.Dict IR.GlobalId Bool
+resolvedTailRecursiveGlobalsFromBodies bodies =
+    bodies
+        |> Dict.foldl
+            (\id body acc ->
+                case body of
+                    IR.RLambda lambda ->
+                        Dict.insert id (RE.isTailRecursiveGlobal id lambda) acc
+
+                    _ ->
+                        acc
             )
-            initialAcc
+            Dict.empty
 
 
 eval : String -> Expression -> Result Error Value
@@ -1402,6 +1468,7 @@ evalResolvedNodeInEnv context resolvedProject cfg env node =
                             { locals = bodyLocals
                             , globals = runtimeGlobals
                             , resolvedBodies = resolvedProject.bodies
+                            , tailRecursiveGlobals = resolvedProject.tailRecursiveGlobals
                             , globalIdToName = runtimeGlobalIdToName
                             , nativeDispatchers = resolvedProject.nativeDispatchers
                             , higherOrderDispatchers = resolvedProject.higherOrderDispatchers
@@ -1415,6 +1482,7 @@ evalResolvedNodeInEnv context resolvedProject cfg env node =
                             , tailLoopTarget = Nothing
                             , tailLoopClosureSelfIndex = Nothing
                             , suspendStepBudget = False
+                            , logDelegateCalls = False
                             }
                     in
                     RE.evalR bridgeRenv payload.body
@@ -1454,6 +1522,7 @@ evalResolvedNodeInEnv context resolvedProject cfg env node =
                 { locals = []
                 , globals = runtimeGlobals
                 , resolvedBodies = resolvedProject.bodies
+                , tailRecursiveGlobals = resolvedProject.tailRecursiveGlobals
                 , globalIdToName = runtimeGlobalIdToName
                 , nativeDispatchers = resolvedProject.nativeDispatchers
                 , higherOrderDispatchers = resolvedProject.higherOrderDispatchers
@@ -1467,6 +1536,7 @@ evalResolvedNodeInEnv context resolvedProject cfg env node =
                 , tailLoopTarget = Nothing
                 , tailLoopClosureSelfIndex = Nothing
                 , suspendStepBudget = False
+                , logDelegateCalls = False
                 }
                 rexpr
 
@@ -1531,24 +1601,25 @@ tryNormalizeConstant resolvedProject moduleName moduleKey moduleImports funcImpl
     in
     case EvalResult.toResult result of
         Ok value ->
-            if isLosslessValue value then
-                Just
-                    ( { funcImpl
-                        | expression = Value.toExpression value
-                      }
-                    , value
-                    )
+            if isPrecomputableValue value then
+                if isLosslessValue value then
+                    Just
+                        ( { funcImpl
+                            | expression = Value.toExpression value
+                          }
+                        , value
+                        )
+
+                else
+                    -- Eval succeeded and the value is safe to keep in the
+                    -- in-memory `precomputedValues` cache, but it cannot be
+                    -- losslessly rewritten back into elm-syntax (for example
+                    -- non-finite numerics). Keep the original expression but
+                    -- cache the evaluated value for runtime hits.
+                    Just ( funcImpl, value )
 
             else
-                -- Eval succeeded but the value can't round-trip to an
-                -- Expression (e.g., `round (1 / 0) : Int` evaluates to
-                -- `Int Infinity`, which `Expression.Integer Infinity`
-                -- can't Wire3-encode). Return the value anyway so the
-                -- in-memory `precomputedValues` cache still hits at
-                -- runtime — the user-norm on-disk cache filters these
-                -- out before serializing. Keeps the original expression
-                -- so the function body still round-trips.
-                Just ( funcImpl, value )
+                Nothing
 
         Err _ ->
             Nothing
@@ -1710,18 +1781,79 @@ runModuleNormalizationToFixpoint resolvedProject moduleName moduleKey moduleImpo
             else
                 fixpointFns
 
+        inlineRewriteEnv : Env
+        inlineRewriteEnv =
+            let
+                baseEnv : Env
+                baseEnv =
+                    Environment.empty moduleName
+            in
+            { baseEnv
+                | currentModuleFunctions = foldedFns
+                , imports = moduleImports
+                , shared =
+                    { functions = Dict.insert moduleKey foldedFns sharedFunctions
+                    , moduleImports = sharedImports
+                    , resolveBridge = baseEnv.shared.resolveBridge
+                    , precomputedValues = sharedPrecomputedValues
+                    , tcoAnalyses = baseEnv.shared.tcoAnalyses
+                    }
+            }
+
+        inlineRewriteCfg : Config
+        inlineRewriteCfg =
+            { trace = False
+            , coverage = False
+            , coverageProbeLines = Set.empty
+            , maxSteps = Nothing
+            , tcoTarget = Nothing
+            , callCounts = Nothing
+            , intercepts = Dict.empty
+            , memoizedFunctions = MemoSpec.emptyRegistry
+            , collectMemoStats = False
+            , useResolvedIR = False
+            }
+
+        rewrittenFns : Dict.Dict String FunctionImplementation
+        rewrittenFns =
+            if flags.inlineFunctions then
+                foldedFns
+                    |> Dict.map
+                        (\_ funcImpl ->
+                            if List.isEmpty funcImpl.arguments then
+                                funcImpl
+
+                            else
+                                { funcImpl
+                                    | expression =
+                                        foldConstantSubExpressionsHelp
+                                            resolvedProject
+                                            3
+                                            { flags
+                                                | foldConstantApplications = False
+                                                , inlinePrecomputedRefs = False
+                                            }
+                                            inlineRewriteEnv
+                                            inlineRewriteCfg
+                                            funcImpl.expression
+                                }
+                        )
+
+            else
+                foldedFns
+
         foldedDelta : Dict.Dict String FunctionImplementation
         foldedDelta =
             fixpointDelta
                 |> Dict.map
                     (\name funcImpl ->
-                        Dict.get name foldedFns
+                        Dict.get name rewrittenFns
                             |> Maybe.withDefault funcImpl
                     )
 
         newDelta : Dict.Dict String FunctionImplementation
         newDelta =
-            foldedFns
+            rewrittenFns
                 |> Dict.foldl
                     (\name foldedImpl acc ->
                         case Dict.get name originalModuleFns of
@@ -1737,7 +1869,7 @@ runModuleNormalizationToFixpoint resolvedProject moduleName moduleKey moduleImpo
                     )
                     foldedDelta
     in
-    ( foldedFns, newDelta, fixpointPrecomputed )
+    ( rewrittenFns, newDelta, fixpointPrecomputed )
 
 
 {-| Topological-order single-pass normalization. For each 0-arg
@@ -1966,8 +2098,9 @@ isLosslessValue value =
         Types.List items ->
             List.all isLosslessValue items
 
-        Types.Custom _ args ->
-            List.all isLosslessValue args
+        Types.Custom qualifiedNameRef args ->
+            not (isNonPrecomputableCustomValue qualifiedNameRef)
+                && List.all isLosslessValue args
 
         Types.JsArray array ->
             Array.toList array |> List.all isLosslessValue
@@ -1991,6 +2124,75 @@ isLosslessValue value =
             -- or uses a KernelImpl with runtime state would lose information.
             -- Skip for now; revisit if the pattern is common.
             False
+
+
+{-| Values that are safe to keep in `precomputedValues` for runtime hits,
+even if they cannot be rewritten back into elm-syntax.
+
+This is intentionally stricter than "successfully evaluated". Parser values
+currently serialize as plain custom values, but caching them changes
+behavior: their internal parser-machine representation is not safe to freeze
+and reuse as a top-level constant.
+-}
+isPrecomputableValue : Value -> Bool
+isPrecomputableValue value =
+    case value of
+        Types.String _ ->
+            True
+
+        Types.Int _ ->
+            True
+
+        Types.Float _ ->
+            True
+
+        Types.Char _ ->
+            True
+
+        Types.Bool _ ->
+            True
+
+        Types.Unit ->
+            True
+
+        Types.Tuple l r ->
+            isPrecomputableValue l && isPrecomputableValue r
+
+        Types.Triple l m r ->
+            isPrecomputableValue l && isPrecomputableValue m && isPrecomputableValue r
+
+        Types.Record fields ->
+            Dict.values fields |> List.all isPrecomputableValue
+
+        Types.List items ->
+            List.all isPrecomputableValue items
+
+        Types.Custom qualifiedNameRef args ->
+            not (isNonPrecomputableCustomValue qualifiedNameRef)
+                && List.all isPrecomputableValue args
+
+        Types.JsArray array ->
+            Array.toList array |> List.all isPrecomputableValue
+
+        Types.JsonValue _ ->
+            False
+
+        Types.JsonDecoderValue _ ->
+            False
+
+        Types.RegexValue _ ->
+            False
+
+        Types.BytesValue _ ->
+            False
+
+        Types.PartiallyApplied _ _ _ _ _ _ ->
+            False
+
+
+isNonPrecomputableCustomValue qualifiedNameRef =
+    (qualifiedNameRef.moduleName == [ "Parser", "Advanced" ] && qualifiedNameRef.name == "Parser")
+        || (qualifiedNameRef.moduleName == [ "Parser" ] && qualifiedNameRef.name == "Parser")
 
 
 foldWithFlags :
@@ -2108,8 +2310,12 @@ foldConstantSubExpressionsHelp resolvedProject depth flags env cfg ((Node range 
 
                 else if flags.inlineFunctions then
                     case tryInlineFunction env moduleName funcName foldedArgs of
-                        Just inlinedExpr ->
-                            foldConstantSubExpressionsHelp resolvedProject (depth - 1) flags env cfg inlinedExpr
+                        Just inlineResult ->
+                            if inlineResult.recursive then
+                                inlineResult.expression
+
+                            else
+                                foldConstantSubExpressionsHelp resolvedProject (depth - 1) flags env cfg inlineResult.expression
 
                         Nothing ->
                             foldedNode
@@ -2251,11 +2457,21 @@ foldConstantSubExpressionsHelp resolvedProject depth flags env cfg ((Node range 
                 node
 
 
-{-| Try to inline a small non-recursive function at a call site.
+type alias InlineFunctionResult =
+    { expression : Node Expression
+    , recursive : Bool
+    }
+
+
+{-| Try to inline a small function at a call site.
 For cross-module calls, qualifies unqualified refs in the inlined body
 with the source module name so they resolve correctly in the caller's context.
+
+Recursive callees are allowed, but callers should avoid recursively
+re-walking the inserted body to prevent unbounded expansion.
+
 -}
-tryInlineFunction : Env -> List String -> String -> List (Node Expression) -> Maybe (Node Expression)
+tryInlineFunction : Env -> List String -> String -> List (Node Expression) -> Maybe InlineFunctionResult
 tryInlineFunction env moduleName funcName args =
     let
         sourceModuleKey =
@@ -2281,10 +2497,14 @@ tryInlineFunction env moduleName funcName args =
     in
     case maybeFuncImpl of
         Just funcImpl ->
+            let
+                isRecursive : Bool
+                isRecursive =
+                    containsSelfCallInExpr funcName funcImpl.expression
+            in
             if
                 List.length funcImpl.arguments
                     == List.length args
-                    && not (containsSelfCallInExpr funcName funcImpl.expression)
                     && expressionSize funcImpl.expression
                     < 30
                     && not (referencesInternalHelper funcImpl.expression)
@@ -2309,7 +2529,10 @@ tryInlineFunction env moduleName funcName args =
                                 List.map2 Tuple.pair paramNames args
                                     |> Dict.fromList
                         in
-                        Just (substituteVars substitution preQualified)
+                        Just
+                            { expression = substituteVars substitution preQualified
+                            , recursive = isRecursive
+                            }
 
                     Nothing ->
                         Nothing
@@ -2976,6 +3199,7 @@ evalWithEnvFromFilesAndMemo (ProjectEnv projectEnv) additionalFiles memoizedFunc
         , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
         , collectMemoStats = collectMemoStats
         , collectDelegateCalls = False
+        , logDelegateCalls = False
         }
         (ProjectEnv projectEnv)
         additionalFiles
@@ -3038,6 +3262,7 @@ evalWithEnvFromFilesAndValuesAndMemo (ProjectEnv projectEnv) additionalFiles inj
         , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
         , collectMemoStats = collectMemoStats
         , collectDelegateCalls = False
+        , logDelegateCalls = False
         }
         (ProjectEnv projectEnv)
         additionalFiles
@@ -3390,6 +3615,7 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw projectEnv additionalFiles 
         , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
         , collectMemoStats = False
         , collectDelegateCalls = False
+        , logDelegateCalls = False
         }
         projectEnv
         additionalFiles
@@ -3479,6 +3705,30 @@ evalWithResolvedIRFromFilesAndInterceptsAndDelegateCallCounter projectEnv additi
         |> DelegateCounter.collect
 
 
+{-| Diagnostic helper that marks resolved-evaluator fallback delegates
+for audit builds, while otherwise preserving the normal evaluation
+result exactly.
+
+The log prefix is `Eval.DelegateCounter.logPrefix`.
+
+-}
+evalWithResolvedIRFromFilesAndInterceptsAndLogDelegateCalls :
+    ProjectEnv
+    -> List File
+    -> Dict.Dict String Value
+    -> Dict.Dict String Types.Intercept
+    -> Expression
+    -> Types.EvalResult Value
+evalWithResolvedIRFromFilesAndInterceptsAndLogDelegateCalls projectEnv additionalFiles injectedValues intercepts expression =
+    evalWithResolvedIRFromFilesAndOptions
+        { defaultResolvedIREvalOptions | logDelegateCalls = True }
+        projectEnv
+        additionalFiles
+        injectedValues
+        intercepts
+        expression
+
+
 {-| Step-budgeted variant. When `maxSteps` is `Just n`, the resolved-IR
 evaluator's trampoline (`runRecWithBudget`) decrements a counter per
 dispatch and returns "Step limit exceeded" when it reaches zero.
@@ -3486,6 +3736,7 @@ dispatch and returns "Step limit exceeded" when it reaches zero.
 
 This is the Phase 4 entry point that `evalWithEnvAndLimit` and
 `evalWithEnvFromFilesAndLimit` delegate to.
+
 -}
 evalWithResolvedIRFromFilesAndInterceptsAndLimit :
     Maybe Int
@@ -3592,11 +3843,22 @@ evalWithResolvedIRFromFilesAndOptions options (ProjectEnv projectEnv) additional
                                                         Node.value impl.name
                                                 in
                                                 case Dict.get ( summary.moduleName, name ) inner.ids of
-                                                    Just _ ->
+                                                    Just existingId ->
                                                         -- Re-registering an existing decl
                                                         -- (e.g. same wrapper used twice).
-                                                        -- Reuse the existing id.
-                                                        inner
+                                                        -- Reuse the existing id, but also heal
+                                                        -- any stale reverse-map hole left by an
+                                                        -- earlier normalization pass.
+                                                        if Dict.member existingId inner.reverseIds then
+                                                            inner
+
+                                                        else
+                                                            { inner
+                                                                | reverseIds =
+                                                                    Dict.insert existingId
+                                                                        ( summary.moduleName, name )
+                                                                        inner.reverseIds
+                                                            }
 
                                                     Nothing ->
                                                         { next = inner.next + 1
@@ -3730,21 +3992,60 @@ evalWithResolvedIRFromFilesAndOptions options (ProjectEnv projectEnv) additional
                                                             summary.importedNames
                                                             |> Resolver.withAmbientGlobals injectedGlobalIds
                                                 in
-                                                case Resolver.resolveDeclaration ctx impl of
-                                                    Ok rexpr ->
-                                                        case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
-                                                            Just id ->
-                                                                Dict.insert id rexpr inner
+                                                if importsParserAdvanced summary.importedNames then
+                                                    inner
 
-                                                            Nothing ->
-                                                                inner
+                                                else
+                                                    case Resolver.resolveDeclaration ctx impl of
+                                                        Ok rexpr ->
+                                                            case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                                Just id ->
+                                                                    Dict.insert id rexpr inner
 
-                                                    Err _ ->
-                                                        inner
+                                                                Nothing ->
+                                                                    inner
+
+                                                        Err _ ->
+                                                            inner
                                         )
                                         outer
                             )
                             baseResolved.bodies
+
+                moduleBodyIds : Set IR.GlobalId
+                moduleBodyIds =
+                    moduleDataForBodies
+                        |> List.foldl
+                            (\summary outer ->
+                                summary.functions
+                                    |> List.foldl
+                                        (\impl inner ->
+                                            if isCustomTypeConstructor impl then
+                                                inner
+
+                                            else
+                                                case Dict.get ( summary.moduleName, Node.value impl.name ) mergedGlobalIds of
+                                                    Just id ->
+                                                        Set.insert id inner
+
+                                                    Nothing ->
+                                                        inner
+                                        )
+                                        outer
+                            )
+                            Set.empty
+
+                mergedTailRecursiveGlobals : Dict.Dict IR.GlobalId Bool
+                mergedTailRecursiveGlobals =
+                    Dict.union
+                        (resolvedTailRecursiveGlobalsFromBodies
+                            (mergedBodies
+                                |> Dict.filter (\id _ -> Set.member id moduleBodyIds)
+                            )
+                        )
+                        (baseResolved.tailRecursiveGlobals
+                            |> Dict.filter (\id _ -> not (Set.member id moduleBodyIds))
+                        )
 
                 {- Precompute intercepts keyed by GlobalId so the hot
                    RApply path can do a single Dict.get instead of
@@ -3879,6 +4180,7 @@ evalWithResolvedIRFromFilesAndOptions options (ProjectEnv projectEnv) additional
                                     { locals = bodyLocals
                                     , globals = precomputedGlobalsCache
                                     , resolvedBodies = mergedBodies
+                                    , tailRecursiveGlobals = mergedTailRecursiveGlobals
                                     , globalIdToName = mergedGlobalIdToNameWithInjected
                                     , nativeDispatchers = baseResolved.nativeDispatchers
                                     , higherOrderDispatchers = baseResolved.higherOrderDispatchers
@@ -3892,6 +4194,7 @@ evalWithResolvedIRFromFilesAndOptions options (ProjectEnv projectEnv) additional
                                     , tailLoopTarget = Nothing
                                     , tailLoopClosureSelfIndex = Nothing
                                     , suspendStepBudget = False
+                                    , logDelegateCalls = options.logDelegateCalls
                                     }
                             in
                             RE.evalR bridgeRenv payload.body
@@ -3968,6 +4271,7 @@ evalWithResolvedIRFromFilesAndOptions options (ProjectEnv projectEnv) additional
                             { locals = []
                             , globals = precomputedGlobalsCache
                             , resolvedBodies = mergedBodies
+                            , tailRecursiveGlobals = mergedTailRecursiveGlobals
                             , globalIdToName = mergedGlobalIdToNameWithInjected
                             , nativeDispatchers = baseResolved.nativeDispatchers
                             , higherOrderDispatchers = baseResolved.higherOrderDispatchers
@@ -3981,6 +4285,7 @@ evalWithResolvedIRFromFilesAndOptions options (ProjectEnv projectEnv) additional
                             , tailLoopTarget = Nothing
                             , tailLoopClosureSelfIndex = Nothing
                             , suspendStepBudget = False
+                            , logDelegateCalls = options.logDelegateCalls
                             }
                     in
                     RE.evalR renv rexpr
@@ -4094,6 +4399,7 @@ evalWithInterceptsAndMemoRaw projectEnv additionalSources intercepts memoizedFun
                 , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                 , collectMemoStats = False
                 , collectDelegateCalls = False
+                , logDelegateCalls = False
                 }
                 projectEnv
                 (List.map .file parsedModules)
@@ -4232,6 +4538,16 @@ extendResolvedWithFiles additionalFiles (ProjectEnv projectEnv) =
         summaries =
             buildCachedModuleSummariesFromParsed parsedModules
 
+        targetModuleKeys : Set String
+        targetModuleKeys =
+            summaries
+                |> List.map (.moduleName >> Environment.moduleKey)
+                |> Set.fromList
+
+        isTargetModule : ModuleName -> Bool
+        isTargetModule moduleName =
+            Set.member (Environment.moduleKey moduleName) targetModuleKeys
+
         baseResolved : ResolvedProject
         baseResolved =
             projectEnv.resolved
@@ -4263,8 +4579,17 @@ extendResolvedWithFiles additionalFiles (ProjectEnv projectEnv) =
                                                 Node.value impl.name
                                         in
                                         case Dict.get ( summary.moduleName, name ) inner.ids of
-                                            Just _ ->
-                                                inner
+                                            Just existingId ->
+                                                if Dict.member existingId inner.reverseIds then
+                                                    inner
+
+                                                else
+                                                    { inner
+                                                        | reverseIds =
+                                                            Dict.insert existingId
+                                                                ( summary.moduleName, name )
+                                                                inner.reverseIds
+                                                    }
 
                                             Nothing ->
                                                 { next = inner.next + 1
@@ -4311,21 +4636,35 @@ extendResolvedWithFiles additionalFiles (ProjectEnv projectEnv) =
                                                     mergedGlobalIds
                                                     summary.importedNames
                                         in
-                                        case Resolver.resolveDeclaration ctx impl of
-                                            Ok rexpr ->
-                                                case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
-                                                    Just id ->
-                                                        Dict.insert id rexpr inner
+                                        if importsParserAdvanced summary.importedNames then
+                                            inner
 
-                                                    Nothing ->
-                                                        inner
+                                        else
+                                            case Resolver.resolveDeclaration ctx impl of
+                                                Ok rexpr ->
+                                                    case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                        Just id ->
+                                                            Dict.insert id rexpr inner
 
-                                            Err _ ->
-                                                inner
+                                                        Nothing ->
+                                                            inner
+
+                                                Err _ ->
+                                                    inner
                                 )
                                 outer
                     )
-                    baseResolved.bodies
+                    (baseResolved.bodies
+                        |> Dict.filter
+                            (\id _ ->
+                                case Dict.get id baseResolved.globalIdToName of
+                                    Just ( moduleName, _ ) ->
+                                        not (isTargetModule moduleName)
+
+                                    Nothing ->
+                                        True
+                            )
+                    )
 
         newResolved : ResolvedProject
         newResolved =
@@ -4333,9 +4672,10 @@ extendResolvedWithFiles additionalFiles (ProjectEnv projectEnv) =
                 | globalIds = mergedGlobalIds
                 , globalIdToName = mergedGlobalIdToName
                 , bodies = mergedBodies
+                , tailRecursiveGlobals = resolvedTailRecursiveGlobalsFromBodies mergedBodies
             }
     in
-    refreshResolvedGlobals (ProjectEnv { projectEnv | resolved = newResolved })
+    refreshResolvedGlobals (ProjectEnv { projectEnv | resolved = finalizeResolvedProject newResolved })
 
 
 refreshResolvedModulesByName : List ModuleName -> ProjectEnv -> ProjectEnv
@@ -4411,9 +4751,20 @@ refreshResolvedModulesByName moduleNames (ProjectEnv projectEnv) =
                                             name =
                                                 Node.value impl.name
                                         in
-                                        { next = inner.next + 1
-                                        , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
-                                        }
+                                        case Dict.get ( summary.moduleName, name ) baseResolved.globalIds of
+                                            Just existingId ->
+                                                { inner
+                                                    | ids =
+                                                        Dict.insert
+                                                            ( summary.moduleName, name )
+                                                            existingId
+                                                            inner.ids
+                                                }
+
+                                            Nothing ->
+                                                { next = inner.next + 1
+                                                , ids = Dict.insert ( summary.moduleName, name ) inner.next inner.ids
+                                                }
                                 )
                                 outer
                     )
@@ -4456,22 +4807,36 @@ refreshResolvedModulesByName moduleNames (ProjectEnv projectEnv) =
                                                     mergedGlobalIds
                                                     summary.importedNames
                                         in
-                                        case Resolver.resolveDeclaration ctx impl of
-                                            Ok rexpr ->
-                                                case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
-                                                    Just id ->
-                                                        Dict.insert id rexpr inner
+                                        if importsParserAdvanced summary.importedNames then
+                                            inner
 
-                                                    Nothing ->
-                                                        inner
+                                        else
+                                            case Resolver.resolveDeclaration ctx impl of
+                                                Ok rexpr ->
+                                                    case Dict.get ( summary.moduleName, name ) mergedGlobalIds of
+                                                        Just id ->
+                                                            Dict.insert id rexpr inner
 
-                                            Err _ ->
-                                                inner
+                                                        Nothing ->
+                                                            inner
+
+                                                Err _ ->
+                                                    inner
                                 )
                                 outer
                     )
                     (baseResolved.bodies
-                        |> Dict.filter (\id _ -> Dict.member id mergedGlobalIdToName)
+                        |> Dict.filter
+                            (\id _ ->
+                                Dict.member id mergedGlobalIdToName
+                                    && (case Dict.get id baseResolved.globalIdToName of
+                                            Just ( moduleName, _ ) ->
+                                                not (isTargetModule moduleName)
+
+                                            Nothing ->
+                                                True
+                                       )
+                            )
                     )
 
         mergedErrors : List ResolveErrorEntry
@@ -4498,16 +4863,20 @@ refreshResolvedModulesByName moduleNames (ProjectEnv projectEnv) =
                                                     mergedGlobalIds
                                                     summary.importedNames
                                         in
-                                        case Resolver.resolveDeclaration ctx impl of
-                                            Ok _ ->
-                                                inner
+                                        if importsParserAdvanced summary.importedNames then
+                                            inner
 
-                                            Err err ->
-                                                { moduleName = summary.moduleName
-                                                , name = name
-                                                , error = err
-                                                }
-                                                    :: inner
+                                        else
+                                            case Resolver.resolveDeclaration ctx impl of
+                                                Ok _ ->
+                                                    inner
+
+                                                Err err ->
+                                                    { moduleName = summary.moduleName
+                                                    , name = name
+                                                    , error = err
+                                                    }
+                                                        :: inner
                                 )
                                 outer
                     )
@@ -4521,10 +4890,11 @@ refreshResolvedModulesByName moduleNames (ProjectEnv projectEnv) =
                 | globalIds = mergedGlobalIds
                 , globalIdToName = mergedGlobalIdToName
                 , bodies = mergedBodies
+                , tailRecursiveGlobals = resolvedTailRecursiveGlobalsFromBodies mergedBodies
                 , errors = mergedErrors
             }
     in
-    refreshResolvedGlobals (ProjectEnv { projectEnv | resolved = newResolved })
+    refreshResolvedGlobals (ProjectEnv { projectEnv | resolved = finalizeResolvedProject newResolved })
 
 
 {-| Check whether a function body is worth trying to normalize. Functions that
@@ -4728,6 +5098,7 @@ invocation tax dominated by the body walk in
 `TcoAnalysis.collectTailCalls` and `Eval.Expression.containsSelfCall`.
 On fuzz-heavy workloads (~100K+ calls) that adds up to hundreds of ms
 of pure repeated work.
+
 -}
 precomputeTcoAnalyses :
     Dict.Dict String (Dict.Dict String FunctionImplementation)
@@ -5015,6 +5386,91 @@ mergeModuleFunctionsIntoEnv moduleName deltaFns (ProjectEnv projectEnv) =
     in
     refreshResolvedModulesByName [ moduleName ]
         (ProjectEnv { projectEnv | env = newEnv })
+
+
+{-| Bulk companion to `mergeModuleFunctionsIntoEnv` for cached normalization
+bundle loads. Applies multiple module function/precomputed overlays first,
+then refreshes the resolved bodies/globals once for the full touched set.
+-}
+mergeNormalizedModulesIntoEnv :
+    List
+        { moduleName : ModuleName
+        , functions : Dict.Dict String FunctionImplementation
+        , precomputedValues : Dict.Dict String Value
+        }
+    -> ProjectEnv
+    -> ProjectEnv
+mergeNormalizedModulesIntoEnv entries (ProjectEnv projectEnv) =
+    let
+        env : Env
+        env =
+            projectEnv.env
+
+        updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+        updatedFunctions =
+            entries
+                |> List.foldl
+                    (\entry acc ->
+                        let
+                            moduleKey : String
+                            moduleKey =
+                                Environment.moduleKey entry.moduleName
+
+                            existingModuleFns : Dict.Dict String FunctionImplementation
+                            existingModuleFns =
+                                Dict.get moduleKey acc
+                                    |> Maybe.withDefault Dict.empty
+                        in
+                        Dict.insert moduleKey (Dict.union entry.functions existingModuleFns) acc
+                    )
+                    env.shared.functions
+
+        updatedPrecomputed : Dict.Dict String (Dict.Dict String Value)
+        updatedPrecomputed =
+            entries
+                |> List.foldl
+                    (\entry acc ->
+                        Dict.insert
+                            (Environment.moduleKey entry.moduleName)
+                            entry.precomputedValues
+                            acc
+                    )
+                    env.shared.precomputedValues
+
+        updatedTcoAnalyses : Dict.Dict String (Dict.Dict String TcoAnalysis.TcoMetadata)
+        updatedTcoAnalyses =
+            entries
+                |> List.foldl
+                    (\entry acc ->
+                        let
+                            moduleKey : String
+                            moduleKey =
+                                Environment.moduleKey entry.moduleName
+
+                            mergedFunctions : Dict.Dict String FunctionImplementation
+                            mergedFunctions =
+                                Dict.get moduleKey updatedFunctions
+                                    |> Maybe.withDefault Dict.empty
+                        in
+                        Dict.insert moduleKey (precomputeOneModule mergedFunctions) acc
+                    )
+                    env.shared.tcoAnalyses
+
+        updatedEnv : Env
+        updatedEnv =
+            { env
+                | shared =
+                    { functions = updatedFunctions
+                    , moduleImports = env.shared.moduleImports
+                    , resolveBridge = env.shared.resolveBridge
+                    , precomputedValues = updatedPrecomputed
+                    , tcoAnalyses = updatedTcoAnalyses
+                    }
+            }
+    in
+    refreshResolvedModulesByName
+        (entries |> List.map .moduleName)
+        (ProjectEnv { projectEnv | env = updatedEnv })
 
 
 {-| Rewrite the bodies of zero-arg functions in the specified user modules by

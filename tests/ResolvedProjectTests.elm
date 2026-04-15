@@ -19,6 +19,7 @@ that's the signal Phase 2 iteration 2b was built to catch.
 
 -}
 
+import Elm.Parser
 import Eval.Module
 import Eval.ResolvedIR as IR
 import Expect
@@ -33,6 +34,7 @@ suite =
         [ coreIdsPopulated
         , singleModuleSmoke
         , multiModuleSmoke
+        , normalizationPreservesExistingGlobalIds
         , noErrorsForBasicProgram
         , broadLanguageCoverage
         ]
@@ -171,6 +173,76 @@ baz =
                     Expect.fail (errToString err)
 
 
+normalizationPreservesExistingGlobalIds : Test
+normalizationPreservesExistingGlobalIds =
+    test "normalizing one module preserves existing GlobalIds and reverse lookup" <|
+        \_ ->
+            let
+                moduleFoo =
+                    """module Foo exposing (answer)
+
+answer : Int
+answer =
+    1 + 2
+"""
+
+                moduleBar =
+                    """module Bar exposing (value)
+
+import Foo
+
+value : Int
+value =
+    Foo.answer
+"""
+            in
+            case ( Eval.Module.buildProjectEnv [], Elm.Parser.parseToFile moduleFoo, Elm.Parser.parseToFile moduleBar ) of
+                ( Ok baseEnv, Ok fooFile, Ok barFile ) ->
+                    case Eval.Module.extendWithFiles baseEnv [ fooFile, barFile ] of
+                        Ok extendedEnv ->
+                            let
+                                before =
+                                    Eval.Module.projectEnvResolved extendedEnv
+
+                                after =
+                                    Eval.Module.normalizeUserModulesInEnv [ [ "Foo" ] ] extendedEnv
+                                        |> Eval.Module.projectEnvResolved
+                            in
+                            case
+                                ( FastDict.get ( [ "Foo" ], "answer" ) before.globalIds
+                                , FastDict.get ( [ "Bar" ], "value" ) before.globalIds
+                                )
+                            of
+                                ( Just fooId, Just barId ) ->
+                                    Expect.all
+                                        [ \_ ->
+                                            FastDict.get ( [ "Foo" ], "answer" ) after.globalIds
+                                                |> Expect.equal (Just fooId)
+                                        , \_ ->
+                                            FastDict.get fooId after.globalIdToName
+                                                |> Expect.equal (Just ( [ "Foo" ], "answer" ))
+                                        , \_ ->
+                                            FastDict.get barId after.bodies
+                                                |> Expect.equal (Just (IR.RGlobal fooId))
+                                        , \_ ->
+                                            FastDict.member fooId after.bodies
+                                                |> Expect.equal True
+                                        ]
+                                        ()
+
+                                _ ->
+                                    Expect.fail "expected ids for Foo.answer and Bar.value"
+
+                        Err err ->
+                            Expect.fail (errToString err)
+
+                ( Err err, _, _ ) ->
+                    Expect.fail (errToString err)
+
+                _ ->
+                    Expect.fail "failed to parse normalization fixtures"
+
+
 noErrorsForBasicProgram : Test
 noErrorsForBasicProgram =
     test "a program using records, case, let, and operators resolves cleanly" <|
@@ -296,7 +368,7 @@ toList tree =
 
 greet : Person -> String
 greet { name, age } =
-    \"Hello, \" ++ name ++ \"! You are \" ++ String.fromInt age ++ \" years old.\"
+    "Hello, " ++ name ++ "! You are " ++ String.fromInt age ++ " years old."
 
 
 birthday : Person -> Person
@@ -367,7 +439,7 @@ pipeline n =
     n
         |> (+) 1
         |> String.fromInt
-        |> (\\s -> \"n+1 = \" ++ s)
+        |> (\\s -> "n+1 = " ++ s)
 
 
 complexLet : Int -> Int

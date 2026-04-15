@@ -1072,9 +1072,14 @@ resolvePattern ctx (Node _ pat) =
             resolvePatternList ctx args
                 |> Result.map
                     (\{ patterns, bindings } ->
+                        let
+                            canonicalModule : List String
+                            canonicalModule =
+                                canonicalizePatternConstructorModule ctx qualRef
+                        in
                         { resolved =
                             RPCtor
-                                { moduleName = qualRef.moduleName
+                                { moduleName = canonicalModule
                                 , name = qualRef.name
                                 }
                                 patterns
@@ -1122,6 +1127,28 @@ resolvePatternList :
     -> Result ResolveError { patterns : List RPattern, bindings : List String }
 resolvePatternList =
     resolvePatterns
+
+
+canonicalizePatternConstructorModule :
+    ResolverContext
+    -> { moduleName : List String, name : String }
+    -> List String
+canonicalizePatternConstructorModule ctx qualRef =
+    if List.isEmpty qualRef.moduleName then
+        case FastDict.get qualRef.name ctx.imports.exposedConstructors of
+            Just ( canonicalModule, _ ) ->
+                canonicalModule
+
+            Nothing ->
+                ctx.currentModule
+
+    else
+        case FastDict.get (Environment.moduleKey qualRef.moduleName) ctx.imports.aliases of
+            Just ( canonicalModule, _ ) ->
+                canonicalModule
+
+            Nothing ->
+                qualRef.moduleName
 
 
 {-| Prepend a list of bound names to an existing locals stack. `bindings` is

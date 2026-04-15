@@ -2,10 +2,12 @@ module Eval.DelegateCounter exposing
     ( CollectedDelegateCalls
     , DelegateCallCounter
     , collect
-    , empty
     , emit
+    , empty
     , enableOnInterceptsByGlobal
     , enabled
+    , log
+    , logPrefix
     , merge
     , qualifiedName
     )
@@ -63,6 +65,16 @@ qualifiedName moduleName name =
 delegateYieldTag : String
 delegateYieldTag =
     "__elm_interpreter_delegate_call__"
+
+
+logPrefix : String
+logPrefix =
+    "__elm_interpreter_delegate_call_log__"
+
+
+log : List String -> String -> a -> a
+log _ _ value =
+    value
 
 
 emit : List String -> String -> EvalResult a -> EvalResult a

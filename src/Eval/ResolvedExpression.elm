@@ -4,6 +4,7 @@ module Eval.ResolvedExpression exposing
     , buildHigherOrderRegistry
     , emptyREnv
     , evalR
+    , isTailRecursiveGlobal
     )
 
 {-| Resolved-IR evaluator (Phase 3). Consumes `Eval.ResolvedIR.RExpr`
@@ -33,7 +34,7 @@ import Char
 import Elm.Syntax.Expression as Expression
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node exposing (Node)
-import Elm.Syntax.Pattern exposing (QualifiedNameRef)
+import Elm.Syntax.Pattern exposing (Pattern(..), QualifiedNameRef)
 import Environment
 import Eval.DelegateCounter as DelegateCounter
 import Eval.Expression
@@ -59,7 +60,7 @@ import Value
 {-| Evaluator context for the resolved IR.
 
 `locals` is a cons-list of already-bound values; `RLocal i` evaluates to
-`List.drop i env.locals |> List.head`. The head is the innermost binding.
+the ith slot from the head (the innermost binding).
 
 `globals` holds pre-computed top-level values. Phase 3 iteration 3b3
 populates this lazily — the first time an `RGlobal` is encountered, its
@@ -80,6 +81,7 @@ type alias REnv =
     { locals : List Value
     , globals : FastDict.Dict IR.GlobalId Value
     , resolvedBodies : FastDict.Dict IR.GlobalId RExpr
+    , tailRecursiveGlobals : FastDict.Dict IR.GlobalId Bool
     , globalIdToName : FastDict.Dict IR.GlobalId ( ModuleName, String )
     , nativeDispatchers : FastDict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
     , higherOrderDispatchers : FastDict.Dict IR.GlobalId HigherOrderDispatcher
@@ -98,6 +100,7 @@ type alias REnv =
     , tailLoopTarget : Maybe TailLoopTarget
     , tailLoopClosureSelfIndex : Maybe Int
     , suspendStepBudget : Bool
+    , logDelegateCalls : Bool
     }
 
 
@@ -112,6 +115,51 @@ type TailLoopTarget
         , prefixLocals : List Value
         , debugName : Maybe QualifiedNameRef
         }
+
+
+localAt : Int -> List Value -> Maybe Value
+localAt index locals =
+    if index < 0 then
+        Nothing
+
+    else
+        case locals of
+            value0 :: rest1 ->
+                if index == 0 then
+                    Just value0
+
+                else
+                    case rest1 of
+                        value1 :: rest2 ->
+                            if index == 1 then
+                                Just value1
+
+                            else
+                                case rest2 of
+                                    value2 :: rest3 ->
+                                        if index == 2 then
+                                            Just value2
+
+                                        else
+                                            case rest3 of
+                                                value3 :: _ ->
+                                                    if index == 3 then
+                                                        Just value3
+
+                                                    else
+                                                        List.drop index locals |> List.head
+
+                                                [] ->
+                                                    Nothing
+
+                                    [] ->
+                                        Nothing
+
+                        [] ->
+                            Nothing
+
+            [] ->
+                Nothing
 
 
 {-| A higher-order kernel dispatcher: a `REnv -> List Value -> Maybe
@@ -154,6 +202,7 @@ emptyREnv =
     { locals = []
     , globals = FastDict.empty
     , resolvedBodies = FastDict.empty
+    , tailRecursiveGlobals = FastDict.empty
     , globalIdToName = FastDict.empty
     , nativeDispatchers = FastDict.empty
     , higherOrderDispatchers = FastDict.empty
@@ -167,6 +216,7 @@ emptyREnv =
     , tailLoopTarget = Nothing
     , tailLoopClosureSelfIndex = Nothing
     , suspendStepBudget = False
+    , logDelegateCalls = False
     }
 
 
@@ -539,10 +589,9 @@ evalRStep staticEnv state expr =
         RApply (RGlobal id) argExprs ->
             case tailLoopLocalsBuilder (envWithState staticEnv state) (RGlobal id) argExprs of
                 Just buildLocals ->
-                    evalArgsStep
+                    evalArgsStepSmall
                         state
                         argExprs
-                        []
                         (\argValues ->
                             rBase
                                 (tailCallLocalsResult
@@ -557,10 +606,9 @@ evalRStep staticEnv state expr =
                     -- call. Walking the arg list uses direct recursion in Elm
                     -- but it's bounded by arg count (typically 1–6), not by
                     -- recursion depth — so no stack issue from that.
-                    evalArgsStep
+                    evalArgsStepSmall
                         state
                         argExprs
-                        []
                         (\argValues ->
                             dispatchGlobalApplyStep staticEnv state id argValues
                         )
@@ -568,10 +616,9 @@ evalRStep staticEnv state expr =
         RApply headExpr argExprs ->
             case tailLoopLocalsBuilder (envWithState staticEnv state) headExpr argExprs of
                 Just buildLocals ->
-                    evalArgsStep
+                    evalArgsStepSmall
                         state
                         argExprs
-                        []
                         (\argValues ->
                             rBase
                                 (tailCallLocalsResult
@@ -589,10 +636,9 @@ evalRStep staticEnv state expr =
                         (\headResult ->
                             case headResult of
                                 EvOk headValue ->
-                                    evalArgsStep
+                                    evalArgsStepSmall
                                         state
                                         argExprs
-                                        []
                                         (\argValues ->
                                             applyClosureStep staticEnv state headValue argValues
                                         )
@@ -613,7 +659,7 @@ evalRStep staticEnv state expr =
                 (\scrutineeResult ->
                     case scrutineeResult of
                         EvOk scrutinee ->
-                            matchCaseBranchesStep staticEnv state scrutinee branches
+                            matchCaseBranchesStep branches staticEnv state scrutinee branches
 
                         _ ->
                             rBase scrutineeResult
@@ -657,11 +703,11 @@ evalRStep staticEnv state expr =
             rBase (EvOk Unit)
 
         RLocal i ->
-            case List.drop i locals of
-                value :: _ ->
+            case localAt i locals of
+                Just value ->
                     rBase (EvOk value)
 
-                [] ->
+                Nothing ->
                     rBase
                         (evErr (envWithState staticEnv state)
                             (TypeError
@@ -707,12 +753,13 @@ calls inside the branch share the outer `runRecursion`. Returns a
 so this should be unreachable at runtime.
 -}
 matchCaseBranchesStep :
-    REnv
+    List ( IR.RPattern, RExpr )
+    -> REnv
     -> EvalState
     -> Value
     -> List ( IR.RPattern, RExpr )
     -> Rec ( EvalState, RExpr ) (EvalResult Value) (EvalResult Value)
-matchCaseBranchesStep staticEnv state scrutinee branches =
+matchCaseBranchesStep allBranches staticEnv state scrutinee branches =
     case branches of
         [] ->
             rBase
@@ -720,6 +767,8 @@ matchCaseBranchesStep staticEnv state scrutinee branches =
                     (TypeError
                         ("case expression failed to match any branch for value: "
                             ++ Value.toString scrutinee
+                            ++ " | branches: "
+                            ++ patternListSummary allBranches
                         )
                     )
                 )
@@ -739,8 +788,7 @@ matchCaseBranchesStep staticEnv state scrutinee branches =
                         )
 
                 Nothing ->
-                    matchCaseBranchesStep staticEnv state scrutinee rest
-
+                    matchCaseBranchesStep allBranches staticEnv state scrutinee rest
 
 {-| Rec-aware let binding evaluator. Threads each binding's RHS through
 `recurseThen` so cross-body calls from inside a let binding stay in the
@@ -933,18 +981,19 @@ applyClosureStep staticEnv state head newArgs =
 
                                 bodyLocals : List Value
                                 bodyLocals =
-                                    List.foldl (::) withSelf totalArgs
+                                    prependArgsToLocals withSelf totalArgs
                             in
                             if isDirectSelfClosureLoop implBody arity then
                                 rBase (directLoopError (envWithState staticEnv state) debugName)
 
                             else
-                                case maybeRunResolvedClosureTailLoop
-                                    (envWithState staticEnv state)
-                                    debugName
-                                    implBody
-                                    selfClosure
-                                    totalArgs
+                                case
+                                    maybeRunResolvedClosureTailLoop
+                                        (envWithState staticEnv state)
+                                        debugName
+                                        implBody
+                                        selfClosure
+                                        totalArgs
                                 of
                                     Just loopResult ->
                                         rBase loopResult
@@ -952,7 +1001,10 @@ applyClosureStep staticEnv state head newArgs =
                                     Nothing ->
                                         rTail
                                             ( stateFromEnv
-                                                (prepareResolvedCall (envWithState staticEnv state))
+                                                (prepareResolvedCallFor
+                                                    debugName
+                                                    (envWithState staticEnv state)
+                                                )
                                                 bodyLocals
                                             , implBody.body
                                             )
@@ -990,7 +1042,7 @@ applyClosureStep staticEnv state head newArgs =
 
                                 bodyLocals : List Value
                                 bodyLocals =
-                                    List.foldl (::) withSelf bodyArgs
+                                    prependArgsToLocals withSelf bodyArgs
                             in
                             if isDirectSelfClosureLoop implBody arity then
                                 rBase (directLoopError (envWithState staticEnv state) debugName)
@@ -998,7 +1050,10 @@ applyClosureStep staticEnv state head newArgs =
                             else
                                 rRecThen
                                     ( stateFromEnv
-                                        (prepareResolvedCall (envWithState staticEnv state))
+                                        (prepareResolvedCallFor
+                                            debugName
+                                            (envWithState staticEnv state)
+                                        )
                                         bodyLocals
                                     , implBody.body
                                     )
@@ -1054,6 +1109,112 @@ evalArgsStep state remaining accRev k =
                         _ ->
                             rBase headResult
                 )
+
+
+evalArgsStepSmall :
+    EvalState
+    -> List RExpr
+    -> (List Value -> Rec ( EvalState, RExpr ) (EvalResult Value) (EvalResult Value))
+    -> Rec ( EvalState, RExpr ) (EvalResult Value) (EvalResult Value)
+evalArgsStepSmall state args k =
+    case args of
+        [] ->
+            k []
+
+        [ a ] ->
+            rRecThen ( state, a )
+                (\aResult ->
+                    case aResult of
+                        EvOk aValue ->
+                            k [ aValue ]
+
+                        _ ->
+                            rBase aResult
+                )
+
+        [ a, b ] ->
+            rRecThen ( state, a )
+                (\aResult ->
+                    case aResult of
+                        EvOk aValue ->
+                            rRecThen ( state, b )
+                                (\bResult ->
+                                    case bResult of
+                                        EvOk bValue ->
+                                            k [ aValue, bValue ]
+
+                                        _ ->
+                                            rBase bResult
+                                )
+
+                        _ ->
+                            rBase aResult
+                )
+
+        [ a, b, c ] ->
+            rRecThen ( state, a )
+                (\aResult ->
+                    case aResult of
+                        EvOk aValue ->
+                            rRecThen ( state, b )
+                                (\bResult ->
+                                    case bResult of
+                                        EvOk bValue ->
+                                            rRecThen ( state, c )
+                                                (\cResult ->
+                                                    case cResult of
+                                                        EvOk cValue ->
+                                                            k [ aValue, bValue, cValue ]
+
+                                                        _ ->
+                                                            rBase cResult
+                                                )
+
+                                        _ ->
+                                            rBase bResult
+                                )
+
+                        _ ->
+                            rBase aResult
+                )
+
+        [ a, b, c, d ] ->
+            rRecThen ( state, a )
+                (\aResult ->
+                    case aResult of
+                        EvOk aValue ->
+                            rRecThen ( state, b )
+                                (\bResult ->
+                                    case bResult of
+                                        EvOk bValue ->
+                                            rRecThen ( state, c )
+                                                (\cResult ->
+                                                    case cResult of
+                                                        EvOk cValue ->
+                                                            rRecThen ( state, d )
+                                                                (\dResult ->
+                                                                    case dResult of
+                                                                        EvOk dValue ->
+                                                                            k [ aValue, bValue, cValue, dValue ]
+
+                                                                        _ ->
+                                                                            rBase dResult
+                                                                )
+
+                                                        _ ->
+                                                            rBase cResult
+                                                )
+
+                                        _ ->
+                                            rBase bResult
+                                )
+
+                        _ ->
+                            rBase aResult
+                )
+
+        _ ->
+            evalArgsStep state args [] k
 
 
 {-| Rec-aware dispatch for `RApply (RGlobal id) args`. Mirrors
@@ -1127,7 +1288,7 @@ dispatchGlobalApplyStep staticEnv state id argValues =
                                             let
                                                 bodyLocals : List Value
                                                 bodyLocals =
-                                                    List.foldl (::) [] argValues
+                                                    prependArgsToLocals [] argValues
                                             in
                                             case maybeRunResolvedGlobalTailLoop localEnv id lambda argValues of
                                                 Just loopResult ->
@@ -1136,7 +1297,10 @@ dispatchGlobalApplyStep staticEnv state id argValues =
                                                 Nothing ->
                                                     rTail
                                                         ( stateFromEnv
-                                                            (prepareResolvedCall localEnv)
+                                                            (prepareResolvedCallFor
+                                                                (qualifiedNameForGlobal localEnv id)
+                                                                localEnv
+                                                            )
                                                             bodyLocals
                                                         , lambda.body
                                                         )
@@ -1148,7 +1312,15 @@ dispatchGlobalApplyStep staticEnv state id argValues =
                                         rBase (dispatchGlobalApplyNoIntercept localEnv id argValues)
 
                                 Just body ->
-                                    rRecThen ( stateFromEnv (prepareResolvedCall localEnv) [], body )
+                                    rRecThen
+                                        ( stateFromEnv
+                                            (prepareResolvedCallFor
+                                                (qualifiedNameForGlobal localEnv id)
+                                                localEnv
+                                            )
+                                            []
+                                        , body
+                                        )
                                         (\headResult ->
                                             case headResult of
                                                 EvOk headValue ->
@@ -1179,12 +1351,41 @@ evalGlobalStep staticEnv state id =
 
         Nothing ->
             case FastDict.get id staticEnv.resolvedBodies of
+                Just (RLambda lambda) ->
+                    let
+                        localEnv : REnv
+                        localEnv =
+                            envWithState staticEnv state
+
+                        debugName : Maybe QualifiedNameRef
+                        debugName =
+                            qualifiedNameForGlobal localEnv id
+                    in
+                    rBase
+                        (EvOk
+                            (makeClosure
+                                (prepareResolvedCallFor debugName localEnv)
+                                lambda.arity
+                                lambda.body
+                                0
+                                debugName
+                            )
+                        )
+
                 Just body ->
                     if isDirectSelfGlobalLoop id body then
                         rBase (directSelfLoopError (envWithState staticEnv state) id)
 
                     else
-                        rTail ( stateFromEnv (prepareResolvedCall (envWithState staticEnv state)) [], body )
+                        rTail
+                            ( stateFromEnv
+                                (prepareResolvedCallFor
+                                    (qualifiedNameForGlobal (envWithState staticEnv state) id)
+                                    (envWithState staticEnv state)
+                                )
+                                []
+                            , body
+                            )
 
                 Nothing ->
                     rBase (delegateCoreApply (envWithState staticEnv state) id [])
@@ -1285,11 +1486,11 @@ evalRDirect env expr =
                     aErr
 
         RLocal i ->
-            case List.drop i env.locals of
-                value :: _ ->
+            case localAt i env.locals of
+                Just value ->
                     EvOk value
 
-                [] ->
+                Nothing ->
                     evErr env
                         (TypeError
                             ("RLocal "
@@ -1414,8 +1615,8 @@ evalRDirect env expr =
                     )
 
         RRecordUpdate slotIdx setters ->
-            case List.drop slotIdx env.locals of
-                (Record originalDict) :: _ ->
+            case localAt slotIdx env.locals of
+                Just (Record originalDict) ->
                     evalRecordFields env setters
                         |> mapResult
                             (\newFields ->
@@ -1429,7 +1630,7 @@ evalRDirect env expr =
                                     )
                             )
 
-                other :: _ ->
+                Just other ->
                     evErr env
                         (TypeError
                             ("record update target (slot "
@@ -1439,7 +1640,7 @@ evalRDirect env expr =
                             )
                         )
 
-                [] ->
+                Nothing ->
                     evErr env
                         (TypeError
                             ("record update slot "
@@ -1472,11 +1673,11 @@ evalRDirect env expr =
         RApply headExpr argExprs ->
             case tailLoopLocalsBuilder env headExpr argExprs of
                 Just buildLocals ->
-                    evalExprList env argExprs
-                        |> andThenList
-                            (\argValues ->
-                                tailCallLocalsResult env (buildLocals argValues)
-                            )
+                            evalExprList env argExprs
+                                |> andThenList
+                                    (\argValues ->
+                                        tailCallLocalsResult env (buildLocals argValues)
+                                    )
 
                 Nothing ->
                     -- Fast path for core-backed globals: evaluate the args, then
@@ -1782,7 +1983,7 @@ runRExprClosure env maybeQualifiedName implBody selfClosure args =
 
         bodyLocals : List Value
         bodyLocals =
-            List.foldl (::) withSelf args
+            prependArgsToLocals withSelf args
     in
     if isDirectSelfClosureLoop implBody (List.length args) then
         directLoopError env maybeQualifiedName
@@ -1796,7 +1997,7 @@ runRExprClosure env maybeQualifiedName implBody selfClosure args =
                 let
                     enteredEnv : REnv
                     enteredEnv =
-                        prepareResolvedCall env
+                        prepareResolvedCallFor maybeQualifiedName env
                 in
                 evalR { enteredEnv | locals = bodyLocals } implBody.body
 
@@ -1808,6 +2009,28 @@ prependRepeated n value list =
 
     else
         prependRepeated (n - 1) value (value :: list)
+
+
+prependArgsToLocals : List Value -> List Value -> List Value
+prependArgsToLocals base args =
+    case args of
+        [] ->
+            base
+
+        [ a ] ->
+            a :: base
+
+        [ a, b ] ->
+            b :: a :: base
+
+        [ a, b, c ] ->
+            c :: b :: a :: base
+
+        [ a, b, c, d ] ->
+            d :: c :: b :: a :: base
+
+        _ ->
+            List.foldl (::) base args
 
 
 memoSpecForGlobal : REnv -> IR.GlobalId -> Maybe ( String, MemoSpec.MemoSpec )
@@ -2097,7 +2320,7 @@ tailLoopLocalsBuilder env headExpr argExprs =
             case headExpr of
                 RGlobal id ->
                     if id == target.id && List.length argExprs == target.arity then
-                        Just (\argValues -> List.foldl (::) [] argValues)
+                        Just (\argValues -> prependArgsToLocals [] argValues)
 
                     else
                         Nothing
@@ -2109,7 +2332,7 @@ tailLoopLocalsBuilder env headExpr argExprs =
             case ( env.tailLoopClosureSelfIndex, headExpr ) of
                 ( Just selfIndex, RLocal index ) ->
                     if index == selfIndex && List.length argExprs == target.arity then
-                        Just (\argValues -> List.foldl (::) target.prefixLocals argValues)
+                        Just (\argValues -> prependArgsToLocals target.prefixLocals argValues)
 
                     else
                         Nothing
@@ -2128,7 +2351,7 @@ maybeRunResolvedGlobalTailLoop :
     -> List Value
     -> Maybe (EvalResult Value)
 maybeRunResolvedGlobalTailLoop env id lambda argValues =
-    if isTailRecursiveResolved (SelfGlobal id) lambda.arity lambda.body then
+    if isKnownTailRecursiveGlobal env id lambda then
         Just
             (runResolvedTailLoop
                 env
@@ -2139,11 +2362,25 @@ maybeRunResolvedGlobalTailLoop env id lambda argValues =
                     }
                 )
                 lambda.body
-                (List.foldl (::) [] argValues)
+                (prependArgsToLocals [] argValues)
             )
 
     else
         Nothing
+
+
+isKnownTailRecursiveGlobal :
+    REnv
+    -> IR.GlobalId
+    -> { arity : Int, body : RExpr }
+    -> Bool
+isKnownTailRecursiveGlobal env id lambda =
+    case FastDict.get id env.tailRecursiveGlobals of
+        Just isTailRec ->
+            isTailRec
+
+        Nothing ->
+            isTailRecursiveGlobal id lambda
 
 
 maybeRunResolvedClosureTailLoop :
@@ -2158,8 +2395,10 @@ maybeRunResolvedClosureTailLoop :
     -> List Value
     -> Maybe (EvalResult Value)
 maybeRunResolvedClosureTailLoop env debugName implBody selfClosure args =
-    if implBody.selfSlots > 0
-        && isTailRecursiveResolved (SelfLocal (List.length args)) (List.length args) implBody.body
+    if
+        implBody.selfSlots
+            > 0
+            && isTailRecursiveResolved (SelfLocal (List.length args)) (List.length args) implBody.body
     then
         let
             prefixLocals : List Value
@@ -2176,7 +2415,7 @@ maybeRunResolvedClosureTailLoop env debugName implBody selfClosure args =
                     }
                 )
                 implBody.body
-                (List.foldl (::) prefixLocals args)
+                (prependArgsToLocals prefixLocals args)
             )
 
     else
@@ -2190,7 +2429,7 @@ runResolvedTailLoop env target body initialLocals =
         body
         (tailLoopRemainingBudget env.fallbackConfig.maxSteps)
         0
-        16
+        (initialTailLoopCheckInterval initialLocals)
         0
         0
         0
@@ -2285,17 +2524,46 @@ runResolvedTailLoopHelp target body remaining iterationsSinceCheck currentInterv
                                 newSize =
                                     tailLoopLocalsSize newLocals
 
-                                newFingerprint : Int
-                                newFingerprint =
-                                    tailLoopLocalsFingerprint newLocals
+                                {- When the aggregate locals size has changed,
+                                   we already know enough for the recursion
+                                   guard: shrinking means bounded progress;
+                                   growing means potential divergence. The
+                                   fingerprint only matters in the equal-size
+                                   case, so compute it lazily to avoid repeated
+                                   full-list walks on large shrinking loops
+                                   like `List.Extra.isInfixOfHelp`.
+                                -}
+                                equalSize : Bool
+                                equalSize =
+                                    newSize == lastSize
+
+                                maybeNewFingerprint : Maybe Int
+                                maybeNewFingerprint =
+                                    if equalSize then
+                                        Just (tailLoopLocalsFingerprint newLocals)
+
+                                    else
+                                        Nothing
 
                                 identicalFingerprint : Bool
                                 identicalFingerprint =
-                                    newFingerprint == lastFingerprint && newSize == lastSize
+                                    case maybeNewFingerprint of
+                                        Just newFingerprint ->
+                                            newFingerprint == lastFingerprint
+
+                                        Nothing ->
+                                            False
 
                                 boundedProgress : Bool
                                 boundedProgress =
-                                    tailLoopHasBoundedProgress env.locals newLocals
+                                    if newSize < lastSize then
+                                        True
+
+                                    else if equalSize then
+                                        tailLoopHasBoundedProgress env.locals newLocals
+
+                                    else
+                                        False
 
                                 newGrowCount : Int
                                 newGrowCount =
@@ -2327,7 +2595,7 @@ runResolvedTailLoopHelp target body remaining iterationsSinceCheck currentInterv
                                     nextInterval : Int
                                     nextInterval =
                                         if newGrowCount == 0 then
-                                            min (currentInterval * 2) 65536
+                                            min (currentInterval * 4) 65536
 
                                         else
                                             max 16 (currentInterval // 2)
@@ -2340,7 +2608,7 @@ runResolvedTailLoopHelp target body remaining iterationsSinceCheck currentInterv
                                     nextInterval
                                     newSize
                                     newGrowCount
-                                    newFingerprint
+                                    (Maybe.withDefault lastFingerprint maybeNewFingerprint)
                                     (replaceTailLoopLocals target newLocals env)
 
                     Nothing ->
@@ -2459,12 +2727,21 @@ tailLoopRemainingBudget maybeSteps =
     Maybe.withDefault 5000000 maybeSteps
 
 
+initialTailLoopCheckInterval : List Value -> Int
+initialTailLoopCheckInterval initialLocals =
+    if tailLoopHasClosures initialLocals then
+        16
+
+    else
+        64
+
+
 prepareResolvedTailLoopEnv : REnv -> TailLoopTarget -> List Value -> REnv
 prepareResolvedTailLoopEnv env target locals =
     let
         enteredEnv : REnv
         enteredEnv =
-            prepareResolvedCall env
+            prepareResolvedCallFor (tailLoopDebugName target) env
     in
     { enteredEnv
         | locals = locals
@@ -2541,8 +2818,10 @@ tailLoopHasBoundedProgress oldLocals newLocals =
                 newSize =
                     tailLoopSizeOfValue newHead
             in
-            (oldSize == newSize
-                && tailLoopValueFingerprint oldHead /= tailLoopValueFingerprint newHead
+            (oldSize
+                == newSize
+                && tailLoopValueFingerprint oldHead
+                /= tailLoopValueFingerprint newHead
             )
                 || tailLoopHasBoundedProgress oldRest newRest
 
@@ -2597,6 +2876,11 @@ tailLoopSizeOfValue value =
             1
 
 
+isTailRecursiveGlobal : IR.GlobalId -> { arity : Int, body : RExpr } -> Bool
+isTailRecursiveGlobal id lambda =
+    isTailRecursiveResolved (SelfGlobal id) lambda.arity lambda.body
+
+
 isTailRecursiveResolved : SelfReference -> Int -> RExpr -> Bool
 isTailRecursiveResolved selfRef arity body =
     containsSelfReference selfRef body
@@ -2640,7 +2924,8 @@ isTailRecursiveResolvedHelp selfRef arity expr =
 
         RApply head args ->
             selfReferenceMatches selfRef head
-                && List.length args == arity
+                && List.length args
+                == arity
                 && not (List.any (containsSelfReference selfRef) args)
 
         _ ->
@@ -2652,7 +2937,8 @@ isTailSafeResolved selfRef arity expr =
     case expr of
         RApply head args ->
             if selfReferenceMatches selfRef head then
-                List.length args == arity
+                List.length args
+                    == arity
                     && not (List.any (containsSelfReference selfRef) args)
 
             else
@@ -2900,6 +3186,33 @@ prepareResolvedCall env =
         }
 
 
+prepareResolvedCallFor : Maybe QualifiedNameRef -> REnv -> REnv
+prepareResolvedCallFor maybeQualifiedName env =
+    let
+        enteredEnv : REnv
+        enteredEnv =
+            prepareResolvedCall env
+    in
+    case maybeQualifiedName of
+        Just qualifiedName ->
+            let
+                enteredFallbackEnv : Env
+                enteredFallbackEnv =
+                    Environment.call
+                        qualifiedName.moduleName
+                        qualifiedName.name
+                        env.fallbackEnv
+            in
+            { enteredEnv
+                | currentModule = qualifiedName.moduleName
+                , callStack = qualifiedName :: env.callStack
+                , fallbackEnv = enteredFallbackEnv
+            }
+
+        Nothing ->
+            enteredEnv
+
+
 stateFromEnv : REnv -> List Value -> EvalState
 stateFromEnv env locals =
     { locals = locals
@@ -3006,6 +3319,21 @@ evalGlobal env id =
 
         Nothing ->
             case FastDict.get id env.resolvedBodies of
+                Just (RLambda lambda) ->
+                    let
+                        debugName : Maybe QualifiedNameRef
+                        debugName =
+                            qualifiedNameForGlobal env id
+                    in
+                    EvOk
+                        (makeClosure
+                            (prepareResolvedCallFor debugName env)
+                            lambda.arity
+                            lambda.body
+                            0
+                            debugName
+                        )
+
                 Just body ->
                     if isDirectSelfGlobalLoop id body then
                         directSelfLoopError env id
@@ -3018,7 +3346,7 @@ evalGlobal env id =
                         let
                             enteredEnv : REnv
                             enteredEnv =
-                                prepareResolvedCall env
+                                prepareResolvedCallFor (qualifiedNameForGlobal env id) env
                         in
                         evalR { enteredEnv | locals = [] } body
 
@@ -3129,11 +3457,13 @@ dispatchGlobalApplyNoIntercept env id argValues =
                                                 let
                                                     enteredEnv : REnv
                                                     enteredEnv =
-                                                        prepareResolvedCall env
+                                                        prepareResolvedCallFor
+                                                            (qualifiedNameForGlobal env id)
+                                                            env
 
                                                     bodyLocals : List Value
                                                     bodyLocals =
-                                                        List.foldl (::) [] argValues
+                                                        prependArgsToLocals [] argValues
                                                 in
                                                 evalR { enteredEnv | locals = bodyLocals } lambda.body
 
@@ -3141,7 +3471,9 @@ dispatchGlobalApplyNoIntercept env id argValues =
                                     let
                                         enteredEnv : REnv
                                         enteredEnv =
-                                            prepareResolvedCall env
+                                            prepareResolvedCallFor
+                                                (qualifiedNameForGlobal env id)
+                                                env
                                     in
                                     evalR { enteredEnv | locals = [] } body
                                         |> andThenValue
@@ -3153,7 +3485,9 @@ dispatchGlobalApplyNoIntercept env id argValues =
                                 let
                                     enteredEnv : REnv
                                     enteredEnv =
-                                        prepareResolvedCall env
+                                        prepareResolvedCallFor
+                                            (qualifiedNameForGlobal env id)
+                                            env
                                 in
                                 evalR { enteredEnv | locals = [] } body
                                     |> andThenValue
@@ -3223,6 +3557,26 @@ delegateCoreApply env id args =
         Just dispatcher ->
             if List.length args == dispatcher.arity then
                 dispatcher.kernelFn args env.fallbackConfig env.fallbackEnv
+
+            else if List.length args < dispatcher.arity then
+                case FastDict.get id env.globalIdToName of
+                    Just ( moduleName, name ) ->
+                        EvOk
+                            (PartiallyApplied
+                                (Environment.empty moduleName)
+                                args
+                                (List.repeat dispatcher.arity (Syntax.fakeNode AllPattern))
+                                (Just
+                                    { moduleName = moduleName
+                                    , name = name
+                                    }
+                                )
+                                (KernelImpl moduleName name dispatcher.kernelFn)
+                                dispatcher.arity
+                            )
+
+                    Nothing ->
+                        delegateViaAst env id args
 
             else
                 -- Partial or over-application of a kernel function:
@@ -3327,6 +3681,12 @@ delegateByName env moduleName name args =
             }
     in
     Eval.Expression.evalExpression fullExpr env.fallbackConfig dispatchEnv
+        |> (if env.logDelegateCalls then
+                DelegateCounter.log moduleName name
+
+            else
+                identity
+           )
         |> (if DelegateCounter.enabled env.interceptsByGlobal then
                 DelegateCounter.emit moduleName name
 
@@ -3374,12 +3734,24 @@ evalCaseBranches :
     -> List ( IR.RPattern, RExpr )
     -> EvalResult Value
 evalCaseBranches env scrutinee branches =
+    evalCaseBranchesHelp branches env scrutinee branches
+
+
+evalCaseBranchesHelp :
+    List ( IR.RPattern, RExpr )
+    -> REnv
+    -> Value
+    -> List ( IR.RPattern, RExpr )
+    -> EvalResult Value
+evalCaseBranchesHelp allBranches env scrutinee branches =
     case branches of
         [] ->
             evErr env
                 (TypeError
                     ("case expression failed to match any branch for value: "
                         ++ Value.toString scrutinee
+                        ++ " | branches: "
+                        ++ patternListSummary allBranches
                     )
                 )
 
@@ -3397,7 +3769,70 @@ evalCaseBranches env scrutinee branches =
                         branchBody
 
                 Nothing ->
-                    evalCaseBranches env scrutinee rest
+                    evalCaseBranchesHelp allBranches env scrutinee rest
+
+
+patternListSummary : List ( IR.RPattern, RExpr ) -> String
+patternListSummary branches =
+    case branches of
+        [] ->
+            "<unknown>"
+
+        _ ->
+            branches
+                |> List.map Tuple.first
+                |> List.map patternSummary
+                |> String.join " | "
+
+
+patternSummary : IR.RPattern -> String
+patternSummary pattern =
+    case pattern of
+        IR.RPVar ->
+            "<var>"
+
+        IR.RPWildcard ->
+            "_"
+
+        IR.RPUnit ->
+            "()"
+
+        IR.RPInt i ->
+            String.fromInt i
+
+        IR.RPFloat f ->
+            String.fromFloat f
+
+        IR.RPChar c ->
+            "'" ++ String.fromChar c ++ "'"
+
+        IR.RPString s ->
+            "\"" ++ s ++ "\""
+
+        IR.RPTuple2 left right ->
+            "(" ++ patternSummary left ++ ", " ++ patternSummary right ++ ")"
+
+        IR.RPTuple3 first second third ->
+            "(" ++ patternSummary first ++ ", " ++ patternSummary second ++ ", " ++ patternSummary third ++ ")"
+
+        IR.RPRecord fields ->
+            "{ " ++ String.join ", " fields ++ " }"
+
+        IR.RPCons headPattern tailPattern ->
+            patternSummary headPattern ++ " :: " ++ patternSummary tailPattern
+
+        IR.RPList items ->
+            "[" ++ String.join ", " (List.map patternSummary items) ++ "]"
+
+        IR.RPCtor ref args ->
+            if List.isEmpty args then
+                ref.name
+
+            else
+                ref.name ++ " " ++ String.join " " (List.map patternSummary args)
+
+        IR.RPAs inner ->
+            patternSummary inner ++ " as <binding>"
 
 
 

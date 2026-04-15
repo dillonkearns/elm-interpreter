@@ -10,13 +10,13 @@ import Core.Bytes.Decode
 import Core.Bytes.Encode
 import Core.Char
 import Core.Debug
+import Core.Dict
 import Core.Elm.JsArray
+import Core.Elm.Kernel.Parser
 import Core.Json.Decode
 import Core.Json.Encode
-import Core.Elm.Kernel.Parser
-import Core.Regex
-import Core.Dict
 import Core.List
+import Core.Regex
 import Core.Set
 import Core.String
 import Elm.Syntax.Expression as Expression exposing (Expression(..), FunctionImplementation)
@@ -28,8 +28,8 @@ import EvalResult
 import FastDict as Dict exposing (Dict)
 import Kernel.Basics
 import Kernel.Bytes
-import Kernel.Dict
 import Kernel.Debug
+import Kernel.Dict
 import Kernel.JsArray
 import Kernel.Json
 import Kernel.List
@@ -92,6 +92,18 @@ functions evalFunction =
 
     -- Elm.Kernel.Bitwise
     , ( [ "Elm", "Kernel", "Bitwise" ]
+      , [ ( "and", two int int to int Bitwise.and Core.Bitwise.and )
+        , ( "complement", one int to int Bitwise.complement Core.Bitwise.complement )
+        , ( "or", two int int to int Bitwise.or Core.Bitwise.or )
+        , ( "shiftLeftBy", two int int to int Bitwise.shiftLeftBy Core.Bitwise.shiftLeftBy )
+        , ( "shiftRightBy", two int int to int Bitwise.shiftRightBy Core.Bitwise.shiftRightBy )
+        , ( "shiftRightZfBy", two int int to int Bitwise.shiftRightZfBy Core.Bitwise.shiftRightZfBy )
+        , ( "xor", two int int to int Bitwise.xor Core.Bitwise.xor )
+        ]
+      )
+
+    -- Native Bitwise.* thin-wrapper short circuits.
+    , ( [ "Bitwise" ]
       , [ ( "and", two int int to int Bitwise.and Core.Bitwise.and )
         , ( "complement", one int to int Bitwise.complement Core.Bitwise.complement )
         , ( "or", two int int to int Bitwise.or Core.Bitwise.or )
@@ -300,6 +312,50 @@ functions evalFunction =
         ]
       )
 
+    -- Native String.* thin-wrapper short circuits. These keep the
+    -- user-level wrapper signatures (`List String`, etc.) intact, so
+    -- they are safe drop-ins unlike prefix-stripped Elm.Kernel names.
+    , ( [ "String" ]
+      , [ ( "isEmpty", one string to bool String.isEmpty Core.String.isEmpty )
+        , ( "length", one string to int String.length Core.String.length )
+        , ( "reverse", one string to string String.reverse Core.String.reverse )
+        , ( "repeat", two int string to string String.repeat Core.String.repeat )
+        , ( "replace", three string string string to string String.replace Core.String.replace )
+        , ( "append", two string string to string String.append Core.String.append )
+        , ( "concat", one (list string) to string String.concat Core.String.concat )
+        , ( "split", two string string to (list string) String.split Core.String.split )
+        , ( "join", two string (list string) to string String.join Core.String.join )
+        , ( "words", one string to (list string) String.words Core.String.words )
+        , ( "lines", one string to (list string) String.lines Core.String.lines )
+        , ( "slice", three int int string to string String.slice Core.String.slice )
+        , ( "left", two int string to string String.left Core.String.left )
+        , ( "right", two int string to string String.right Core.String.right )
+        , ( "dropLeft", two int string to string String.dropLeft Core.String.dropLeft )
+        , ( "dropRight", two int string to string String.dropRight Core.String.dropRight )
+        , ( "contains", two string string to bool String.contains Core.String.contains )
+        , ( "startsWith", two string string to bool String.startsWith Core.String.startsWith )
+        , ( "endsWith", two string string to bool String.endsWith Core.String.endsWith )
+        , ( "indexes", two string string to (list int) String.indexes Core.String.indexes )
+        , ( "toUpper", one string to string String.toUpper Core.String.toUpper )
+        , ( "toLower", one string to string String.toLower Core.String.toLower )
+        , ( "pad", three int char string to string String.pad Core.String.pad )
+        , ( "padLeft", three int char string to string String.padLeft Core.String.padLeft )
+        , ( "padRight", three int char string to string String.padRight Core.String.padRight )
+        , ( "trim", one string to string String.trim Core.String.trim )
+        , ( "trimLeft", one string to string String.trimLeft Core.String.trimLeft )
+        , ( "trimRight", one string to string String.trimRight Core.String.trimRight )
+        , ( "toInt", one string to (maybe int) String.toInt Core.String.toInt )
+        , ( "fromInt", one int to string String.fromInt Core.String.fromInt )
+        , ( "toFloat", one string to (maybe float) String.toFloat Core.String.toFloat )
+        , ( "fromFloat", oneWithError anything to string stringFromFloat Core.String.fromFloat )
+        , ( "toList", one string to (list char) String.toList Core.String.toList )
+        , ( "fromList", one (list char) to string String.fromList Core.String.fromList )
+        , ( "fromChar", one char to string String.fromChar Core.String.fromChar )
+        , ( "cons", two char string to string String.cons Core.String.cons )
+        , ( "uncons", one string to (maybe (tuple char string)) String.uncons Core.String.uncons )
+        ]
+      )
+
     -- Elm.Kernel.Utils
     , ( [ "Elm", "Kernel", "Utils" ]
       , [ ( "append", twoWithError anything anything to anything Kernel.Utils.append Core.Basics.append )
@@ -310,6 +366,54 @@ functions evalFunction =
         , ( "equal", Kernel.Utils.comparison [ EQ ] )
         , ( "notEqual", Kernel.Utils.comparison [ LT, GT ] )
         , ( "compare", twoWithError anything anything to order Kernel.Utils.compare Core.Basics.compare )
+        ]
+      )
+
+    -- Native Basics.* thin-wrapper short circuits. Keep this to
+    -- non-higher-order entries; composition helpers still run through
+    -- the user-source wrappers for now.
+    , ( [ "Basics" ]
+      , [ ( "add", twoNumbers (+) (+) Core.Basics.add )
+        , ( "sub", twoNumbers (-) (-) Core.Basics.sub )
+        , ( "mul", twoNumbers (*) (*) Core.Basics.mul )
+        , ( "fdiv", two float float to float (/) Core.Basics.fdiv )
+        , ( "idiv", twoWithError int int to int Kernel.Basics.idiv Core.Basics.idiv )
+        , ( "pow", twoNumbers (^) (^) Core.Basics.pow )
+        , ( "toFloat", one int to float toFloat Core.Basics.toFloat )
+        , ( "round", one float to int round Core.Basics.round )
+        , ( "floor", one float to int floor Core.Basics.floor )
+        , ( "ceiling", one float to int ceiling Core.Basics.ceiling )
+        , ( "truncate", one float to int truncate Core.Basics.truncate )
+        , ( "eq", Kernel.Utils.comparison [ EQ ] )
+        , ( "neq", Kernel.Utils.comparison [ LT, GT ] )
+        , ( "lt", Kernel.Utils.comparison [ LT ] )
+        , ( "gt", Kernel.Utils.comparison [ GT ] )
+        , ( "le", Kernel.Utils.comparison [ LT, EQ ] )
+        , ( "ge", Kernel.Utils.comparison [ GT, EQ ] )
+        , ( "min", twoWithError anything anything to anything basicsMin Core.Basics.min )
+        , ( "max", twoWithError anything anything to anything basicsMax Core.Basics.max )
+        , ( "compare", twoWithError anything anything to order Kernel.Utils.compare Core.Basics.compare )
+        , ( "not", one bool to bool not Core.Basics.not )
+        , ( "and", two bool bool to bool (&&) Core.Basics.and )
+        , ( "or", two bool bool to bool (||) Core.Basics.or )
+        , ( "xor", two bool bool to bool xor Core.Basics.xor )
+        , ( "append", twoWithError anything anything to anything Kernel.Utils.append Core.Basics.append )
+        , ( "modBy", twoWithError int int to int Kernel.Basics.modBy Core.Basics.modBy )
+        , ( "remainderBy", twoWithError int int to int Kernel.Basics.remainderBy Core.Basics.remainderBy )
+        , ( "negate", oneWithError anything to anything basicsNegate Core.Basics.negate )
+        , ( "sqrt", one float to float sqrt Core.Basics.sqrt )
+        , ( "logBase", two float float to float logBase Core.Basics.logBase )
+        , ( "e", constant float e )
+        , ( "pi", constant float pi )
+        , ( "cos", one float to float cos Core.Basics.cos )
+        , ( "sin", one float to float sin Core.Basics.sin )
+        , ( "tan", one float to float tan Core.Basics.tan )
+        , ( "acos", one float to float acos Core.Basics.acos )
+        , ( "asin", one float to float asin Core.Basics.asin )
+        , ( "atan", one float to float atan Core.Basics.atan )
+        , ( "atan2", two float float to float atan2 Core.Basics.atan2 )
+        , ( "isNaN", one float to bool isNaN Core.Basics.isNaN )
+        , ( "isInfinite", one float to bool isInfinite Core.Basics.isInfinite )
         ]
       )
 
@@ -326,7 +430,7 @@ functions evalFunction =
         , ( "addEntry", threeWithError (function evalFunction anything to anything) anything anyList to anyList Kernel.Json.addEntry Core.Json.Encode.null )
         , ( "addField", three string anything anything to anything Kernel.Json.addField Core.Json.Encode.null )
 
-          -- Decode constructors
+        -- Decode constructors
         , ( "decodeString", constant anything Kernel.Json.decodeString )
         , ( "decodeBool", constant anything Kernel.Json.decodeBool )
         , ( "decodeInt", constant anything Kernel.Json.decodeInt )
@@ -351,7 +455,7 @@ functions evalFunction =
         , ( "map8", jsonMapNEntry 9 )
         , ( "andThen", two anything anything to anything Kernel.Json.jsonAndThen Core.Json.Decode.andThen )
 
-          -- Decode runners (need evalFunction)
+        -- Decode runners (need evalFunction)
         , ( "runOnString", jsonRunOnString evalFunction )
         , ( "run", jsonRun evalFunction )
         ]
@@ -449,6 +553,57 @@ functions evalFunction =
         |> Dict.fromList
 
 
+basicsMin : Value -> Value -> Eval Value
+basicsMin left right cfg env =
+    Kernel.Utils.compare left right cfg env
+        |> EvalResult.map
+            (\ordering ->
+                case ordering of
+                    LT ->
+                        left
+
+                    _ ->
+                        right
+            )
+
+
+basicsMax : Value -> Value -> Eval Value
+basicsMax left right cfg env =
+    Kernel.Utils.compare left right cfg env
+        |> EvalResult.map
+            (\ordering ->
+                case ordering of
+                    GT ->
+                        left
+
+                    _ ->
+                        right
+            )
+
+
+basicsNegate : Value -> Eval Value
+basicsNegate value _ env =
+    case value of
+        Int intValue ->
+            EvalResult.succeed (Int (negate intValue))
+
+        Float floatValue ->
+            EvalResult.succeed (Float (negate floatValue))
+
+        _ ->
+            EvalResult.fail <| typeError env <| "Cannot negate " ++ Value.toString value
+
+
+stringFromFloat : Value -> Eval String
+stringFromFloat value _ env =
+    case value of
+        Float floatValue ->
+            EvalResult.succeed (String.fromFloat floatValue)
+
+        _ ->
+            EvalResult.fail <| typeError env <| "Expected a Float, got " ++ Value.toString value
+
+
 log : FunctionImplementation
 log =
     { name = fakeNode "log"
@@ -489,12 +644,14 @@ randomNextKernel _ =
                         else
                             EvalResult.fail <|
                                 typeError env <|
-                                    "Random.next (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+                                    "Random.next (kernel): expected Random.Seed, got "
+                                        ++ Value.toString seedValue
 
                     _ ->
                         EvalResult.fail <|
                             typeError env <|
-                                "Random.next (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+                                "Random.next (kernel): expected Random.Seed, got "
+                                    ++ Value.toString seedValue
 
             _ ->
                 EvalResult.fail <|
@@ -512,6 +669,7 @@ roughly 1.4 seconds of interpreted work per value.
 
 Defining it here makes it a real host-Elm module-level constant: computed
 once at Kernel module load time, then looked up in O(log n) via `Array.get`.
+
 -}
 fuzzFloatExponentMapping : Array Int
 fuzzFloatExponentMapping =
@@ -569,9 +727,9 @@ fuzzFloatReorderExponentKernel _ =
     peel (Seed state _) =
         let
             word =
-                (Bitwise.xor state (Bitwise.shiftRightZfBy ((Bitwise.shiftRightZfBy 28 state) + 4) state)) * 277803737
+                Bitwise.xor state (Bitwise.shiftRightZfBy (Bitwise.shiftRightZfBy 28 state + 4) state) * 277803737
         in
-            Bitwise.shiftRightZfBy 0 (Bitwise.xor (Bitwise.shiftRightZfBy 22 word) word)
+        Bitwise.shiftRightZfBy 0 (Bitwise.xor (Bitwise.shiftRightZfBy 22 word) word)
 
 -}
 randomPeelKernel : ModuleName -> ( Int, List Value -> Eval Value )
@@ -588,12 +746,14 @@ randomPeelKernel _ =
                         else
                             EvalResult.fail <|
                                 typeError env <|
-                                    "Random.peel (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+                                    "Random.peel (kernel): expected Random.Seed, got "
+                                        ++ Value.toString seedValue
 
                     _ ->
                         EvalResult.fail <|
                             typeError env <|
-                                "Random.peel (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+                                "Random.peel (kernel): expected Random.Seed, got "
+                                    ++ Value.toString seedValue
 
             _ ->
                 EvalResult.fail <|
@@ -642,6 +802,7 @@ whose body is `KernelImpl "Random" "intStep" intStepKernel`. The lo/hi are
 stored as `oldArgs` so when `Random.step` (pure Elm source) unwraps the
 Generator and applies the closure to the seed, the interpreter concatenates
 oldArgs ++ [seed] and hands all three to `intStepKernel` in one shot.
+
 -}
 randomIntKernel : ModuleName -> ( Int, List Value -> Eval Value )
 randomIntKernel _ =
@@ -770,7 +931,8 @@ intStepKernelImpl args _ env =
                 _ ->
                     EvalResult.fail <|
                         typeError env <|
-                            "Random.int step (kernel): expected Random.Seed, got " ++ Value.toString seedValue
+                            "Random.int step (kernel): expected Random.Seed, got "
+                                ++ Value.toString seedValue
 
         _ ->
             EvalResult.fail <|
@@ -1125,14 +1287,14 @@ jsArray selector =
 the interpreter can produce.
 
 **IMPORTANT for anyone adding kernel wrappers or new selectors:** there
-are *two* Value representations a user can legitimately pass as a
+are _two_ Value representations a user can legitimately pass as a
 function, and this selector (and anything analogous) MUST handle both:
 
 1.  `PartiallyApplied` — anonymous lambdas, top-level functions, let
     bindings, any closure produced by `evalFunction` /
     `mkPartiallyApplied`.
 
-2.  `Custom ref customArgs` — a partially-applied *type constructor*
+2.  `Custom ref customArgs` — a partially-applied _type constructor_
     (`Node Range.emptyRange`, `Just`, `Tuple.pair 1`, etc.). These show
     up whenever user code passes a constructor as a higher-order
     argument, e.g.
@@ -1153,6 +1315,7 @@ Node {…}") before the error was swallowed by
 When in doubt, cross-reference this selector with
 `Kernel.Json.applyFunction`, which is the other place in the codebase
 that goes "Value → callable" and has always handled both branches.
+
 -}
 function :
     EvalFunction
@@ -1470,7 +1633,6 @@ threeWithError firstSelector secondSelector thirdSelector _ output f implementat
             _ ->
                 err ("[ " ++ String.join ", " (List.map Value.toString args) ++ " ]")
     )
-
 
 
 partiallyApply : ModuleName -> List Value -> FunctionImplementation -> EvalResult Value
@@ -1800,7 +1962,7 @@ bytesDecodeKernel evalFn _ =
     )
 
 
-{-| Bytes read kernel entry for 2-arg read functions (read_u8, read_i8, decodeFailure).
+{-| Bytes read kernel entry for 2-arg read functions (read\_u8, read\_i8, decodeFailure).
 These take (Bytes, Int) -> (Int, Value).
 -}
 bytesRead2 : (Array Int -> Int -> Value) -> FunctionImplementation -> ModuleName -> ( Int, List Value -> Eval Value )
@@ -1822,7 +1984,7 @@ bytesRead2 readFn implementation moduleName =
     )
 
 
-{-| Bytes read kernel entry for 3-arg read functions (read_u16 etc.).
+{-| Bytes read kernel entry for 3-arg read functions (read\_u16 etc.).
 These take (Bool, Bytes, Int) -> (Int, Value). The Bool is already partially applied.
 -}
 bytesRead3 : (Bool -> Array Int -> Int -> Value) -> FunctionImplementation -> ModuleName -> ( Int, List Value -> Eval Value )
@@ -1852,7 +2014,7 @@ bytesRead3 readFn implementation moduleName =
     )
 
 
-{-| Bytes read kernel entry for read_bytes and read_string.
+{-| Bytes read kernel entry for read\_bytes and read\_string.
 These take (Int, Bytes, Int) -> (Int, Value). The Int is the byte count.
 -}
 bytesReadN : (Int -> Array Int -> Int -> Value) -> FunctionImplementation -> ModuleName -> ( Int, List Value -> Eval Value )

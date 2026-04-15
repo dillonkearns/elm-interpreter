@@ -15,6 +15,7 @@ import Eval.Types as Types
 import EvalResult
 import FastDict as Dict exposing (Dict)
 import Kernel
+import Kernel.Basics
 import Kernel.Utils
 import List.Extra
 import MemoSpec
@@ -1608,6 +1609,9 @@ resolveOperator opName =
         "++" ->
             Just ( utilsKernelModuleName, kernelAppend )
 
+        "//" ->
+            Just ( [ "Elm", "Kernel", "Basics" ], kernelIntDiv )
+
         -- All other operators: use the pre-built Dict
         _ ->
             Dict.get opName operatorKernelFunctions
@@ -1771,6 +1775,25 @@ kernelAppend args cfg env =
             EvalResult.fail <| typeError env "Append needs exactly two arguments"
 
 
+kernelIntDiv : List Value -> Eval Value
+kernelIntDiv args cfg env =
+    case args of
+        [ Int left, Int right ] ->
+            Kernel.Basics.idiv left right cfg env
+                |> EvalResult.map Int
+
+        [ left, right ] ->
+            EvalResult.fail <|
+                typeError env <|
+                    "Expected the first argument to be Int and the second argument to be Int, got "
+                        ++ Value.toString left
+                        ++ ", "
+                        ++ Value.toString right
+
+        _ ->
+            EvalResult.fail <| typeError env "Integer division needs exactly two arguments"
+
+
 {-| Compare a list's length to `n` without walking the whole list when
 one side clearly dominates. Short-circuits the moment we know the
 result, so for a length-3 list against arity 2 we stop after 2 cons
@@ -1831,7 +1854,9 @@ evalApplication first rest cfg env =
                     EQ ->
                         -- Saturated call: arg count matches arity exactly.
                         -- Eval all args via the hot path, then run the body.
-                        evalArgsThen rest cfg env
+                        evalArgsThen rest
+                            cfg
+                            env
                             (\args ->
                                 evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg env
                             )
@@ -1845,7 +1870,9 @@ evalApplication first rest cfg env =
                         -- would derive arity from `List.length patterns`
                         -- and silently zero it out for `RExprImpl`
                         -- closures whose patterns list is always empty).
-                        evalArgsThen rest cfg env
+                        evalArgsThen rest
+                            cfg
+                            env
                             (\args ->
                                 Types.succeedPartial <|
                                     PartiallyApplied localEnv args patterns maybeQualifiedName implementation patternsLength
@@ -2652,12 +2679,13 @@ weren't precomputed at project load — let-bound functions, anonymous
 lambdas, etc. — in which case the caller falls back to a live
 `isTailRecursive` / `TcoAnalysis.analyze` walk of the body.
 
-The `env` passed must be the function's *callee* env (i.e. the env
+The `env` passed must be the function's _callee_ env (i.e. the env
 after `Environment.call*` has switched `currentModule` /
 `currentModuleKey` to the qualified-name's module). That lets us use
 `env.currentModuleKey` directly as the outer lookup key and skip the
 per-call `Environment.moduleKey` string concat that this function
 profiles at the top of the cold-eval hot path.
+
 -}
 lookupTcoMetadata : QualifiedNameRef -> Env -> Maybe TcoAnalysis.TcoMetadata
 lookupTcoMetadata qualifiedName env =
