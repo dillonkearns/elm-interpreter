@@ -130,5 +130,5 @@ packageAggressive =
     { default
         | inlinePrecomputedRefs = True
         , inlineFunctions = True
-        , inlineFunctionMaxSize = 30
+        , inlineFunctionMaxSize = 60
     }

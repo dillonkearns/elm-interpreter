@@ -4413,83 +4413,83 @@ evalRecordUpdate (Node range name) setters cfg env =
 evalOperator : String -> PartialEval Value
 evalOperator opName cfg env =
     case Dict.get opName Core.operators of
-        Nothing ->
-            Types.failPartial <| nameError env opName
+            Nothing ->
+                Types.failPartial <| nameError env opName
 
-        Just operatorRef ->
-            -- Look up the actual function implementation to avoid circular
-            -- references (e.g., Parser.keeper = (|=) which maps back to keeper).
-            -- Resolve through the functions dictionary to get the real implementation.
-            let
-                resolvedRef : { moduleName : ModuleName, name : String, function : Maybe Expression.FunctionImplementation }
-                resolvedRef =
-                    resolveOperatorFunction operatorRef
-            in
-            case resolvedRef.function of
-                Just function ->
-                    if List.isEmpty function.arguments then
-                        -- Zero-arg function (eta-reduced): evaluate its body directly
-                        -- This handles cases like `keeper = A.keeper` or `keeper = (|=)`
-                        Recursion.recurse
-                            ( function.expression
-                            , cfg
-                            , { env
-                                | currentModule = resolvedRef.moduleName
-                                , currentModuleKey = Environment.moduleKey resolvedRef.moduleName
-                                , currentModuleFunctions =
-                                    Dict.get (Environment.moduleKey resolvedRef.moduleName) env.shared.functions
-                                        |> Maybe.withDefault Dict.empty
-                                , letFunctions = Dict.empty
-                                , values = Dict.empty
-                                , imports =
-                                    Dict.get (Environment.moduleKey resolvedRef.moduleName) env.shared.moduleImports
-                                        |> Maybe.withDefault env.imports
-                              }
-                            )
+            Just operatorRef ->
+                -- Look up the actual function implementation to avoid circular
+                -- references (e.g., Parser.keeper = (|=) which maps back to keeper).
+                -- Resolve through the functions dictionary to get the real implementation.
+                let
+                    resolvedRef : { moduleName : ModuleName, name : String, function : Maybe Expression.FunctionImplementation }
+                    resolvedRef =
+                        resolveOperatorFunction operatorRef
+                in
+                case resolvedRef.function of
+                    Just function ->
+                        if List.isEmpty function.arguments then
+                            -- Zero-arg function (eta-reduced): evaluate its body directly
+                            -- This handles cases like `keeper = A.keeper` or `keeper = (|=)`
+                            Recursion.recurse
+                                ( function.expression
+                                , cfg
+                                , { env
+                                    | currentModule = resolvedRef.moduleName
+                                    , currentModuleKey = Environment.moduleKey resolvedRef.moduleName
+                                    , currentModuleFunctions =
+                                        Dict.get (Environment.moduleKey resolvedRef.moduleName) env.shared.functions
+                                            |> Maybe.withDefault Dict.empty
+                                    , letFunctions = Dict.empty
+                                    , values = Dict.empty
+                                    , imports =
+                                        Dict.get (Environment.moduleKey resolvedRef.moduleName) env.shared.moduleImports
+                                            |> Maybe.withDefault env.imports
+                                  }
+                                )
 
-                    else
+                        else
+                            let
+                                callFn =
+                                    if cfg.trace then
+                                        Environment.callModuleFn
+
+                                    else
+                                        Environment.callModuleFnNoStack
+                            in
+                            PartiallyApplied
+                                (callFn resolvedRef.moduleName resolvedRef.name env)
+                                []
+                                function.arguments
+                                (Just { moduleName = resolvedRef.moduleName, name = resolvedRef.name })
+                                (AstImpl function.expression)
+                                (List.length function.arguments)
+                                |> Types.succeedPartial
+
+                    Nothing ->
+                        -- Fallback: function not found in coreFunctions, use indirect call
                         let
                             callFn =
                                 if cfg.trace then
-                                    Environment.call
+                                    Environment.callModuleFn
 
                                 else
-                                    Environment.callNoStack
+                                    Environment.callModuleFnNoStack
                         in
                         PartiallyApplied
-                            (callFn resolvedRef.moduleName resolvedRef.name env)
+                            (callFn operatorRef.moduleName opName env)
                             []
-                            function.arguments
-                            (Just { moduleName = resolvedRef.moduleName, name = resolvedRef.name })
-                            (AstImpl function.expression)
-                            (List.length function.arguments)
+                            [ fakeNode <| VarPattern "$l", fakeNode <| VarPattern "$r" ]
+                            Nothing
+                            (AstImpl <|
+                                fakeNode <|
+                                    Expression.Application
+                                        [ fakeNode <| Expression.FunctionOrValue operatorRef.moduleName operatorRef.name
+                                        , fakeNode <| Expression.FunctionOrValue [] "$l"
+                                        , fakeNode <| Expression.FunctionOrValue [] "$r"
+                                        ]
+                            )
+                            2
                             |> Types.succeedPartial
-
-                Nothing ->
-                    -- Fallback: function not found in coreFunctions, use indirect call
-                    let
-                        callFn =
-                            if cfg.trace then
-                                Environment.call
-
-                            else
-                                Environment.callNoStack
-                    in
-                    PartiallyApplied
-                        (callFn operatorRef.moduleName opName env)
-                        []
-                        [ fakeNode <| VarPattern "$l", fakeNode <| VarPattern "$r" ]
-                        Nothing
-                        (AstImpl <|
-                            fakeNode <|
-                                Expression.Application
-                                    [ fakeNode <| Expression.FunctionOrValue operatorRef.moduleName operatorRef.name
-                                    , fakeNode <| Expression.FunctionOrValue [] "$l"
-                                    , fakeNode <| Expression.FunctionOrValue [] "$r"
-                                    ]
-                        )
-                        2
-                        |> Types.succeedPartial
 
 
 {-| Resolve an operator reference through the function chain.

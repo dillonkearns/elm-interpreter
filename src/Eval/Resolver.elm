@@ -41,20 +41,26 @@ it today.
 
 Destructuring `let` bindings (`let (a, b) = pair in body`) are handled by
 storing the pattern on `RLetBinding`; the evaluator does the pattern match
-at binding time. Non-variable patterns can only destructure — Elm's type
-checker already rejected any attempt at recursive destructuring, so the
-resolver treats all let groups as mutually-visible without further analysis.
+at binding time. Before resolving a `let` block, the resolver dependency-sorts
+its declarations using the same free-variable analysis as the old evaluator.
+That fixes acyclic forward references (`implementationName = implementation.name`
+before `implementation = ...`) while still rejecting illegal value cycles.
+Non-variable patterns can only destructure — Elm's type checker already
+rejected any attempt at recursive destructuring.
 
 -}
 
 import Core
 import Elm.Syntax.Expression as Expression exposing (Expression, FunctionImplementation, LetDeclaration(..))
+import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern)
 import Environment
 import Eval.ResolvedIR as IR exposing (GlobalId, RExpr(..), RPattern(..))
 import FastDict
+import Set exposing (Set)
 import Syntax exposing (fakeNode)
+import TopologicalSort
 import Types exposing (ImportedNames)
 
 
@@ -499,7 +505,7 @@ resolveOperatorApplication ctx opName left right =
                 (resolveExpression ctx right)
 
         _ ->
-            case FastDict.get opName Core.operators of
+            case resolveOperatorTarget opName of
                 Just ref ->
                     resolveGlobal ctx ref.moduleName ref.name
                         |> Result.andThen
@@ -515,12 +521,69 @@ resolveOperatorApplication ctx opName left right =
 
 resolveOperatorReference : ResolverContext -> String -> Result ResolveError RExpr
 resolveOperatorReference ctx opName =
-    case FastDict.get opName Core.operators of
+    case resolveOperatorTarget opName of
         Just ref ->
             resolveGlobal ctx ref.moduleName ref.name
 
         Nothing ->
             Err (UnknownOperator opName)
+
+
+resolveOperatorTarget : String -> Maybe { moduleName : ModuleName, name : String }
+resolveOperatorTarget opName =
+    FastDict.get opName Core.operators
+        |> Maybe.map resolveOperatorAlias
+
+
+resolveOperatorAlias : { moduleName : ModuleName, name : String } -> { moduleName : ModuleName, name : String }
+resolveOperatorAlias ref =
+    case FastDict.get ref.moduleName Core.functions |> Maybe.andThen (FastDict.get ref.name) of
+        Just function ->
+            if List.isEmpty function.arguments then
+                case Node.value function.expression of
+                    Expression.FunctionOrValue qualModule qualName ->
+                        if List.isEmpty qualModule then
+                            ref
+
+                        else
+                            resolveOperatorAlias { moduleName = qualModule, name = qualName }
+
+                    Expression.PrefixOperator _ ->
+                        resolveOperatorAcrossModules ref.name
+                            |> Maybe.withDefault ref
+
+                    _ ->
+                        ref
+
+            else
+                ref
+
+        Nothing ->
+            ref
+
+
+resolveOperatorAcrossModules : String -> Maybe { moduleName : ModuleName, name : String }
+resolveOperatorAcrossModules name =
+    Core.functions
+        |> FastDict.foldl
+            (\moduleName moduleDict acc ->
+                case acc of
+                    Just _ ->
+                        acc
+
+                    Nothing ->
+                        case FastDict.get name moduleDict of
+                            Just function ->
+                                if List.isEmpty function.arguments then
+                                    Nothing
+
+                                else
+                                    Just { moduleName = moduleName, name = name }
+
+                            Nothing ->
+                                Nothing
+            )
+            Nothing
 
 
 resolveLambda :
@@ -674,35 +737,52 @@ resolveLet :
     -> Expression.LetBlock
     -> Result ResolveError RExpr
 resolveLet ctx letBlock =
-    -- Let bindings use sequential scoping with self-recursion for function
-    -- bindings. Concretely, when resolving binding N:
-    --
-    --   * Value bindings (arity 0) see only bindings 0..N-1 — they cannot
-    --     reference themselves or later siblings. This matches Elm's
-    --     semantics: `let x = x in ...` is a type error.
-    --
-    --   * Function bindings (arity > 0) see bindings 0..N-1 PLUS themselves,
-    --     so single-binding self-recursion (`let fact n = ... fact (n-1)
-    --     in ...`) works. Full MUTUAL recursion of sibling function
-    --     bindings is NOT supported here — Phase 3 will revisit this when
-    --     closures arrive and the evaluator can pre-allocate slots.
-    --
-    -- The let BODY sees every binding, exactly like the pre-body
-    -- `extendedLocals` produced by the fold.
-    --
-    -- This sequential shape is consistent with a pure-Elm evaluator that
-    -- evaluates bindings in order and prepends each result to the locals
-    -- stack — no placeholder slot patching needed.
-    collectLetBindings ctx letBlock.declarations
+    dependencySortLetDeclarations letBlock.declarations
         |> Result.andThen
-            (\{ bindings, extendedLocals } ->
-                let
-                    innerCtx : ResolverContext
-                    innerCtx =
-                        { ctx | localNames = extendedLocals }
-                in
-                resolveExpression innerCtx letBlock.expression
-                    |> Result.map (\body -> RLet bindings body)
+            (\sortedDeclarations ->
+                collectLetBindings ctx sortedDeclarations
+                    |> Result.andThen
+                        (\{ bindings, extendedLocals } ->
+                            let
+                                innerCtx : ResolverContext
+                                innerCtx =
+                                    { ctx | localNames = extendedLocals }
+                            in
+                            resolveExpression innerCtx letBlock.expression
+                                |> Result.map (\body -> RLet bindings body)
+                        )
+            )
+
+
+dependencySortLetDeclarations :
+    List (Node LetDeclaration)
+    -> Result ResolveError (List (Node LetDeclaration))
+dependencySortLetDeclarations declarations =
+    declarations
+        |> List.indexedMap
+            (\id declaration ->
+                { id = id + 1
+                , declaration = declaration
+                , defVars = declarationDefinedVariables declaration
+                , refVars = declarationFreeVariables declaration
+                , cycleAllowed = letDeclarationIsFunction declaration
+                }
+            )
+        |> TopologicalSort.sort
+            { id = .id
+            , defVars = .defVars
+            , refVars = .refVars
+            , cycleAllowed = .cycleAllowed
+            }
+        |> Result.map (List.map .declaration >> List.reverse)
+        |> Result.mapError
+            (\sortError ->
+                case sortError of
+                    TopologicalSort.IllegalCycle ->
+                        UnsupportedExpression "illegal cycle in let block"
+
+                    TopologicalSort.InternalError ->
+                        UnsupportedExpression "internal error in let block"
             )
 
 
@@ -865,6 +945,150 @@ firstBindingName bindings =
 
         [] ->
             "$destructure"
+
+
+letDeclarationIsFunction : Node LetDeclaration -> Bool
+letDeclarationIsFunction (Node _ letDeclaration) =
+    case letDeclaration of
+        LetFunction { declaration } ->
+            not (List.isEmpty (Node.value declaration).arguments)
+
+        LetDestructuring _ _ ->
+            False
+
+
+declarationFreeVariables : Node LetDeclaration -> Set String
+declarationFreeVariables (Node _ letDeclaration) =
+    case letDeclaration of
+        LetFunction { declaration } ->
+            let
+                { name, arguments, expression } =
+                    Node.value declaration
+            in
+            Set.diff
+                (freeVariables expression)
+                (List.foldl
+                    (\pattern -> Set.union (patternDefinedVariables pattern))
+                    (Set.singleton (Node.value name))
+                    arguments
+                )
+
+        LetDestructuring pattern expression ->
+            Set.diff (freeVariables expression) (patternDefinedVariables pattern)
+
+
+declarationDefinedVariables : Node LetDeclaration -> Set String
+declarationDefinedVariables (Node _ letDeclaration) =
+    case letDeclaration of
+        LetFunction { declaration } ->
+            Set.singleton (Node.value (Node.value declaration).name)
+
+        LetDestructuring pattern _ ->
+            patternDefinedVariables pattern
+
+
+patternDefinedVariables : Node Pattern -> Set String
+patternDefinedVariables (Node _ pattern) =
+    case pattern of
+        Pattern.TuplePattern patterns ->
+            List.foldl (\inner -> Set.union (patternDefinedVariables inner)) Set.empty patterns
+
+        Pattern.RecordPattern fields ->
+            List.foldl (\(Node _ name) -> Set.insert name) Set.empty fields
+
+        Pattern.UnConsPattern head tail ->
+            Set.union (patternDefinedVariables head) (patternDefinedVariables tail)
+
+        Pattern.ListPattern patterns ->
+            List.foldl (\inner -> Set.union (patternDefinedVariables inner)) Set.empty patterns
+
+        Pattern.VarPattern name ->
+            Set.singleton name
+
+        Pattern.NamedPattern _ patterns ->
+            List.foldl (\inner -> Set.union (patternDefinedVariables inner)) Set.empty patterns
+
+        Pattern.AsPattern inner (Node _ name) ->
+            Set.insert name (patternDefinedVariables inner)
+
+        Pattern.ParenthesizedPattern inner ->
+            patternDefinedVariables inner
+
+        _ ->
+            Set.empty
+
+
+caseFreeVariables : Expression.Case -> Set String
+caseFreeVariables ( pattern, expression ) =
+    Set.diff (freeVariables expression) (patternDefinedVariables pattern)
+
+
+letFreeVariables : Expression.LetBlock -> Set String
+letFreeVariables { declarations, expression } =
+    Set.diff
+        (List.foldl (\declaration -> Set.union (declarationFreeVariables declaration)) (freeVariables expression) declarations)
+        (List.foldl (\declaration -> Set.union (declarationDefinedVariables declaration)) Set.empty declarations)
+
+
+freeVariables : Node Expression -> Set String
+freeVariables (Node _ expr) =
+    case expr of
+        Expression.Application expressions ->
+            List.foldl (\item -> Set.union (freeVariables item)) Set.empty expressions
+
+        Expression.OperatorApplication _ _ left right ->
+            Set.union (freeVariables left) (freeVariables right)
+
+        Expression.FunctionOrValue [] name ->
+            if isConstructorName name then
+                Set.empty
+
+            else
+                Set.singleton name
+
+        Expression.IfBlock condition trueBranch falseBranch ->
+            Set.union (freeVariables condition) (Set.union (freeVariables trueBranch) (freeVariables falseBranch))
+
+        Expression.Negation child ->
+            freeVariables child
+
+        Expression.TupledExpression expressions ->
+            List.foldl (\item -> Set.union (freeVariables item)) Set.empty expressions
+
+        Expression.ParenthesizedExpression child ->
+            freeVariables child
+
+        Expression.LetExpression block ->
+            letFreeVariables block
+
+        Expression.CaseExpression { expression, cases } ->
+            List.foldl (\branch -> Set.union (caseFreeVariables branch)) (freeVariables expression) cases
+
+        Expression.LambdaExpression { expression, args } ->
+            Set.diff
+                (freeVariables expression)
+                (List.foldl (\pattern -> Set.union (patternDefinedVariables pattern)) Set.empty args)
+
+        Expression.RecordExpr setters ->
+            List.foldl
+                (\(Node _ ( _, valueNode )) -> Set.union (freeVariables valueNode))
+                Set.empty
+                setters
+
+        Expression.ListExpr expressions ->
+            List.foldl (\item -> Set.union (freeVariables item)) Set.empty expressions
+
+        Expression.RecordAccess record _ ->
+            freeVariables record
+
+        Expression.RecordUpdateExpression (Node _ name) setters ->
+            List.foldl
+                (\(Node _ ( _, valueNode )) -> Set.union (freeVariables valueNode))
+                (Set.singleton name)
+                setters
+
+        _ ->
+            Set.empty
 
 
 resolveCase :

@@ -30,10 +30,14 @@ on the fix without re-running the full review-runner bundle.
 
 -}
 
+import Elm.Parser
+import Elm.Syntax.Expression exposing (Expression(..))
 import Eval.Module
+import Eval.ResolvedIR as IR
 import Expect
+import FastDict
 import Test exposing (Test, describe, test)
-import Types exposing (Value(..))
+import Types exposing (EvalResult(..), Value(..))
 
 
 suite : Test
@@ -42,6 +46,7 @@ suite =
         [ identityDirectCall
         , identityFromBasicsModule
         , parserIntViaResolvedIR
+        , parserOperatorWrapperResolvesToAdvancedImplementation
         ]
 
 
@@ -126,6 +131,74 @@ result =
 
                         Err err ->
                             Expect.fail ("expected Ok, got: " ++ Debug.toString err)
+
+                Err err ->
+                    Expect.fail ("buildProjectEnv failed: " ++ Debug.toString err)
+
+
+parserOperatorWrapperResolvesToAdvancedImplementation : Test
+parserOperatorWrapperResolvesToAdvancedImplementation =
+    test "user operator application resolves to Parser.Advanced.ignorer in resolved IR" <|
+        \_ ->
+            let
+                source : String
+                source =
+                    """module Foo exposing (result)
+
+import Parser
+import Parser.Advanced as Advanced exposing ((|.), succeed)
+
+
+result : Result (List (Advanced.DeadEnd () Parser.Problem)) ()
+result =
+    Advanced.run
+        (succeed ()
+            |. Advanced.token (Advanced.Token "a" (Parser.Expecting "a"))
+        )
+        "a"
+"""
+            in
+            case Eval.Module.buildProjectEnv [ source ] of
+                Ok projectEnv ->
+                    let
+                        resolved =
+                            Eval.Module.projectEnvResolved projectEnv
+                    in
+                    case
+                        ( FastDict.get ( [ "Foo" ], "result" ) resolved.globalIds
+                        , FastDict.get ( [ "Parser", "Advanced" ], "ignorer" ) resolved.globalIds
+                        )
+                    of
+                        ( Just resultId, Just advancedIgnorerId ) ->
+                            case FastDict.get resultId resolved.bodies of
+                                Just body ->
+                                    case body of
+                                        IR.RApply (IR.RGlobal runId) [ IR.RApply (IR.RGlobal targetId) _, IR.RString "a" ] ->
+                                            if targetId == advancedIgnorerId then
+                                                Expect.pass
+
+                                            else
+                                                Expect.fail
+                                                    ("expected operator application to target Parser.Advanced.ignorer, got id "
+                                                        ++ String.fromInt targetId
+                                                        ++ " instead of "
+                                                        ++ String.fromInt advancedIgnorerId
+                                                        ++ " (run id "
+                                                        ++ String.fromInt runId
+                                                        ++ ")"
+                                                    )
+
+                                        other ->
+                                            Expect.fail ("unexpected resolved body for Foo.result: " ++ Debug.toString other)
+
+                                Nothing ->
+                                    Expect.fail "missing resolved body for Foo.result"
+
+                        ( Nothing, _ ) ->
+                            Expect.fail "missing global id for Foo.result"
+
+                        ( _, Nothing ) ->
+                            Expect.fail "missing global id for Parser.Advanced.ignorer"
 
                 Err err ->
                     Expect.fail ("buildProjectEnv failed: " ++ Debug.toString err)

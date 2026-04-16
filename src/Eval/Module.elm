@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeDependencySummaryStats, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeOneModuleInEnvSelectedWithFlags, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -393,7 +393,8 @@ isCustomTypeConstructor impl =
 
 
 {-| Walk every declaration — core and user — to assign `GlobalId`s, then
-walk user declarations again to resolve their bodies to `RExpr`. Core
+add ids for exact kernel-backed names that don't have an AST declaration,
+then walk user declarations again to resolve their bodies to `RExpr`. Core
 bodies are deliberately **not** resolved (they reference kernel functions
 that Phase 3's evaluator handles via a separate dispatch path anyway).
 
@@ -454,9 +455,34 @@ resolveProject summaries =
                     )
                     coreIdAssignment
 
+        kernelIdAssignment : { next : Int, ids : Dict.Dict ( ModuleName, String ) IR.GlobalId }
+        kernelIdAssignment =
+            Eval.Expression.kernelFunctions
+                |> Dict.foldl
+                    (\moduleKey moduleDict outer ->
+                        let
+                            moduleName : ModuleName
+                            moduleName =
+                                String.split "." moduleKey
+                        in
+                        moduleDict
+                            |> Dict.foldl
+                                (\name _ inner ->
+                                    if Dict.member ( moduleName, name ) inner.ids then
+                                        inner
+
+                                    else
+                                        { next = inner.next + 1
+                                        , ids = Dict.insert ( moduleName, name ) inner.next inner.ids
+                                        }
+                                )
+                                outer
+                    )
+                    allIdAssignment
+
         globalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
         globalIds =
-            allIdAssignment.ids
+            kernelIdAssignment.ids
 
         -- Reverse lookup map built from globalIds. Phase 3's core-dispatch
         -- bridge needs to know "which (moduleName, name) does this id map
@@ -490,15 +516,13 @@ resolveProject summaries =
             RE.buildHigherOrderRegistry
                 (\key -> Dict.get key globalIds)
 
-        {- Build the kernel dispatcher registry from `kernelFunctions`.
-           Only register entries whose module key is a user-facing name
-           (like `Dict`, `String`, `Basics`) — NOT ones under the
-           `Elm.Kernel.*` prefix.
+        {- Build the kernel dispatcher registry from `kernelFunctions`
+           by exact qualified name.
 
-           The previous behavior also mapped `Elm.Kernel.X.fn` →
-           `X.fn` via prefix strip, on the assumption that the Core
-           wrapper for `X.fn` was a trivial pass-through. That
-           assumption is WRONG for any Core wrapper that adapts
+           This deliberately does NOT do the old unsafe
+           `Elm.Kernel.X.fn` → `X.fn` prefix-strip rewrite. That
+           rewrite assumed the Core wrapper for `X.fn` was a trivial
+           pass-through, which is false for wrappers that adapt
            argument types across the kernel boundary, e.g.:
 
              String.join sep chunks =
@@ -511,11 +535,13 @@ resolveProject summaries =
            kernel sees a `List` where it expects a `JsArray`, and fires
            "Expected the second argument to be List String".
 
-           User-level kernel entries (`( [ "Dict" ], ... )`,
-           `( [ "String" ], ... )`, etc.) are DELIBERATELY registered
-           as drop-in replacements for the Core wrapper — they are
-           safe to short-circuit. `Elm.Kernel.*` entries are only safe
-           when the caller has already done any arg marshalling.
+           Exact-name dispatch is safe for both cases:
+
+             - user-facing overrides like `Dict.insert`, which are
+               intentionally registered as drop-in replacements
+             - explicit `Elm.Kernel.*` references that appear in
+               package source (e.g. `Regex`, `Bytes`, `Json`) after
+               the caller has already chosen the kernel entry point
         -}
         kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
         kernelDispatchers =
@@ -527,28 +553,21 @@ resolveProject summaries =
                             parts =
                                 String.split "." moduleKey
                         in
-                        case parts of
-                            "Elm" :: "Kernel" :: _ ->
-                                -- Kernel-internal entries; don't short-
-                                -- circuit user-level calls to these.
+                        moduleDict
+                            |> Dict.foldl
+                                (\funcName ( arity, kernelFn ) acc ->
+                                    case Dict.get ( parts, funcName ) globalIds of
+                                        Just id ->
+                                            Dict.insert id
+                                                { arity = arity
+                                                , kernelFn = kernelFn
+                                                }
+                                                acc
+
+                                        Nothing ->
+                                            acc
+                                )
                                 outer
-
-                            _ ->
-                                moduleDict
-                                    |> Dict.foldl
-                                        (\funcName ( arity, kernelFn ) acc ->
-                                            case Dict.get ( parts, funcName ) globalIds of
-                                                Just id ->
-                                                    Dict.insert id
-                                                        { arity = arity
-                                                        , kernelFn = kernelFn
-                                                        }
-                                                        acc
-
-                                                Nothing ->
-                                                    acc
-                                        )
-                                        outer
                     )
                     Dict.empty
 
@@ -600,46 +619,10 @@ resolveProjectFromSummariesAndInitial initialAcc summaries =
 
                                     ctx : Resolver.ResolverContext
                                     ctx =
-                                        {- Exclude modules whose resolved bodies
-                                           interact badly with the kernel
-                                           callback dispatching (via the bridge)
-                                           or cause massive iteration via
-                                           recursive parser combinators.
-
-                                           Parser.* — recursive combinator
-                                             bodies that generate massive
-                                             evalR iteration through the bridge.
-                                           Elm.Type — uses Parser.run internally
-                                             for type-string parsing; its
-                                             resolved body creates RExprImpl
-                                             closures that loop through the
-                                             parser's recursive walker.
-                                           Elm.Project — its decoder has
-                                             RExprImpl callbacks that silent-
-                                             drop via "Could not match lambda
-                                             patterns" in the Kernel.Json
-                                             walker's `applyFunction` path.
-
-                                           Everything else benefits from the
-                                           flip (import canonicalization for
-                                           aliased imports → more user code
-                                           runs through evalR).
-                                        -}
-                                        case summary.moduleName of
-                                            "Parser" :: _ ->
-                                                Resolver.initContext summary.moduleName globalIds
-
-                                            [ "Elm", "Type" ] ->
-                                                Resolver.initContext summary.moduleName globalIds
-
-                                            [ "Elm", "Project" ] ->
-                                                Resolver.initContext summary.moduleName globalIds
-
-                                            _ ->
-                                                Resolver.initContextWithImports
-                                                    summary.moduleName
-                                                    globalIds
-                                                    summary.importedNames
+                                        Resolver.initContextWithImports
+                                            summary.moduleName
+                                            globalIds
+                                            summary.importedNames
                                 in
                                 case Resolver.resolveDeclaration ctx impl of
                                     Ok rexpr ->
@@ -1303,6 +1286,17 @@ collectRejectSamples =
     False
 
 
+largeBodyRejectSampleWindow : Int
+largeBodyRejectSampleWindow =
+    30
+
+
+shouldCollectLargeBodyRejectSample : Int -> Int -> Bool
+shouldCollectLargeBodyRejectSample inlineThreshold bodySize =
+    bodySize >= inlineThreshold
+        && bodySize < inlineThreshold + largeBodyRejectSampleWindow
+
+
 mergeRejectSamples : List String -> List String -> List String
 mergeRejectSamples left right =
     List.foldl addRejectSample left right
@@ -1536,7 +1530,7 @@ normalizeSummariesWithStats summaries =
                 |> Dict.fromList
 
         ( normalizedFunctions, normalizedPrecomputedValues ) =
-            normalizeTopLevelConstants summaries sharedFunctionsBefore sharedModuleImports
+            normalizeTopLevelConstants NormalizationFlags.packageAggressive summaries sharedFunctionsBefore sharedModuleImports
 
         optimizationResult : DependencySummaryOptimizationResult
         optimizationResult =
@@ -1745,14 +1739,15 @@ AST. Same for functions that fail to eval (Debug.todo, circular refs, etc).
 
 -}
 normalizeTopLevelConstants :
-    List CachedModuleSummary
+    NormalizationFlags.NormalizationFlags
+    -> List CachedModuleSummary
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
     -> Dict.Dict String ImportedNames
     ->
         ( Dict.Dict String (Dict.Dict String FunctionImplementation)
         , Dict.Dict String (Dict.Dict String Value)
         )
-normalizeTopLevelConstants summaries initialFunctions sharedImports =
+normalizeTopLevelConstants flags summaries initialFunctions sharedImports =
     List.foldl
         (\summary ( currentFunctions, currentPrecomputed ) ->
             let
@@ -1781,6 +1776,7 @@ normalizeTopLevelConstants summaries initialFunctions sharedImports =
                             if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
                                 case
                                     tryNormalizeConstant
+                                        flags
                                         summary.moduleName
                                         moduleKey
                                         summary.importedNames
@@ -1820,7 +1816,8 @@ rewritten expression (so the AST path is fast) and the `Value` (so the
 runtime precomputed cache hits for module-level references).
 -}
 tryNormalizeConstant :
-    ModuleName
+    NormalizationFlags.NormalizationFlags
+    -> ModuleName
     -> String
     -> ImportedNames
     -> FunctionImplementation
@@ -1828,7 +1825,7 @@ tryNormalizeConstant :
     -> Dict.Dict String ImportedNames
     -> Dict.Dict String (Dict.Dict String Value)
     -> Maybe ( FunctionImplementation, Value )
-tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions sharedModuleImports sharedPrecomputedValues =
+tryNormalizeConstant flags moduleName moduleKey moduleImports funcImpl sharedFunctions sharedModuleImports sharedPrecomputedValues =
     let
         env : Env
         env =
@@ -1857,7 +1854,7 @@ tryNormalizeConstant moduleName moduleKey moduleImports funcImpl sharedFunctions
             { trace = False
             , coverage = False
             , coverageProbeLines = Set.empty
-            , maxSteps = Just NormalizationFlags.experimental.tryNormalizeMaxSteps
+            , maxSteps = Just flags.tryNormalizeMaxSteps
             , tcoTarget = Nothing
             , callCounts = Nothing
             , intercepts = Dict.empty
@@ -1915,12 +1912,15 @@ cached and get stuck at the slow/expensive eval path. Re-running the pass
 lets the second attempt hit the now-populated `precomputedValues`.
 
 Returns the fully-normalized function dict, the delta (only the
-functions whose bodies changed), and the per-name precomputed `Value`
-dict. All three are keyed on the simple function name.
+functions whose bodies changed), the per-name precomputed `Value`
+dict, and the rewrite stats emitted while normalizing the module. The
+function / delta / precomputed maps are keyed on the simple function
+name.
 
 -}
 runModuleNormalizationToFixpoint :
-    Maybe (Set String)
+    NormalizationFlags.NormalizationFlags
+    -> Maybe (Set String)
     -> ModuleName
     -> String
     -> ImportedNames
@@ -1930,11 +1930,12 @@ runModuleNormalizationToFixpoint :
     -> Dict.Dict String FunctionImplementation
     -> Dict.Dict String Value
     ->
-        ( Dict.Dict String FunctionImplementation
-        , Dict.Dict String FunctionImplementation
-        , Dict.Dict String Value
-        )
-runModuleNormalizationToFixpoint normalizationTargets moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
+        { fns : Dict.Dict String FunctionImplementation
+        , delta : Dict.Dict String FunctionImplementation
+        , precomputed : Dict.Dict String Value
+        , stats : DependencySummaryStats
+        }
+runModuleNormalizationToFixpoint flags normalizationTargets moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
     let
         isSelectedTarget : String -> Bool
         isSelectedTarget name =
@@ -1944,12 +1945,6 @@ runModuleNormalizationToFixpoint normalizationTargets moduleName moduleKey modul
 
                 Just selectedNames ->
                     Set.member name selectedNames
-
-        -- Flags read from the single `NormalizationFlags.experimental`
-        -- knob. Edit that value + rebuild to run a new A/B experiment.
-        flags : NormalizationFlags.NormalizationFlags
-        flags =
-            NormalizationFlags.experimental
 
         step :
             Dict.Dict String FunctionImplementation
@@ -1980,11 +1975,12 @@ runModuleNormalizationToFixpoint normalizationTargets moduleName moduleKey modul
                             { acc | fns = Dict.insert name priorFn acc.fns }
 
                         else if isSelectedTarget name && List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
-                            case
-                                tryNormalizeConstant
-                                    moduleName
-                                    moduleKey
-                                    moduleImports
+                                case
+                                    tryNormalizeConstant
+                                        flags
+                                        moduleName
+                                        moduleKey
+                                        moduleImports
                                     priorFn
                                     (Dict.insert moduleKey acc.fns sharedFunctions)
                                     sharedImports
@@ -2035,6 +2031,7 @@ runModuleNormalizationToFixpoint normalizationTargets moduleName moduleKey modul
         ( fixpointFns, fixpointDelta, fixpointPrecomputed ) =
             if flags.runFixpoint then
                 normalizeInDepOrder
+                    flags
                     normalizationTargets
                     moduleName
                     moduleKey
@@ -2054,21 +2051,65 @@ runModuleNormalizationToFixpoint normalizationTargets moduleName moduleKey modul
         -- the AST once per function regardless of whether a fusion
         -- opportunity is found — so on modules with no List.map chains, this
         -- is mostly overhead plus the spine-collection rewrite.
-        foldedFns : Dict.Dict String FunctionImplementation
-        foldedFns =
+        foldedResult :
+            { fns : Dict.Dict String FunctionImplementation
+            , stats : DependencySummaryStats
+            }
+        foldedResult =
             if flags.runListFusion then
                 fixpointFns
-                    |> Dict.map
-                        (\name funcImpl ->
+                    |> Dict.foldl
+                        (\name funcImpl acc ->
                             if isSelectedTarget name && not (List.isEmpty funcImpl.arguments) then
-                                { funcImpl | expression = ListFusion.fuse funcImpl.expression }
+                                let
+                                    fusionOutcome : ListFusion.FuseResult
+                                    fusionOutcome =
+                                        ListFusion.canonicalizeWithStats funcImpl.expression
+
+                                    normalizedExpression : Node Expression
+                                    normalizedExpression =
+                                        fusionOutcome.expression
+
+                                    listFusionStats : DependencySummaryStats
+                                    listFusionStats =
+                                        { emptyDependencySummaryStats
+                                            | listFusionChanges =
+                                                countBool (normalizedExpression /= funcImpl.expression)
+                                            , listFusionPipelineNormalizations = fusionOutcome.stats.pipelineNormalizations
+                                            , listFusionHeadFlattenRewrites = fusionOutcome.stats.headFlattenRewrites
+                                            , listFusionRuleRewrites = fusionOutcome.stats.ruleRewrites
+                                        }
+
+                                    functionStats : DependencySummaryStats
+                                    functionStats =
+                                        { emptyDependencySummaryStats
+                                            | functionsVisited = 1
+                                            , functionsRewritten =
+                                                countBool (normalizedExpression /= funcImpl.expression)
+                                        }
+                                in
+                                { fns =
+                                    Dict.insert
+                                        name
+                                        { funcImpl | expression = normalizedExpression }
+                                        acc.fns
+                                , stats =
+                                    mergeDependencySummaryStats
+                                        acc.stats
+                                        (mergeDependencySummaryStats functionStats listFusionStats)
+                                }
 
                             else
-                                funcImpl
+                                { acc | fns = Dict.insert name funcImpl acc.fns }
                         )
+                        { fns = Dict.empty, stats = emptyDependencySummaryStats }
 
             else
-                fixpointFns
+                { fns = fixpointFns, stats = emptyDependencySummaryStats }
+
+        foldedFns : Dict.Dict String FunctionImplementation
+        foldedFns =
+            foldedResult.fns
 
         foldedDelta : Dict.Dict String FunctionImplementation
         foldedDelta =
@@ -2101,7 +2142,11 @@ runModuleNormalizationToFixpoint normalizationTargets moduleName moduleKey modul
                     )
                     foldedDelta
     in
-    ( foldedFns, newDelta, fixpointPrecomputed )
+    { fns = foldedFns
+    , delta = newDelta
+    , precomputed = fixpointPrecomputed
+    , stats = foldedResult.stats
+    }
 
 
 {-| Topological-order single-pass normalization. For each 0-arg
@@ -2124,7 +2169,8 @@ but the guard keeps the pass safe on malformed input.
 
 -}
 normalizeInDepOrder :
-    Maybe (Set String)
+    NormalizationFlags.NormalizationFlags
+    -> Maybe (Set String)
     -> ModuleName
     -> String
     -> ImportedNames
@@ -2138,7 +2184,7 @@ normalizeInDepOrder :
         , Dict.Dict String FunctionImplementation
         , Dict.Dict String Value
         )
-normalizeInDepOrder normalizationTargets moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
+normalizeInDepOrder flags normalizationTargets moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns originalPrecomputedFns =
     let
         isSelectedTarget : String -> Bool
         isSelectedTarget name =
@@ -2201,7 +2247,7 @@ normalizeInDepOrder normalizationTargets moduleName moduleKey moduleImports shar
         finalState =
             candidateNames
                 |> Set.foldl
-                    (\name state -> processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state)
+                    (\name state -> processCandidate flags moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state)
                     initialState
     in
     ( finalState.fns, finalState.delta, finalState.precomputed )
@@ -2217,7 +2263,8 @@ type alias NormalizeDepState =
 
 
 processCandidate :
-    ModuleName
+    NormalizationFlags.NormalizationFlags
+    -> ModuleName
     -> String
     -> ImportedNames
     -> Dict.Dict String (Dict.Dict String FunctionImplementation)
@@ -2228,7 +2275,7 @@ processCandidate :
     -> String
     -> NormalizeDepState
     -> NormalizeDepState
-processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state =
+processCandidate flags moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph name state =
     if Set.member name state.visited then
         state
 
@@ -2250,7 +2297,7 @@ processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImport
             afterDeps : NormalizeDepState
             afterDeps =
                 Set.foldl
-                    (\dep s -> processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph dep s)
+                    (\dep s -> processCandidate flags moduleName moduleKey moduleImports sharedFunctions sharedImports sharedPrecomputedValues originalModuleFns depGraph dep s)
                     withPath
                     deps
 
@@ -2268,6 +2315,7 @@ processCandidate moduleName moduleKey moduleImports sharedFunctions sharedImport
             Just priorFn ->
                 case
                     tryNormalizeConstant
+                        flags
                         moduleName
                         moduleKey
                         moduleImports
@@ -2867,8 +2915,8 @@ inlineRejectStats rejectReason maybeSample =
             withSample { baseStats | inlineRejectedInternalHelper = 1 }
 
 
-formatRejectSample : InlineRejectReason -> List String -> String -> Node Expression -> String
-formatRejectSample rejectReason moduleName funcName expression =
+formatRejectSample : InlineRejectReason -> List String -> String -> Int -> InlineBodyShape -> Node Expression -> String
+formatRejectSample rejectReason moduleName funcName bodySize bodyShape expression =
     let
         reasonLabel =
             case rejectReason of
@@ -2907,8 +2955,50 @@ formatRejectSample rejectReason moduleName funcName expression =
 
         qualifiedName =
             String.join "." (moduleName ++ [ funcName ])
+
+        bodyShapeLabel =
+            inlineBodyShapeToString bodyShape
     in
-    reasonLabel ++ " | " ++ qualifiedName ++ " | " ++ Expression.Extra.toString expression
+    reasonLabel
+        ++ " | "
+        ++ qualifiedName
+        ++ " | size="
+        ++ String.fromInt bodySize
+        ++ " | shape="
+        ++ bodyShapeLabel
+        ++ " | "
+        ++ truncateSamplePreview 180 (Expression.Extra.toString expression)
+
+
+inlineBodyShapeToString : InlineBodyShape -> String
+inlineBodyShapeToString bodyShape =
+    case bodyShape of
+        InlineLeaf ->
+            "leaf"
+
+        InlineConstructor ->
+            "constructor"
+
+        InlineOperator ->
+            "operator"
+
+        InlineRecordAccess ->
+            "record_access"
+
+        InlineCollection ->
+            "collection"
+
+        InlineOther ->
+            "other"
+
+
+truncateSamplePreview : Int -> String -> String
+truncateSamplePreview maxChars preview =
+    if String.length preview <= maxChars then
+        preview
+
+    else
+        String.left maxChars preview ++ "..."
 
 
 classifyUnsafeRoot : Node Expression -> InlineUnsafeRoot
@@ -3540,9 +3630,16 @@ tryInlineFunction flags env moduleName funcName args =
                                     |> Maybe.map Set.fromList
                                     |> Maybe.withDefault Set.empty
 
+                            sourceModuleImports : ImportedNames
+                            sourceModuleImports =
+                                Dict.get sourceModuleKey env.shared.moduleImports
+                                    |> Maybe.withDefault emptyImports
+
                             preQualified =
                                 if isCrossModule then
-                                    qualifyUnqualifiedRefs sourceModuleName sourceFunctionNames paramNameSet funcImpl.expression
+                                    funcImpl.expression
+                                        |> canonicalizeQualifiedRefs sourceModuleImports
+                                        |> qualifyUnqualifiedRefs sourceModuleName sourceFunctionNames paramNameSet
 
                                 else
                                     funcImpl.expression
@@ -3571,9 +3668,17 @@ tryInlineFunction flags env moduleName funcName args =
                                 }
 
                         else if bodySize >= flags.inlineFunctionMaxSize then
+                            let
+                                sample =
+                                    if shouldCollectLargeBodyRejectSample flags.inlineFunctionMaxSize bodySize then
+                                        Just (formatRejectSample InlineRejectBodyTooLarge sourceModuleName funcName bodySize bodyShape funcImpl.expression)
+
+                                    else
+                                        Nothing
+                            in
                             InlineRejected
                                 { reason = InlineRejectBodyTooLarge
-                                , sample = Nothing
+                                , sample = sample
                                 }
 
                         else if not inlineSafe then
@@ -3588,7 +3693,7 @@ tryInlineFunction flags env moduleName funcName args =
                                     else
                                         case rejectReason of
                                             InlineRejectUnsafe InlineUnsafeApplication ->
-                                                Just (formatRejectSample rejectReason sourceModuleName funcName funcImpl.expression)
+                                                Just (formatRejectSample rejectReason sourceModuleName funcName bodySize bodyShape funcImpl.expression)
 
                                             _ ->
                                                 Nothing
@@ -4286,6 +4391,109 @@ qualifyUnqualifiedRefs sourceModule moduleFunctions locals ((Node range expr) as
 
         Negation inner ->
             Node range (Negation (q inner))
+
+        _ ->
+            node
+
+
+canonicalizeQualifiedRefs : ImportedNames -> Node Expression -> Node Expression
+canonicalizeQualifiedRefs imports ((Node range expr) as node) =
+    let
+        c =
+            canonicalizeQualifiedRefs imports
+
+        canonicalizeModuleName : List String -> List String
+        canonicalizeModuleName moduleName =
+            if List.isEmpty moduleName then
+                moduleName
+
+            else
+                Dict.get (Environment.moduleKey moduleName) imports.aliases
+                    |> Maybe.map Tuple.first
+                    |> Maybe.withDefault moduleName
+    in
+    case expr of
+        FunctionOrValue moduleName name ->
+            if List.isEmpty moduleName then
+                node
+
+            else
+                let
+                    canonicalModuleName =
+                        canonicalizeModuleName moduleName
+                in
+                if canonicalModuleName == moduleName then
+                    node
+
+                else
+                    Node range (FunctionOrValue canonicalModuleName name)
+
+        Application items ->
+            Node range (Application (List.map c items))
+
+        OperatorApplication op dir left right ->
+            Node range (OperatorApplication op dir (c left) (c right))
+
+        IfBlock condition trueBranch falseBranch ->
+            Node range (IfBlock (c condition) (c trueBranch) (c falseBranch))
+
+        CaseExpression { expression, cases } ->
+            Node range
+                (CaseExpression
+                    { expression = c expression
+                    , cases = List.map (\( pat, body ) -> ( pat, c body )) cases
+                    }
+                )
+
+        LetExpression { declarations, expression } ->
+            Node range
+                (LetExpression
+                    { declarations =
+                        List.map
+                            (\(Node declarationRange declaration) ->
+                                Node declarationRange
+                                    (case declaration of
+                                        LetFunction functionDecl ->
+                                            let
+                                                (Node implRange impl) =
+                                                    functionDecl.declaration
+                                            in
+                                            LetFunction
+                                                { functionDecl
+                                                    | declaration =
+                                                        Node implRange
+                                                            { impl | expression = c impl.expression }
+                                                }
+
+                                        LetDestructuring pattern value ->
+                                            LetDestructuring pattern (c value)
+                                    )
+                            )
+                            declarations
+                    , expression = c expression
+                    }
+                )
+
+        ListExpr items ->
+            Node range (ListExpr (List.map c items))
+
+        TupledExpression items ->
+            Node range (TupledExpression (List.map c items))
+
+        ParenthesizedExpression inner ->
+            Node range (ParenthesizedExpression (c inner))
+
+        LambdaExpression lambda ->
+            Node range (LambdaExpression { lambda | expression = c lambda.expression })
+
+        RecordExpr fields ->
+            Node range (RecordExpr (List.map (\(Node fieldRange ( name, value )) -> Node fieldRange ( name, c value )) fields))
+
+        RecordAccess inner field ->
+            Node range (RecordAccess (c inner) field)
+
+        Negation inner ->
+            Node range (Negation (c inner))
 
         _ ->
             node
@@ -6801,7 +7009,9 @@ blobs can stay small.
 
 Uses the existing `ProjectEnv` as both the evaluation context (so package
 functions and previously-normalized sibling modules are visible) and the
-place to install the rewritten bodies.
+place to install the rewritten bodies. Also returns the dependency-summary
+stats emitted by the normalization passes so callers can profile which
+heuristics actually fired on user modules.
 
 -}
 normalizeOneModuleInEnvSelected :
@@ -6809,11 +7019,27 @@ normalizeOneModuleInEnvSelected :
     -> ModuleName
     -> ProjectEnv
     ->
-        ( ProjectEnv
-        , Dict.Dict String FunctionImplementation
-        , Dict.Dict String Value
-        )
+        { env : ProjectEnv
+        , delta : Dict.Dict String FunctionImplementation
+        , precomputed : Dict.Dict String Value
+        , stats : DependencySummaryStats
+        }
 normalizeOneModuleInEnvSelected normalizationTargets moduleName (ProjectEnv projectEnv) =
+    normalizeOneModuleInEnvSelectedWithFlags NormalizationFlags.experimental normalizationTargets moduleName (ProjectEnv projectEnv)
+
+
+normalizeOneModuleInEnvSelectedWithFlags :
+    NormalizationFlags.NormalizationFlags
+    -> Maybe (Set String)
+    -> ModuleName
+    -> ProjectEnv
+    ->
+        { env : ProjectEnv
+        , delta : Dict.Dict String FunctionImplementation
+        , precomputed : Dict.Dict String Value
+        , stats : DependencySummaryStats
+        }
+normalizeOneModuleInEnvSelectedWithFlags flags normalizationTargets moduleName (ProjectEnv projectEnv) =
     let
         env : Env
         env =
@@ -6846,8 +7072,9 @@ normalizeOneModuleInEnvSelected normalizationTargets moduleName (ProjectEnv proj
             Dict.get moduleKey sharedPrecomputedValues
                 |> Maybe.withDefault Dict.empty
 
-        ( normalizedModuleFns, delta, normalizedPrecomputedFns ) =
+        normalizationResult =
             runModuleNormalizationToFixpoint
+                flags
                 normalizationTargets
                 moduleName
                 moduleKey
@@ -6862,13 +7089,13 @@ normalizeOneModuleInEnvSelected normalizationTargets moduleName (ProjectEnv proj
         selectedPrecomputed =
             case normalizationTargets of
                 Nothing ->
-                    normalizedPrecomputedFns
+                    normalizationResult.precomputed
 
                 Just targetNames ->
                     targetNames
                         |> Set.foldl
                             (\name acc ->
-                                case Dict.get name normalizedPrecomputedFns of
+                                case Dict.get name normalizationResult.precomputed of
                                     Just value ->
                                         Dict.insert name value acc
 
@@ -6879,11 +7106,11 @@ normalizeOneModuleInEnvSelected normalizationTargets moduleName (ProjectEnv proj
 
         updatedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
         updatedFunctions =
-            Dict.insert moduleKey normalizedModuleFns env.shared.functions
+            Dict.insert moduleKey normalizationResult.fns env.shared.functions
 
         updatedPrecomputed : Dict.Dict String (Dict.Dict String Value)
         updatedPrecomputed =
-            Dict.insert moduleKey normalizedPrecomputedFns sharedPrecomputedValues
+            Dict.insert moduleKey normalizationResult.precomputed sharedPrecomputedValues
 
         newEnv : Env
         newEnv =
@@ -6895,12 +7122,16 @@ normalizeOneModuleInEnvSelected normalizationTargets moduleName (ProjectEnv proj
                     , precomputedValues = updatedPrecomputed
                     , tcoAnalyses =
                         Dict.insert moduleKey
-                            (precomputeOneModule normalizedModuleFns)
+                            (precomputeOneModule normalizationResult.fns)
                             env.shared.tcoAnalyses
                     }
             }
     in
-    ( refreshResolvedGlobals (ProjectEnv { projectEnv | env = newEnv }), delta, selectedPrecomputed )
+    { env = refreshResolvedGlobals (ProjectEnv { projectEnv | env = newEnv })
+    , delta = normalizationResult.delta
+    , precomputed = selectedPrecomputed
+    , stats = normalizationResult.stats
+    }
 
 
 normalizeOneModuleInEnv :
@@ -6909,7 +7140,7 @@ normalizeOneModuleInEnv :
     -> ( ProjectEnv, Dict.Dict String FunctionImplementation )
 normalizeOneModuleInEnv moduleName (ProjectEnv projectEnv) =
     normalizeOneModuleInEnvSelected Nothing moduleName (ProjectEnv projectEnv)
-        |> (\( updatedEnv, delta, _ ) -> ( updatedEnv, delta ))
+        |> (\result -> ( result.env, result.delta ))
 
 
 {-| Merge a pre-computed normalization delta into the env, overlaying the
@@ -7008,6 +7239,7 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                                         if List.isEmpty funcImpl.arguments && isNormalizationCandidate funcImpl.expression then
                                             case
                                                 tryNormalizeConstant
+                                                    NormalizationFlags.experimental
                                                     moduleName
                                                     moduleKey
                                                     moduleImports

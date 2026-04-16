@@ -34,6 +34,7 @@ supported here never produce those.
 
 -}
 
+import Char
 import Elm.Syntax.Expression as Expression
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node exposing (Node)
@@ -43,6 +44,7 @@ import Eval.Expression
 import Eval.NativeDispatch as NativeDispatch
 import Eval.ResolvedIR as IR exposing (RExpr(..))
 import FastDict
+import Kernel.Parser as KernelParser
 import MemoSpec
 import Set
 import Syntax
@@ -2676,6 +2678,1232 @@ higherOrderDispatcherList =
     , ( [ "Dict" ], "foldr", HigherOrderDispatcher dictFoldrDispatcher )
     , ( [ "Dict" ], "map", HigherOrderDispatcher dictMapDispatcher )
     ]
+        ++ parserDispatcherList
+
+
+parserDispatcherList : List ( ModuleName, String, HigherOrderDispatcher )
+parserDispatcherList =
+    [ ( parserAdvancedModuleName, "run", HigherOrderDispatcher parserRunDispatcher )
+    , ( parserAdvancedModuleName, "succeed", HigherOrderDispatcher parserSucceedDispatcher )
+    , ( parserAdvancedModuleName, "problem", HigherOrderDispatcher parserProblemDispatcher )
+    , ( parserAdvancedModuleName, "end", HigherOrderDispatcher parserEndDispatcher )
+    , ( parserAdvancedModuleName, "map", HigherOrderDispatcher parserMapDispatcher )
+    , ( parserAdvancedModuleName, "keeper", HigherOrderDispatcher parserKeeperDispatcher )
+    , ( parserAdvancedModuleName, "|=", HigherOrderDispatcher parserKeeperDispatcher )
+    , ( parserAdvancedModuleName, "ignorer", HigherOrderDispatcher parserIgnorerDispatcher )
+    , ( parserAdvancedModuleName, "|.", HigherOrderDispatcher parserIgnorerDispatcher )
+    , ( parserAdvancedModuleName, "andThen", HigherOrderDispatcher parserAndThenDispatcher )
+    , ( parserAdvancedModuleName, "lazy", HigherOrderDispatcher parserLazyDispatcher )
+    , ( parserAdvancedModuleName, "oneOf", HigherOrderDispatcher parserOneOfDispatcher )
+    , ( parserAdvancedModuleName, "loop", HigherOrderDispatcher parserLoopDispatcher )
+    , ( parserAdvancedModuleName, "backtrackable", HigherOrderDispatcher parserBacktrackableDispatcher )
+    , ( parserAdvancedModuleName, "commit", HigherOrderDispatcher parserCommitDispatcher )
+    , ( parserAdvancedModuleName, "token", HigherOrderDispatcher parserTokenDispatcher )
+    , ( parserAdvancedModuleName, "symbol", HigherOrderDispatcher parserSymbolDispatcher )
+    , ( parserAdvancedModuleName, "keyword", HigherOrderDispatcher parserKeywordDispatcher )
+    , ( parserAdvancedModuleName, "chompIf", HigherOrderDispatcher parserChompIfDispatcher )
+    , ( parserAdvancedModuleName, "chompWhile", HigherOrderDispatcher parserChompWhileDispatcher )
+    , ( parserAdvancedModuleName, "chompUntilEndOr", HigherOrderDispatcher parserChompUntilEndOrDispatcher )
+    , ( parserAdvancedModuleName, "getChompedString", HigherOrderDispatcher parserGetChompedStringDispatcher )
+    , ( parserAdvancedModuleName, "mapChompedString", HigherOrderDispatcher parserMapChompedStringDispatcher )
+    , ( parserModuleName, "keeper", HigherOrderDispatcher parserKeeperDispatcher )
+    , ( parserModuleName, "ignorer", HigherOrderDispatcher parserIgnorerDispatcher )
+    ]
+
+
+parserAdvancedModuleName : ModuleName
+parserAdvancedModuleName =
+    [ "Parser", "Advanced" ]
+
+
+parserModuleName : ModuleName
+parserModuleName =
+    [ "Parser" ]
+
+
+type ParserStepView
+    = ParserStepGood Bool Value Value
+    | ParserStepBad Bool Value
+
+
+type LoopStepView
+    = LoopAgain Value
+    | LoopDone Value
+
+
+type alias ParserStateView =
+    { src : String
+    , offset : Int
+    , indent : Int
+    , context : Value
+    , row : Int
+    , col : Int
+    }
+
+
+parserQualifiedName : String -> QualifiedNameRef
+parserQualifiedName name =
+    { moduleName = parserAdvancedModuleName
+    , name = name
+    }
+
+
+parserCtor : String -> List Value -> Value
+parserCtor name args =
+    Custom (parserQualifiedName name) args
+
+
+parserStepView : Value -> Maybe ParserStepView
+parserStepView value =
+    case value of
+        Custom ref [ Bool progress, parsedValue, state ] ->
+            if ref.moduleName == parserAdvancedModuleName && ref.name == "Good" then
+                Just (ParserStepGood progress parsedValue state)
+
+            else
+                Nothing
+
+        Custom ref [ Bool progress, bag ] ->
+            if ref.moduleName == parserAdvancedModuleName && ref.name == "Bad" then
+                Just (ParserStepBad progress bag)
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+loopStepView : Value -> Maybe LoopStepView
+loopStepView value =
+    case value of
+        Custom ref [ inner ] ->
+            if ref.moduleName == parserAdvancedModuleName && ref.name == "Loop" then
+                Just (LoopAgain inner)
+
+            else if ref.moduleName == parserAdvancedModuleName && ref.name == "Done" then
+                Just (LoopDone inner)
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+makeParserValue : REnv -> String -> (REnv -> Value -> EvalResult Value) -> Value
+makeParserValue staticEnv debugName parserFn =
+    parserCtor "Parser"
+        [ PartiallyApplied
+            staticEnv.fallbackEnv
+            []
+            []
+            Nothing
+            (KernelImpl
+                parserAdvancedModuleName
+                ("fast-" ++ debugName)
+                (\args cfg callEnv ->
+                    case args of
+                        [ state ] ->
+                            parserFn
+                                { staticEnv
+                                    | fallbackEnv = callEnv
+                                    , fallbackConfig = cfg
+                                    , currentModule = callEnv.currentModule
+                                    , callStack = callEnv.callStack
+                                }
+                                state
+
+                        _ ->
+                            EvErr
+                                (Value.typeError
+                                    callEnv
+                                    ("Expected 1 parser state arg, got " ++ String.fromInt (List.length args))
+                                )
+                )
+            )
+            1
+        ]
+
+
+parserApply : REnv -> Value -> Value -> EvalResult Value
+parserApply env parserValue state =
+    case parserValue of
+        Custom ref [ parseFn ] ->
+            if ref.moduleName == parserAdvancedModuleName && ref.name == "Parser" then
+                applyClosure env parseFn [ state ]
+
+            else
+                evErr env
+                    (TypeError
+                        ("Expected Parser value, got " ++ Value.toString parserValue)
+                    )
+
+        _ ->
+            evErr env
+                (TypeError
+                    ("Expected Parser value, got " ++ Value.toString parserValue)
+                )
+
+
+resultOk : Value -> Value
+resultOk value =
+    Custom { moduleName = [ "Result" ], name = "Ok" } [ value ]
+
+
+resultErr : Value -> Value
+resultErr value =
+    Custom { moduleName = [ "Result" ], name = "Err" } [ value ]
+
+
+parserGood : Bool -> Value -> Value -> EvalResult Value
+parserGood progress value state =
+    EvOk (parserCtor "Good" [ Bool progress, value, state ])
+
+
+parserBad : Bool -> Value -> EvalResult Value
+parserBad progress bag =
+    EvOk (parserCtor "Bad" [ Bool progress, bag ])
+
+
+emptyParserBag : Value
+emptyParserBag =
+    parserCtor "Empty" []
+
+
+appendParserBag : Value -> Value -> Value
+appendParserBag left right =
+    parserCtor "Append" [ left, right ]
+
+
+deadEndFromState : Value -> Value -> Maybe Value
+deadEndFromState problem state =
+    case
+        ( parserStateField "row" state
+        , parserStateField "col" state
+        , parserStateField "context" state
+        )
+    of
+        ( Just (Int row), Just (Int col), Just context ) ->
+            Just
+                (Record
+                    (FastDict.fromList
+                        [ ( "row", Int row )
+                        , ( "col", Int col )
+                        , ( "problem", problem )
+                        , ( "contextStack", context )
+                        ]
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+problemBagFromState : Value -> Value -> Maybe Value
+problemBagFromState problem state =
+    deadEndFromState problem state
+        |> Maybe.map (\deadEnd -> parserCtor "AddRight" [ emptyParserBag, deadEnd ])
+
+
+parserStateField : String -> Value -> Maybe Value
+parserStateField fieldName state =
+    case state of
+        Record fields ->
+            FastDict.get fieldName fields
+
+        _ ->
+            Nothing
+
+
+parserStateView : Value -> Maybe ParserStateView
+parserStateView state =
+    case parserStateField "src" state of
+        Just (String src) ->
+            case parserStateField "offset" state of
+                Just (Int offset) ->
+                    case parserStateField "indent" state of
+                        Just (Int indent) ->
+                            case parserStateField "context" state of
+                                Just context ->
+                                    case parserStateField "row" state of
+                                        Just (Int row) ->
+                                            case parserStateField "col" state of
+                                                Just (Int col) ->
+                                                    Just
+                                                        { src = src
+                                                        , offset = offset
+                                                        , indent = indent
+                                                        , context = context
+                                                        , row = row
+                                                        , col = col
+                                                        }
+
+                                                _ ->
+                                                    Nothing
+
+                                        _ ->
+                                            Nothing
+
+                                _ ->
+                                    Nothing
+
+                        _ ->
+                            Nothing
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+parserStateValue : ParserStateView -> Value
+parserStateValue state =
+    Record
+        (FastDict.fromList
+            [ ( "src", String state.src )
+            , ( "offset", Int state.offset )
+            , ( "indent", Int state.indent )
+            , ( "context", state.context )
+            , ( "row", Int state.row )
+            , ( "col", Int state.col )
+            ]
+        )
+
+
+parserSourceSlice : Value -> Value -> Maybe String
+parserSourceSlice startState endState =
+    case
+        ( parserStateField "src" startState
+        , parserStateField "offset" startState
+        , parserStateField "offset" endState
+        )
+    of
+        ( Just (String src), Just (Int startOffset), Just (Int endOffset) ) ->
+            Just (String.slice startOffset endOffset src)
+
+        _ ->
+            Nothing
+
+
+parserBagToList : Value -> List Value -> List Value
+parserBagToList bag acc =
+    case bag of
+        Custom ref [] ->
+            if ref.moduleName == parserAdvancedModuleName && ref.name == "Empty" then
+                acc
+
+            else
+                acc
+
+        Custom ref [ left, right ] ->
+            if ref.moduleName == parserAdvancedModuleName && ref.name == "AddRight" then
+                parserBagToList left (right :: acc)
+
+            else if ref.moduleName == parserAdvancedModuleName && ref.name == "Append" then
+                parserBagToList left (parserBagToList right acc)
+
+            else
+                acc
+
+        _ ->
+            acc
+
+
+parserBadFromState : REnv -> Value -> Value -> EvalResult Value
+parserBadFromState env problem state =
+    case problemBagFromState problem state of
+        Just bag ->
+            parserBad False bag
+
+        Nothing ->
+            evErr env
+                (TypeError "Malformed parser state for Parser.Advanced failure")
+
+
+parserTokenView : Value -> Maybe ( String, Value )
+parserTokenView value =
+    case value of
+        Custom ref [ String str, expecting ] ->
+            if ref.moduleName == parserAdvancedModuleName && ref.name == "Token" then
+                Just ( str, expecting )
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+parserCharAt : Int -> String -> Maybe ( Char, Int )
+parserCharAt offset src =
+    String.slice offset (offset + 2) src
+        |> String.uncons
+        |> Maybe.map (\( char, _ ) -> ( char, String.length (String.fromChar char) ))
+
+
+parserPredicateMatches : REnv -> Value -> Char -> EvalResult Value
+parserPredicateMatches env predicate char =
+    applyClosure env predicate [ Char char ]
+        |> andThenValue
+            (\result ->
+                case result of
+                    Bool matched ->
+                        EvOk (Bool matched)
+
+                    _ ->
+                        evErr env
+                            (TypeError
+                                ("Expected Bool parser predicate result, got " ++ Value.toString result)
+                            )
+            )
+
+
+parserMapValue :
+    REnv
+    -> String
+    -> (REnv -> Value -> Value -> Value -> EvalResult Value)
+    -> Value
+    -> Value
+parserMapValue staticEnv debugName transform parserValue =
+    makeParserValue staticEnv debugName
+        (\runtimeEnv state0 ->
+            parserApply runtimeEnv parserValue state0
+                |> andThenValue
+                    (\step ->
+                        case parserStepView step of
+                            Just (ParserStepBad progress bag) ->
+                                EvOk (parserCtor "Bad" [ Bool progress, bag ])
+
+                            Just (ParserStepGood progress parsedValue state1) ->
+                                transform runtimeEnv state0 parsedValue state1
+                                    |> andThenValue
+                                        (\mapped ->
+                                            EvOk
+                                                (parserCtor "Good"
+                                                    [ Bool progress
+                                                    , mapped
+                                                    , state1
+                                                    ]
+                                                )
+                                        )
+
+                            Nothing ->
+                                evErr runtimeEnv
+                                    (TypeError
+                                        ("Expected Parser.Advanced step, got " ++ Value.toString step)
+                                    )
+                    )
+        )
+
+
+parserMap2Value :
+    REnv
+    -> String
+    -> (REnv -> Value -> Value -> EvalResult Value)
+    -> Value
+    -> Value
+    -> Value
+parserMap2Value staticEnv debugName combine parserA parserB =
+    makeParserValue staticEnv debugName
+        (\runtimeEnv state0 ->
+            parserApply runtimeEnv parserA state0
+                |> andThenValue
+                    (\stepA ->
+                        case parserStepView stepA of
+                            Just (ParserStepBad progress bag) ->
+                                EvOk (parserCtor "Bad" [ Bool progress, bag ])
+
+                            Just (ParserStepGood progressA valueA state1) ->
+                                parserApply runtimeEnv parserB state1
+                                    |> andThenValue
+                                        (\stepB ->
+                                            case parserStepView stepB of
+                                                Just (ParserStepBad progressB bag) ->
+                                                    EvOk
+                                                        (parserCtor "Bad"
+                                                            [ Bool (progressA || progressB)
+                                                            , bag
+                                                            ]
+                                                        )
+
+                                                Just (ParserStepGood progressB valueB state2) ->
+                                                    combine runtimeEnv valueA valueB
+                                                        |> andThenValue
+                                                            (\combined ->
+                                                                EvOk
+                                                                    (parserCtor "Good"
+                                                                        [ Bool (progressA || progressB)
+                                                                        , combined
+                                                                        , state2
+                                                                        ]
+                                                                    )
+                                                            )
+
+                                                Nothing ->
+                                                    evErr runtimeEnv
+                                                        (TypeError
+                                                            ("Expected Parser.Advanced step, got " ++ Value.toString stepB)
+                                                        )
+                                        )
+
+                            Nothing ->
+                                evErr runtimeEnv
+                                    (TypeError
+                                        ("Expected Parser.Advanced step, got " ++ Value.toString stepA)
+                                    )
+                    )
+        )
+
+
+parserRunDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserRunDispatcher env args =
+    case args of
+        [ parserValue, String src ] ->
+            let
+                initialState : Value
+                initialState =
+                    Record
+                        (FastDict.fromList
+                            [ ( "src", String src )
+                            , ( "offset", Int 0 )
+                            , ( "indent", Int 1 )
+                            , ( "context", List [] )
+                            , ( "row", Int 1 )
+                            , ( "col", Int 1 )
+                            ]
+                        )
+            in
+            Just
+                (parserApply env parserValue initialState
+                    |> andThenValue
+                        (\step ->
+                            case parserStepView step of
+                                Just (ParserStepGood _ value _) ->
+                                    EvOk (resultOk value)
+
+                                Just (ParserStepBad _ bag) ->
+                                    EvOk
+                                        (resultErr
+                                            (List (parserBagToList bag []))
+                                        )
+
+                                Nothing ->
+                                    evErr env
+                                        (TypeError
+                                            ("Expected Parser.Advanced step, got " ++ Value.toString step)
+                                        )
+                        )
+                )
+
+        _ ->
+            Nothing
+
+
+parserSucceedDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserSucceedDispatcher env args =
+    case args of
+        [ value ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-succeed"
+                        (\_ state -> EvOk (parserCtor "Good" [ Bool False, value, state ]))
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserProblemDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserProblemDispatcher env args =
+    case args of
+        [ problem ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-problem"
+                        (\runtimeEnv state ->
+                            case problemBagFromState problem state of
+                                Just bag ->
+                                    EvOk (parserCtor "Bad" [ Bool False, bag ])
+
+                                Nothing ->
+                                    evErr runtimeEnv
+                                        (TypeError "Malformed parser state for Parser.Advanced.problem")
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserEndDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserEndDispatcher env args =
+    case args of
+        [ problem ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-end"
+                        (\runtimeEnv state ->
+                            case parserStateView state of
+                                Just stateView ->
+                                    if String.length stateView.src == stateView.offset then
+                                        parserGood False Unit state
+
+                                    else
+                                        parserBadFromState runtimeEnv problem state
+
+                                Nothing ->
+                                    evErr runtimeEnv
+                                        (TypeError "Malformed parser state for Parser.Advanced.end")
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserMapDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserMapDispatcher env args =
+    case args of
+        [ callback, parserValue ] ->
+            Just
+                (EvOk
+                    (parserMapValue env "parser-map"
+                        (\runtimeEnv _ parsedValue _ ->
+                            applyClosure runtimeEnv callback [ parsedValue ]
+                        )
+                        parserValue
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserKeeperDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserKeeperDispatcher env args =
+    case args of
+        [ parserFunc, parserArg ] ->
+            Just
+                (EvOk
+                    (parserMap2Value env "parser-keeper"
+                        (\runtimeEnv func arg ->
+                            applyClosure runtimeEnv func [ arg ]
+                        )
+                        parserFunc
+                        parserArg
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserIgnorerDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserIgnorerDispatcher env args =
+    case args of
+        [ keepParser, ignoreParser ] ->
+            Just
+                (EvOk
+                    (parserMap2Value env "parser-ignorer"
+                        (\_ keep _ -> EvOk keep)
+                        keepParser
+                        ignoreParser
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserAndThenDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserAndThenDispatcher env args =
+    case args of
+        [ callback, parserValue ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-andThen"
+                        (\runtimeEnv state0 ->
+                            parserApply runtimeEnv parserValue state0
+                                |> andThenValue
+                                    (\stepA ->
+                                        case parserStepView stepA of
+                                            Just (ParserStepBad progress bag) ->
+                                                EvOk (parserCtor "Bad" [ Bool progress, bag ])
+
+                                            Just (ParserStepGood progressA valueA state1) ->
+                                                applyClosure runtimeEnv callback [ valueA ]
+                                                    |> andThenValue
+                                                        (\nextParser ->
+                                                            parserApply runtimeEnv nextParser state1
+                                                                |> andThenValue
+                                                                    (\stepB ->
+                                                                        case parserStepView stepB of
+                                                                            Just (ParserStepBad progressB bag) ->
+                                                                                EvOk
+                                                                                    (parserCtor "Bad"
+                                                                                        [ Bool (progressA || progressB)
+                                                                                        , bag
+                                                                                        ]
+                                                                                    )
+
+                                                                            Just (ParserStepGood progressB valueB state2) ->
+                                                                                EvOk
+                                                                                    (parserCtor "Good"
+                                                                                        [ Bool (progressA || progressB)
+                                                                                        , valueB
+                                                                                        , state2
+                                                                                        ]
+                                                                                    )
+
+                                                                            Nothing ->
+                                                                                evErr runtimeEnv
+                                                                                    (TypeError
+                                                                                        ("Expected Parser.Advanced step, got " ++ Value.toString stepB)
+                                                                                    )
+                                                                    )
+                                                        )
+
+                                            Nothing ->
+                                                evErr runtimeEnv
+                                                    (TypeError
+                                                        ("Expected Parser.Advanced step, got " ++ Value.toString stepA)
+                                                    )
+                                    )
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserLazyDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserLazyDispatcher env args =
+    case args of
+        [ thunk ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-lazy"
+                        (\runtimeEnv state ->
+                            applyClosure runtimeEnv thunk [ Unit ]
+                                |> andThenValue
+                                    (\parserValue ->
+                                        parserApply runtimeEnv parserValue state
+                                    )
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserOneOfDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserOneOfDispatcher env args =
+    case args of
+        [ List parsers ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-oneOf"
+                        (\runtimeEnv state ->
+                            parserOneOfHelp runtimeEnv state emptyParserBag parsers
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserOneOfHelp : REnv -> Value -> Value -> List Value -> EvalResult Value
+parserOneOfHelp env state0 bag parsers =
+    case parsers of
+        [] ->
+            EvOk (parserCtor "Bad" [ Bool False, bag ])
+
+        parserValue :: remaining ->
+            parserApply env parserValue state0
+                |> andThenValue
+                    (\step ->
+                        case parserStepView step of
+                            Just (ParserStepGood progress value state1) ->
+                                EvOk (parserCtor "Good" [ Bool progress, value, state1 ])
+
+                            Just (ParserStepBad progress nextBag) ->
+                                if progress then
+                                    EvOk (parserCtor "Bad" [ Bool progress, nextBag ])
+
+                                else
+                                    parserOneOfHelp env state0 (appendParserBag bag nextBag) remaining
+
+                            Nothing ->
+                                evErr env
+                                    (TypeError
+                                        ("Expected Parser.Advanced step, got " ++ Value.toString step)
+                                    )
+                    )
+
+
+parserLoopDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserLoopDispatcher env args =
+    case args of
+        [ initialState, callback ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-loop"
+                        (\runtimeEnv state0 ->
+                            parserLoopHelp runtimeEnv False initialState callback state0
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserLoopHelp : REnv -> Bool -> Value -> Value -> Value -> EvalResult Value
+parserLoopHelp env progress state callback parserState =
+    applyClosure env callback [ state ]
+        |> andThenValue
+            (\parserValue ->
+                parserApply env parserValue parserState
+                    |> andThenValue
+                        (\step ->
+                            case parserStepView step of
+                                Just (ParserStepGood stepProgress loopStep state1) ->
+                                    case loopStepView loopStep of
+                                        Just (LoopAgain newState) ->
+                                            parserLoopHelp env (progress || stepProgress) newState callback state1
+
+                                        Just (LoopDone result) ->
+                                            EvOk
+                                                (parserCtor "Good"
+                                                    [ Bool (progress || stepProgress)
+                                                    , result
+                                                    , state1
+                                                    ]
+                                                )
+
+                                        Nothing ->
+                                            evErr env
+                                                (TypeError
+                                                    ("Expected Parser.Advanced.Step, got " ++ Value.toString loopStep)
+                                                )
+
+                                Just (ParserStepBad stepProgress bag) ->
+                                    EvOk
+                                        (parserCtor "Bad"
+                                            [ Bool (progress || stepProgress)
+                                            , bag
+                                            ]
+                                        )
+
+                                Nothing ->
+                                    evErr env
+                                        (TypeError
+                                            ("Expected Parser.Advanced step, got " ++ Value.toString step)
+                                        )
+                        )
+            )
+
+
+parserBacktrackableDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserBacktrackableDispatcher env args =
+    case args of
+        [ parserValue ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-backtrackable"
+                        (\runtimeEnv state ->
+                            parserApply runtimeEnv parserValue state
+                                |> andThenValue
+                                    (\step ->
+                                        case parserStepView step of
+                                            Just (ParserStepBad _ bag) ->
+                                                EvOk (parserCtor "Bad" [ Bool False, bag ])
+
+                                            Just (ParserStepGood _ value state1) ->
+                                                EvOk (parserCtor "Good" [ Bool False, value, state1 ])
+
+                                            Nothing ->
+                                                evErr runtimeEnv
+                                                    (TypeError
+                                                        ("Expected Parser.Advanced step, got " ++ Value.toString step)
+                                                    )
+                                    )
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserCommitDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserCommitDispatcher env args =
+    case args of
+        [ value ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-commit"
+                        (\_ state -> EvOk (parserCtor "Good" [ Bool True, value, state ]))
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserTokenDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserTokenDispatcher env args =
+    case args of
+        [ tokenValue ] ->
+            parserTokenView tokenValue
+                |> Maybe.map
+                    (\( str, expecting ) ->
+                        EvOk
+                            (makeParserValue env "parser-token"
+                                (\runtimeEnv state ->
+                                    case parserStateView state of
+                                        Just stateView ->
+                                            let
+                                                progress : Bool
+                                                progress =
+                                                    not (String.isEmpty str)
+
+                                                ( newOffset, newRow, newCol ) =
+                                                    KernelParser.isSubString
+                                                        str
+                                                        stateView.offset
+                                                        stateView.row
+                                                        stateView.col
+                                                        stateView.src
+                                            in
+                                            if newOffset == -1 then
+                                                parserBadFromState runtimeEnv expecting state
+
+                                            else
+                                                parserGood
+                                                    progress
+                                                    Unit
+                                                    (parserStateValue
+                                                        { stateView
+                                                            | offset = newOffset
+                                                            , row = newRow
+                                                            , col = newCol
+                                                        }
+                                                    )
+
+                                        Nothing ->
+                                            evErr runtimeEnv
+                                                (TypeError "Malformed parser state for Parser.Advanced.token")
+                                )
+                            )
+                    )
+
+        _ ->
+            Nothing
+
+
+parserSymbolDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserSymbolDispatcher =
+    parserTokenDispatcher
+
+
+parserKeywordDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserKeywordDispatcher env args =
+    case args of
+        [ tokenValue ] ->
+            parserTokenView tokenValue
+                |> Maybe.map
+                    (\( keyword, expecting ) ->
+                        EvOk
+                            (makeParserValue env "parser-keyword"
+                                (\runtimeEnv state ->
+                                    case parserStateView state of
+                                        Just stateView ->
+                                            let
+                                                progress : Bool
+                                                progress =
+                                                    not (String.isEmpty keyword)
+
+                                                ( newOffset, newRow, newCol ) =
+                                                    KernelParser.isSubString
+                                                        keyword
+                                                        stateView.offset
+                                                        stateView.row
+                                                        stateView.col
+                                                        stateView.src
+
+                                                isKeywordBoundary : Bool
+                                                isKeywordBoundary =
+                                                    case parserCharAt newOffset stateView.src of
+                                                        Just ( nextChar, _ ) ->
+                                                            not (Char.isAlphaNum nextChar || nextChar == '_')
+
+                                                        Nothing ->
+                                                            True
+                                            in
+                                            if newOffset == -1 || not isKeywordBoundary then
+                                                parserBadFromState runtimeEnv expecting state
+
+                                            else
+                                                parserGood
+                                                    progress
+                                                    Unit
+                                                    (parserStateValue
+                                                        { stateView
+                                                            | offset = newOffset
+                                                            , row = newRow
+                                                            , col = newCol
+                                                        }
+                                                    )
+
+                                        Nothing ->
+                                            evErr runtimeEnv
+                                                (TypeError "Malformed parser state for Parser.Advanced.keyword")
+                                )
+                            )
+                    )
+
+        _ ->
+            Nothing
+
+
+parserChompIfDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserChompIfDispatcher env args =
+    case args of
+        [ predicate, expecting ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-chompIf"
+                        (\runtimeEnv state ->
+                            case parserStateView state of
+                                Just stateView ->
+                                    case parserCharAt stateView.offset stateView.src of
+                                        Just ( char, width ) ->
+                                            parserPredicateMatches runtimeEnv predicate char
+                                                |> andThenValue
+                                                    (\matchedValue ->
+                                                        case matchedValue of
+                                                            Bool True ->
+                                                                if char == '\n' then
+                                                                    parserGood
+                                                                        True
+                                                                        Unit
+                                                                        (parserStateValue
+                                                                            { stateView
+                                                                                | offset = stateView.offset + 1
+                                                                                , row = stateView.row + 1
+                                                                                , col = 1
+                                                                            }
+                                                                        )
+
+                                                                else
+                                                                    parserGood
+                                                                        True
+                                                                        Unit
+                                                                        (parserStateValue
+                                                                            { stateView
+                                                                                | offset = stateView.offset + width
+                                                                                , col = stateView.col + 1
+                                                                            }
+                                                                        )
+
+                                                            Bool False ->
+                                                                parserBadFromState runtimeEnv expecting state
+
+                                                            _ ->
+                                                                evErr runtimeEnv
+                                                                    (TypeError
+                                                                        ("Expected Bool parser predicate result, got " ++ Value.toString matchedValue)
+                                                                    )
+                                                    )
+
+                                        Nothing ->
+                                            parserBadFromState runtimeEnv expecting state
+
+                                Nothing ->
+                                    evErr runtimeEnv
+                                        (TypeError "Malformed parser state for Parser.Advanced.chompIf")
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserChompWhileDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserChompWhileDispatcher env args =
+    case args of
+        [ predicate ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-chompWhile"
+                        (\runtimeEnv state ->
+                            case parserStateView state of
+                                Just stateView ->
+                                    parserChompWhileHelp runtimeEnv predicate stateView.offset stateView.row stateView.col stateView
+
+                                Nothing ->
+                                    evErr runtimeEnv
+                                        (TypeError "Malformed parser state for Parser.Advanced.chompWhile")
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserChompWhileHelp : REnv -> Value -> Int -> Int -> Int -> ParserStateView -> EvalResult Value
+parserChompWhileHelp env predicate offset row col originalState =
+    case parserCharAt offset originalState.src of
+        Just ( char, width ) ->
+            parserPredicateMatches env predicate char
+                |> andThenValue
+                    (\matchedValue ->
+                        case matchedValue of
+                            Bool True ->
+                                if char == '\n' then
+                                    parserChompWhileHelp env predicate (offset + 1) (row + 1) 1 originalState
+
+                                else
+                                    parserChompWhileHelp env predicate (offset + width) row (col + 1) originalState
+
+                            Bool False ->
+                                parserGood
+                                    (originalState.offset < offset)
+                                    Unit
+                                    (parserStateValue
+                                        { originalState
+                                            | offset = offset
+                                            , row = row
+                                            , col = col
+                                        }
+                                    )
+
+                            _ ->
+                                evErr env
+                                    (TypeError
+                                        ("Expected Bool parser predicate result, got " ++ Value.toString matchedValue)
+                                    )
+                    )
+
+        Nothing ->
+            parserGood
+                (originalState.offset < offset)
+                Unit
+                (parserStateValue
+                    { originalState
+                        | offset = offset
+                        , row = row
+                        , col = col
+                    }
+                )
+
+
+parserChompUntilEndOrDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserChompUntilEndOrDispatcher env args =
+    case args of
+        [ String needle ] ->
+            Just
+                (EvOk
+                    (makeParserValue env "parser-chompUntilEndOr"
+                        (\runtimeEnv state ->
+                            case parserStateView state of
+                                Just stateView ->
+                                    let
+                                        ( newOffset, newRow, newCol ) =
+                                            KernelParser.findSubString
+                                                needle
+                                                stateView.offset
+                                                stateView.row
+                                                stateView.col
+                                                stateView.src
+
+                                        adjustedOffset : Int
+                                        adjustedOffset =
+                                            if newOffset < 0 then
+                                                String.length stateView.src
+
+                                            else
+                                                newOffset
+                                    in
+                                    parserGood
+                                        (stateView.offset < adjustedOffset)
+                                        Unit
+                                        (parserStateValue
+                                            { stateView
+                                                | offset = adjustedOffset
+                                                , row = newRow
+                                                , col = newCol
+                                            }
+                                        )
+
+                                Nothing ->
+                                    evErr runtimeEnv
+                                        (TypeError "Malformed parser state for Parser.Advanced.chompUntilEndOr")
+                        )
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserGetChompedStringDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserGetChompedStringDispatcher env args =
+    case args of
+        [ parserValue ] ->
+            Just
+                (EvOk
+                    (parserMapValue env "parser-getChompedString"
+                        (\runtimeEnv state0 _ state1 ->
+                            case parserSourceSlice state0 state1 of
+                                Just slice ->
+                                    EvOk (String slice)
+
+                                Nothing ->
+                                    evErr runtimeEnv
+                                        (TypeError "Malformed parser state for Parser.Advanced.getChompedString")
+                        )
+                        parserValue
+                    )
+                )
+
+        _ ->
+            Nothing
+
+
+parserMapChompedStringDispatcher : REnv -> List Value -> Maybe (EvalResult Value)
+parserMapChompedStringDispatcher env args =
+    case args of
+        [ callback, parserValue ] ->
+            Just
+                (EvOk
+                    (parserMapValue env "parser-mapChompedString"
+                        (\runtimeEnv state0 parsedValue state1 ->
+                            case parserSourceSlice state0 state1 of
+                                Just slice ->
+                                    applyClosure runtimeEnv callback [ String slice, parsedValue ]
+
+                                Nothing ->
+                                    evErr runtimeEnv
+                                        (TypeError "Malformed parser state for Parser.Advanced.mapChompedString")
+                        )
+                        parserValue
+                    )
+                )
+
+        _ ->
+            Nothing
 
 
 
