@@ -437,6 +437,19 @@ functions evalFunction =
       , [ ( "reorderExponent", fuzzFloatReorderExponentKernel )
         ]
       )
+
+    -- Parser.Advanced hot-path primitives. The user-source versions
+    -- construct a `Parser (\s -> ...)` closure that the interpreter walks
+    -- on every parse step. For parser-heavy workloads (e.g.
+    -- `MarkdownFuzzer` running 100 parse→render→parse iterations) the
+    -- wrapper dispatch dominates. These kernel entries return a
+    -- `Parser` Custom wrapping a `PartiallyApplied` with a `KernelImpl`
+    -- body, so when the caller unwraps `(Parser parse)` and applies it
+    -- to the state the interpreter hands args straight to host Elm.
+    , ( [ "Parser", "Advanced" ]
+      , [ ( "succeed", parserAdvancedSucceedKernel )
+        ]
+      )
     ]
         |> List.map
             (\( moduleName, moduleFunctions ) ->
@@ -1914,3 +1927,75 @@ applyPredicate evalFn predicate charArg cfg env =
 
         _ ->
             EvalResult.fail <| typeError env "isSubChar: expected a predicate function"
+
+
+
+-- Parser.Advanced native wrappers
+--
+-- Parser.Advanced values have shape `Parser (State c -> PStep c x a)`. The
+-- user source wraps a lambda around the state; the interpreter evaluates
+-- the wrapper + the case-analysis on every step. For hot combinators we
+-- can short-circuit by returning a `Parser` Custom whose inner closure is
+-- a `PartiallyApplied` backed by a `KernelImpl`. When the caller unwraps
+-- `(Parser parse)` and applies it to the state, the interpreter runs the
+-- kernel body directly instead of walking the Elm source.
+
+
+parserAdvancedRef : QualifiedNameRef
+parserAdvancedRef =
+    { moduleName = [ "Parser", "Advanced" ], name = "Parser" }
+
+
+parserAdvancedGoodRef : QualifiedNameRef
+parserAdvancedGoodRef =
+    { moduleName = [ "Parser", "Advanced" ], name = "Good" }
+
+
+{-| Wrap a 1-capture, 1-state-arg kernel step as a native `Parser` Custom.
+Mirrors `makeNativeGenerator` but for Parser.Advanced's Parser ctor.
+-}
+makeParserAdvancedParser1 : Value -> (List Value -> Eval Value) -> Value
+makeParserAdvancedParser1 captured stepFn =
+    Custom parserAdvancedRef
+        [ PartiallyApplied
+            (Environment.empty [ "Parser", "Advanced" ])
+            [ captured ]
+            [ fakeNode (VarPattern "$captured"), fakeNode (VarPattern "$state") ]
+            (Just { moduleName = [ "Parser", "Advanced" ], name = "nativeParser" })
+            (KernelImpl [ "Parser", "Advanced" ] "nativeParserStep" stepFn)
+            2
+        ]
+
+
+{-| Native Parser.Advanced.succeed a.
+
+Returns `Parser (\s -> Good False a s)` without walking the wrapper. The
+captured value `a` is stored as `oldArgs`; when `Parser.Advanced.run`
+unwraps the Parser and applies the closure to the initial state, the
+interpreter hands `[a, s]` to `parserAdvancedSucceedStep`.
+
+-}
+parserAdvancedSucceedKernel : ModuleName -> ( Int, List Value -> Eval Value )
+parserAdvancedSucceedKernel _ =
+    ( 1
+    , \args _ env ->
+        case args of
+            [ a ] ->
+                EvalResult.succeed (makeParserAdvancedParser1 a parserAdvancedSucceedStep)
+
+            _ ->
+                EvalResult.fail <|
+                    typeError env "Parser.Advanced.succeed (kernel): expected 1 arg"
+    )
+
+
+parserAdvancedSucceedStep : List Value -> Eval Value
+parserAdvancedSucceedStep args _ env =
+    case args of
+        [ a, state ] ->
+            EvalResult.succeed
+                (Custom parserAdvancedGoodRef [ Bool False, a, state ])
+
+        _ ->
+            EvalResult.fail <|
+                typeError env "Parser.Advanced.succeed step (kernel): expected [captured, state]"
