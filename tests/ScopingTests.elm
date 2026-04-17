@@ -137,6 +137,48 @@ main = List.map .x [Point 10 20, Point 30 40]
 """
                     (Expression.FunctionOrValue [] "main")
                     |> Expect.equal (Ok (List [ Int 10, Int 30 ]))
+        , evalProjectTest "record alias constructor imported with explicit exposing"
+            [ """module Point exposing (Point)
+
+type alias Point = { x : Int, y : Int }
+"""
+            , """module Main exposing (main)
+
+import Point exposing (Point)
+
+main = (Point 5 6).x
+"""
+            ]
+            Int
+            5
+        , evalProjectTest "record alias constructor used qualified"
+            [ """module Point exposing (Point)
+
+type alias Point = { x : Int, y : Int }
+"""
+            , """module Main exposing (main)
+
+import Point
+
+main = (Point.Point 5 6).y
+"""
+            ]
+            Int
+            6
+        , evalProjectTest "record alias constructor imported with exposing everything"
+            [ """module Point exposing (..)
+
+type alias Point = { x : Int, y : Int }
+"""
+            , """module Main exposing (main)
+
+import Point exposing (..)
+
+main = (Point 7 8).y
+"""
+            ]
+            Int
+            8
         ]
 
 

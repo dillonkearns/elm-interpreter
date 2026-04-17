@@ -356,27 +356,53 @@ resolveFunctionOrValue ctx moduleName name =
                                             Ok (RCtor { moduleName = canonicalModule, name = name })
 
                                 Nothing ->
-                                    {- No local top-level and no exposed
-                                       import match: assume the constructor
-                                       is defined in the current module.
-                                       Mirrors OLD eval's `evalVariant`,
-                                       which resolves unqualified custom-
-                                       type constructors to `env.currentModule`
-                                       so `==` comparisons against qualified
-                                       references from other modules (e.g.
-                                       `Foo.Hearts` vs an unqualified `Hearts`
-                                       inside `Foo`) produce consistent
-                                       `Custom { moduleName, name }` values.
-                                       Previously this branch dropped
-                                       `moduleName` to `[]`, which caused
-                                       the 5 `OrderTests` failures in the
-                                       core-extra bench whenever a wrapper
-                                       module qualified the ctor reference
-                                       and the defining module's let-rec
-                                       body compared it against an
-                                       unqualified reference.
+                                    {- Record type aliases are registered as
+                                       functions, not ctors, so they land in
+                                       `exposedValues` rather than
+                                       `exposedConstructors`. Try that before
+                                       giving up — otherwise an unqualified
+                                       `Signature` from an `exposing (..)` /
+                                       `exposing (Signature)` import would
+                                       fall through to `RCtor` and blow up
+                                       `.field` access with "field access on
+                                       non-record".
+
+                                       If the exposed-value lookup misses
+                                       globalIds, we still fall through to
+                                       the `RCtor { currentModule, name }`
+                                       default (see the comment below).
                                     -}
-                                    Ok (RCtor { moduleName = ctx.currentModule, name = name })
+                                    case FastDict.get name ctx.imports.exposedValues of
+                                        Just ( canonicalModule, _ ) ->
+                                            case FastDict.get ( canonicalModule, name ) ctx.globalIds of
+                                                Just id ->
+                                                    Ok (RGlobal id)
+
+                                                Nothing ->
+                                                    Ok (RCtor { moduleName = ctx.currentModule, name = name })
+
+                                        Nothing ->
+                                            {- No local top-level and no exposed
+                                               import match: assume the constructor
+                                               is defined in the current module.
+                                               Mirrors OLD eval's `evalVariant`,
+                                               which resolves unqualified custom-
+                                               type constructors to `env.currentModule`
+                                               so `==` comparisons against qualified
+                                               references from other modules (e.g.
+                                               `Foo.Hearts` vs an unqualified `Hearts`
+                                               inside `Foo`) produce consistent
+                                               `Custom { moduleName, name }` values.
+                                               Previously this branch dropped
+                                               `moduleName` to `[]`, which caused
+                                               the 5 `OrderTests` failures in the
+                                               core-extra bench whenever a wrapper
+                                               module qualified the ctor reference
+                                               and the defining module's let-rec
+                                               body compared it against an
+                                               unqualified reference.
+                                            -}
+                                            Ok (RCtor { moduleName = ctx.currentModule, name = name })
 
                 else
                     -- Unqualified value: try the current module first

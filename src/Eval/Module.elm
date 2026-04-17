@@ -7670,9 +7670,20 @@ exposeExplicitItem allInterfaces (( moduleName, _ ) as moduleNameWithKey) (Node 
         FunctionExpose name ->
             { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
 
-        TypeOrAliasExpose _ ->
-            -- Type name without constructors - doesn't add values
-            acc
+        TypeOrAliasExpose name ->
+            -- Record type aliases auto-generate a constructor function
+            -- that must be reachable via unqualified reference
+            -- (e.g. `import Elm.Syntax.Signature exposing (Signature)`
+            -- must let `Signature a b` resolve to the record-building
+            -- function, matching what `exposing (..)` already provides
+            -- through `exposeFromInterface`). Custom types without `(..)`
+            -- register nothing in globalIds, so this is a no-op lookup
+            -- for them at resolve time.
+            if isAliasInInterface allInterfaces moduleName name then
+                { acc | exposedValues = Dict.insert name moduleNameWithKey acc.exposedValues }
+
+            else
+                acc
 
         TypeExpose { name, open } ->
             case open of
@@ -7710,6 +7721,25 @@ exposeExplicitItem allInterfaces (( moduleName, _ ) as moduleNameWithKey) (Node 
 
         InfixExpose _ ->
             acc
+
+
+isAliasInInterface : ElmDict.Dict ModuleName (List Exposed) -> ModuleName -> String -> Bool
+isAliasInInterface allInterfaces moduleName name =
+    case ElmDict.get moduleName allInterfaces of
+        Nothing ->
+            False
+
+        Just interface ->
+            List.any
+                (\exposed ->
+                    case exposed of
+                        Elm.Interface.Alias aliasName ->
+                            aliasName == name
+
+                        _ ->
+                            False
+                )
+                interface
 
 
 defaultImports : List (Node Elm.Syntax.Import.Import)

@@ -3229,17 +3229,16 @@ evalQualifiedOrVariantSlow moduleName name cfg env =
 {-| Look up a record alias constructor function for a given variant name.
 Returns the function only if its body is a RecordExpr, to avoid infinite
 loops with regular custom type constructors.
+
+For unqualified uppercase references, also consults `env.imports.exposedValues`
+so that `import Elm.Syntax.Signature exposing (Signature)` lets
+`Signature name ty` resolve to the record-building function registered under
+that import's canonical module.
+
 -}
 findRecordAliasConstructor : ModuleName -> String -> Env -> Maybe ( ModuleName, Expression.FunctionImplementation )
 findRecordAliasConstructor moduleName name env =
     let
-        ( resolvedModule, resolvedModuleKey ) =
-            if List.isEmpty moduleName then
-                ( env.currentModule, env.currentModuleKey )
-
-            else
-                fixModuleName moduleName env
-
         isRecordExprBody : Expression.FunctionImplementation -> Bool
         isRecordExprBody func =
             case Node.value func.expression of
@@ -3249,24 +3248,48 @@ findRecordAliasConstructor moduleName name env =
                 _ ->
                     False
 
-        maybeFunc : Maybe Expression.FunctionImplementation
-        maybeFunc =
-            if List.isEmpty moduleName then
-                Dict.get name env.currentModuleFunctions
+        tryModule : ModuleName -> String -> Maybe ( ModuleName, Expression.FunctionImplementation )
+        tryModule targetModule targetKey =
+            let
+                maybeFunc : Maybe Expression.FunctionImplementation
+                maybeFunc =
+                    if targetModule == env.currentModule then
+                        Dict.get name env.currentModuleFunctions
 
-            else
-                Dict.get resolvedModuleKey env.shared.functions
-                    |> Maybe.andThen (Dict.get name)
-    in
-    maybeFunc
-        |> Maybe.andThen
-            (\f ->
-                if isRecordExprBody f then
-                    Just ( resolvedModule, f )
+                    else
+                        Dict.get targetKey env.shared.functions
+                            |> Maybe.andThen (Dict.get name)
+            in
+            case maybeFunc of
+                Just f ->
+                    if isRecordExprBody f then
+                        Just ( targetModule, f )
 
-                else
+                    else
+                        Nothing
+
+                Nothing ->
                     Nothing
-            )
+    in
+    if List.isEmpty moduleName then
+        case tryModule env.currentModule env.currentModuleKey of
+            Just hit ->
+                Just hit
+
+            Nothing ->
+                case Dict.get name env.imports.exposedValues of
+                    Just ( canonicalModule, canonicalKey ) ->
+                        tryModule canonicalModule canonicalKey
+
+                    Nothing ->
+                        Nothing
+
+    else
+        let
+            ( resolvedModule, resolvedModuleKey ) =
+                fixModuleName moduleName env
+        in
+        tryModule resolvedModule resolvedModuleKey
 
 
 fixModuleName : ModuleName -> Env -> ( ModuleName, String )
