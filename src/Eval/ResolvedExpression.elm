@@ -389,12 +389,54 @@ evalR initEnv initExpr =
 
 
 {-| Rebuild a full REnv from the static-env closure + the current
-locals. Used only when calling direct-style helpers that require the
-whole REnv shape; the hot trampoline path never needs this.
+locals.
+
+Written out field-by-field (rather than `{ staticEnv | locals = locals }`)
+so the Elm compiler emits a monomorphic object-literal rather than routing
+through `_Utils_update`, which V8 was treating as a megamorphic KeyedStore
+site (~31% of all `KeyedStoreIC_Megamorphic` ticks in the MarkdownFuzzer
+profile). Explicit construction gives V8 a stable hidden class per
+REnv shape.
+
 -}
 envWithLocals : REnv -> List Value -> REnv
 envWithLocals staticEnv locals =
-    { staticEnv | locals = locals }
+    { locals = locals
+    , globals = staticEnv.globals
+    , resolvedBodies = staticEnv.resolvedBodies
+    , globalIdToName = staticEnv.globalIdToName
+    , nativeDispatchers = staticEnv.nativeDispatchers
+    , higherOrderDispatchers = staticEnv.higherOrderDispatchers
+    , kernelDispatchers = staticEnv.kernelDispatchers
+    , interceptsByGlobal = staticEnv.interceptsByGlobal
+    , fallbackEnv = staticEnv.fallbackEnv
+    , fallbackConfig = staticEnv.fallbackConfig
+    , currentModule = staticEnv.currentModule
+    , callStack = staticEnv.callStack
+    , callDepth = staticEnv.callDepth
+    }
+
+
+{-| Variant of `envWithLocals` that also bumps `callDepth`. Used in
+`runRExprClosure` for every resolved-IR closure invocation — same
+shape-stability rationale.
+-}
+envWithLocalsAndBumpedDepth : REnv -> List Value -> REnv
+envWithLocalsAndBumpedDepth env locals =
+    { locals = locals
+    , globals = env.globals
+    , resolvedBodies = env.resolvedBodies
+    , globalIdToName = env.globalIdToName
+    , nativeDispatchers = env.nativeDispatchers
+    , higherOrderDispatchers = env.higherOrderDispatchers
+    , kernelDispatchers = env.kernelDispatchers
+    , interceptsByGlobal = env.interceptsByGlobal
+    , fallbackEnv = env.fallbackEnv
+    , fallbackConfig = env.fallbackConfig
+    , currentModule = env.currentModule
+    , callStack = env.callStack
+    , callDepth = env.callDepth + 1
+    }
 
 
 {-| One step of the trampolined evaluator. Takes the static REnv
@@ -561,7 +603,7 @@ evalRStep staticEnv locals expr =
             rBase
                 (EvOk
                     (makeClosure
-                        { staticEnv | locals = [] }
+                        (envWithLocals staticEnv [])
                         1
                         (RRecordAccess (RLocal 0) fieldName)
                         0
@@ -1292,7 +1334,7 @@ evalRDirect env expr =
             evalLetBindings env bindings
                 |> andThenList
                     (\newLocals ->
-                        evalR { env | locals = newLocals } letBody
+                        evalR (envWithLocals env newLocals) letBody
                     )
 
         RLambda lambda ->
@@ -1342,7 +1384,7 @@ evalRDirect env expr =
             -- No captures needed since the body only references the argument.
             EvOk
                 (makeClosure
-                    { env | locals = [] }
+                    (envWithLocals env [])
                     1
                     (RRecordAccess (RLocal 0) fieldName)
                     0
@@ -1608,7 +1650,7 @@ runRExprClosure env implBody selfClosure args =
 
         bodyEnv : REnv
         bodyEnv =
-            { env | locals = bodyLocals, callDepth = env.callDepth + 1 }
+            envWithLocalsAndBumpedDepth env bodyLocals
     in
     evalR bodyEnv implBody.body
 
@@ -1659,12 +1701,7 @@ evalGlobal env id =
                 delegateCoreApply env id []
 
             else
-                let
-                    topLevelEnv : REnv
-                    topLevelEnv =
-                        { env | locals = [] }
-                in
-                evalR topLevelEnv body
+                evalR (envWithLocals env []) body
 
         Nothing ->
             -- Core declaration — delegate a zero-arg reference to
@@ -1751,12 +1788,7 @@ dispatchGlobalApplyNoIntercept env id argValues =
                                         delegateCoreApply env id argValues
 
                     else
-                        let
-                            topLevelEnv : REnv
-                            topLevelEnv =
-                                { env | locals = [] }
-                        in
-                        evalR topLevelEnv body
+                        evalR (envWithLocals env []) body
                             |> andThenValue
                                 (\headValue ->
                                     applyClosure env headValue argValues
@@ -1981,7 +2013,7 @@ evalCaseBranches env scrutinee branches =
         ( pattern, branchBody ) :: rest ->
             case matchPattern pattern scrutinee env.locals of
                 Just newLocals ->
-                    evalR { env | locals = newLocals } branchBody
+                    evalR (envWithLocals env newLocals) branchBody
 
                 Nothing ->
                     evalCaseBranches env scrutinee rest
@@ -2070,7 +2102,7 @@ evalLetBindingsHelp env locals bindings =
             let
                 bodyEnv : REnv
                 bodyEnv =
-                    { env | locals = locals }
+                    envWithLocals env locals
             in
             if binding.arity > 0 then
                 case binding.body of
