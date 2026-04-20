@@ -1947,16 +1947,26 @@ delegateByName env moduleName name args =
 
         dispatchEnv : Env
         dispatchEnv =
-            { baseEnv
-                | currentModule = moduleName
-                , currentModuleKey = dispatchModuleKey
-                , currentModuleFunctions =
-                    FastDict.get dispatchModuleKey baseEnv.shared.functions
-                        |> Maybe.withDefault FastDict.empty
-                , imports =
-                    FastDict.get dispatchModuleKey baseEnv.shared.moduleImports
-                        |> Maybe.withDefault baseEnv.imports
-                , values = dispatchValues
+            -- Explicit-field construction (not `{ baseEnv | ... }`) so the
+            -- Elm compiler emits a monomorphic object literal. Going through
+            -- `_Utils_update` turned this site into a megamorphic
+            -- `KeyedStoreIC` — `delegateByName` was 95% of the residual
+            -- `KeyedStoreIC_Megamorphic` ticks (3.70% of wall on
+            -- MarkdownFuzzer cold-user at HEAD 714dd4b).
+            { currentModule = moduleName
+            , currentModuleKey = dispatchModuleKey
+            , shared = baseEnv.shared
+            , currentModuleFunctions =
+                FastDict.get dispatchModuleKey baseEnv.shared.functions
+                    |> Maybe.withDefault FastDict.empty
+            , letFunctions = baseEnv.letFunctions
+            , values = dispatchValues
+            , callStack = baseEnv.callStack
+            , imports =
+                FastDict.get dispatchModuleKey baseEnv.shared.moduleImports
+                    |> Maybe.withDefault baseEnv.imports
+            , callDepth = baseEnv.callDepth
+            , recursionCheck = baseEnv.recursionCheck
             }
     in
     Eval.Expression.evalExpression fullExpr env.fallbackConfig dispatchEnv
