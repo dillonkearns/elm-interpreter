@@ -4077,20 +4077,24 @@ continueLetResumeResult envResult body cfg =
 evalLetBlockFull : Expression.LetBlock -> PartialEval Value
 evalLetBlockFull letBlock cfg env =
     let
-        envDefs : Set String
-        envDefs =
-            Set.diff
-                (Set.union
-                    (Dict.keys env.currentModuleFunctions |> Set.fromList)
-                    (Dict.keys env.values |> Set.fromList)
-                )
-                allDefVars
-
         allDefVars : Set String
         allDefVars =
             letBlock.declarations
                 |> List.foldl (\e -> Set.union (declarationDefinedVariables e)) Set.empty
 
+        {- Previously we subtracted a precomputed `envDefs` Set
+           (`Set.fromList (Dict.keys env.currentModuleFunctions)` ∪
+           `Set.fromList (Dict.keys env.values)`) from each decl's
+           `refVars` to keep the refVars small before handing them
+           to `TopologicalSort.sort`. Building those two Sets turned
+           out to be hot (~5% self on core-extra — `Dict.balance` /
+           `insertHelp` firing from `Set.fromList`), and the sort's
+           correctness doesn't actually require the subtraction: a
+           refVar that doesn't match any declaration's `defVars` is
+           naturally a no-op in the sort (it's treated as an
+           external reference). So we just pass `refVars = freeVars`
+           and let the sort ignore whatever isn't defined locally.
+        -}
         sortedDeclarations : Result TopologicalSort.SortError (List (Node LetDeclaration))
         sortedDeclarations =
             letBlock.declarations
@@ -4099,7 +4103,13 @@ evalLetBlockFull letBlock cfg env =
                         { id = id + 1
                         , declaration = declaration
                         , defVars = declarationDefinedVariables declaration
-                        , refVars = Set.diff (declarationFreeVariables declaration) envDefs
+                        , refVars =
+                            -- Intersect with allDefVars to keep refVars small:
+                            -- the sort only uses refs that match some decl's
+                            -- defVars anyway, and this Set.intersect is cheap
+                            -- against allDefVars (typically just a handful of
+                            -- names) instead of the whole env-wide Set.
+                            Set.intersect (declarationFreeVariables declaration) allDefVars
                         , cycleAllowed = isLetDeclarationFunction declaration
                         }
                     )
@@ -4121,7 +4131,6 @@ evalLetBlockFull letBlock cfg env =
                     EvalResult.fail <| typeError env "internal error in let block"
 
                 Ok sd ->
-                    -- Two-pass processing for mutual recursion support:
                     -- Two-pass processing for mutual recursion support:
                     -- Pass 1: register all function declarations so they can find each other
                     -- Pass 2: create PartiallyApplied values and evaluate non-function decls
