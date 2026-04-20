@@ -2295,20 +2295,16 @@ call maybeQualifiedName implementation cfg env =
                         newEnv =
                             callFn qualifiedName.moduleName qualifiedName.name env
                     in
-                    let
-                        cachedTcoMeta : Maybe TcoAnalysis.TcoMetadata
-                        cachedTcoMeta =
-                            lookupTcoMetadata qualifiedName newEnv
-
-                        callIsTailRec : Bool
-                        callIsTailRec =
-                            case cachedTcoMeta of
-                                Just meta ->
-                                    meta.isTailRec
-
-                                Nothing ->
-                                    isTailRecursive qualifiedName.name expr
-                    in
+                    {- Deferred `lookupTcoMetadata`: the `Just target` →
+                       `target == tcoKey` branch doesn't need `cachedTcoMeta`
+                       (it just signals `TailCall` directly). Computing it
+                       unconditionally showed up as ~1% self-time on the
+                       core-extra profile — a FastDict.get per call on what's
+                       otherwise a pure control-flow branch. The lookup still
+                       fires for the other three outcomes (where the tcoLoop
+                       `strategy` genuinely needs it, or `callIsTailRec` drives
+                       the cfg.tcoTarget-clearing branch).
+                    -}
                     case cfg.tcoTarget of
                         Just target ->
                             let
@@ -2316,7 +2312,8 @@ call maybeQualifiedName implementation cfg env =
                                     Syntax.qualifiedNameToString qualifiedName
                             in
                             if target == tcoKey then
-                                -- Inside a tcoLoop: signal TailCall
+                                -- Inside a tcoLoop: signal TailCall.
+                                -- Skip the TCO metadata lookup entirely.
                                 Recursion.base
                                     (EvErr
                                         { currentModule = env.currentModule
@@ -2325,33 +2322,62 @@ call maybeQualifiedName implementation cfg env =
                                         }
                                     )
 
-                            else if callIsTailRec then
+                            else
                                 let
-                                    limit =
-                                        case cfg.maxSteps of
-                                            Just n ->
-                                                n
+                                    cachedTcoMeta : Maybe TcoAnalysis.TcoMetadata
+                                    cachedTcoMeta =
+                                        lookupTcoMetadata qualifiedName newEnv
 
-                                            Nothing ->
-                                                5000000
-
-                                    strategy : TcoAnalysis.TcoStrategy
-                                    strategy =
+                                    callIsTailRec : Bool
+                                    callIsTailRec =
                                         case cachedTcoMeta of
                                             Just meta ->
-                                                meta.strategy
+                                                meta.isTailRec
 
                                             Nothing ->
-                                                TcoAnalysis.analyze qualifiedName.name (Dict.keys newEnv.values) expr
+                                                isTailRecursive qualifiedName.name expr
                                 in
-                                Recursion.base (tcoLoop tcoKey expr strategy limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
+                                if callIsTailRec then
+                                    let
+                                        limit =
+                                            case cfg.maxSteps of
+                                                Just n ->
+                                                    n
 
-                            else
-                                -- Not tail-recursive: clear tcoTarget
-                                Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, newEnv )
+                                                Nothing ->
+                                                    5000000
+
+                                        strategy : TcoAnalysis.TcoStrategy
+                                        strategy =
+                                            case cachedTcoMeta of
+                                                Just meta ->
+                                                    meta.strategy
+
+                                                Nothing ->
+                                                    TcoAnalysis.analyze qualifiedName.name (Dict.keys newEnv.values) expr
+                                    in
+                                    Recursion.base (tcoLoop tcoKey expr strategy limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
+
+                                else
+                                    -- Not tail-recursive: clear tcoTarget
+                                    Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, newEnv )
 
                         Nothing ->
                             -- No tcoTarget: skip qualifiedNameToString for tcoKey
+                            let
+                                cachedTcoMeta : Maybe TcoAnalysis.TcoMetadata
+                                cachedTcoMeta =
+                                    lookupTcoMetadata qualifiedName newEnv
+
+                                callIsTailRec : Bool
+                                callIsTailRec =
+                                    case cachedTcoMeta of
+                                        Just meta ->
+                                            meta.isTailRec
+
+                                        Nothing ->
+                                            isTailRecursive qualifiedName.name expr
+                            in
                             if callIsTailRec then
                                 let
                                     tcoKey =
