@@ -319,7 +319,7 @@ emptyConfig =
     , intercepts = FastDict.empty
     , memoizedFunctions = MemoSpec.emptyRegistry
     , collectMemoStats = False
-    , useResolvedIR = False
+    , useResolvedIR = False, resolveBridge = Types.noResolveBridge
     }
 
 

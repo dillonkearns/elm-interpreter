@@ -262,7 +262,7 @@ evalWithResolvedIRExpression (ProjectEnv projectEnv) expression =
                     , intercepts = Dict.empty
                     , memoizedFunctions = MemoSpec.emptyRegistry
                     , collectMemoStats = False
-                    , useResolvedIR = False
+                    , useResolvedIR = False, resolveBridge = Types.noResolveBridge
                     }
 
                 renv : RE.REnv
@@ -878,14 +878,14 @@ eval : String -> Expression -> Result Error Value
 eval source expression =
     let
         ( result, _, _ ) =
-            traceOrEvalModule { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } source expression
+            traceOrEvalModule { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False, resolveBridge = Types.noResolveBridge } source expression
     in
     result
 
 
 trace : String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
 trace source expression =
-    traceOrEvalModule { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False } source expression
+    traceOrEvalModule { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False, resolveBridge = Types.noResolveBridge } source expression
 
 
 traceOrEvalModule : Types.Config -> String -> Expression -> ( Result Error Value, Rope CallTree, Rope String )
@@ -1457,7 +1457,6 @@ buildProjectEnvFromSummaries summaries =
             , shared =
                 { functions = sharedFunctions
                 , moduleImports = sharedModuleImports
-                , resolveBridge = Types.noResolveBridge
                 , precomputedValues = Dict.empty
                 , tcoAnalyses = precomputeTcoAnalyses sharedFunctions
                 }
@@ -1592,7 +1591,7 @@ optimizeDependencySummaryBodies summaries sharedModuleImports normalizedFunction
             , intercepts = Dict.empty
             , memoizedFunctions = MemoSpec.emptyRegistry
             , collectMemoStats = False
-            , useResolvedIR = False
+            , useResolvedIR = False, resolveBridge = Types.noResolveBridge
             }
 
         flags : NormalizationFlags.NormalizationFlags
@@ -1625,7 +1624,6 @@ optimizeDependencySummaryBodies summaries sharedModuleImports normalizedFunction
                         , shared =
                             { functions = normalizedFunctions
                             , moduleImports = sharedModuleImports
-                            , resolveBridge = Types.noResolveBridge
                             , precomputedValues = normalizedPrecomputedValues
                             , tcoAnalyses = Dict.empty
                             }
@@ -1835,7 +1833,6 @@ tryNormalizeConstant flags moduleName moduleKey moduleImports funcImpl sharedFun
             , shared =
                 { functions = sharedFunctions
                 , moduleImports = sharedModuleImports
-                , resolveBridge = Types.noResolveBridge
                 , precomputedValues = sharedPrecomputedValues
                 , tcoAnalyses = Dict.empty
                 }
@@ -1860,7 +1857,7 @@ tryNormalizeConstant flags moduleName moduleKey moduleImports funcImpl sharedFun
             , intercepts = Dict.empty
             , memoizedFunctions = MemoSpec.emptyRegistry
             , collectMemoStats = False
-            , useResolvedIR = False
+            , useResolvedIR = False, resolveBridge = Types.noResolveBridge
             }
 
         result : EvalResult Value
@@ -4627,7 +4624,6 @@ replaceModuleInEnv (ProjectEnv projectEnv) newModule =
             , shared =
                 { functions = Dict.remove modKey projectEnv.env.shared.functions
                 , moduleImports = Dict.remove modKey projectEnv.env.shared.moduleImports
-                , resolveBridge = projectEnv.env.shared.resolveBridge
                 , precomputedValues = Dict.remove modKey projectEnv.env.shared.precomputedValues
                 , tcoAnalyses = Dict.remove modKey projectEnv.env.shared.tcoAnalyses
                 }
@@ -4803,7 +4799,7 @@ evalWithEnvAndLimit maxSteps (ProjectEnv projectEnv) additionalSources expressio
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
+                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False, resolveBridge = Types.noResolveBridge }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -4891,7 +4887,7 @@ evalWithEnvFromFilesAndLimit maxSteps (ProjectEnv projectEnv) additionalFiles ex
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
+                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False, resolveBridge = Types.noResolveBridge }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -5005,7 +5001,7 @@ evalWithEnvFromFilesAndMemo (ProjectEnv projectEnv) additionalFiles memoizedFunc
                 , intercepts = Dict.empty
                 , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                 , collectMemoStats = collectMemoStats
-                , useResolvedIR = False
+                , useResolvedIR = False, resolveBridge = Types.noResolveBridge
                 }
                 finalEnv
                 |> driveInternalMemo
@@ -5111,7 +5107,7 @@ evalWithEnvFromFilesAndValues (ProjectEnv projectEnv) additionalFiles injectedVa
                 result =
                     Eval.Expression.evalExpression
                         (fakeNode expression)
-                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
+                        { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False, resolveBridge = Types.noResolveBridge }
                         finalEnv
                         |> EvalResult.toResult
             in
@@ -5218,7 +5214,7 @@ evalWithEnvFromFilesAndValuesAndMemo (ProjectEnv projectEnv) additionalFiles inj
                 , intercepts = Dict.empty
                 , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                 , collectMemoStats = collectMemoStats
-                , useResolvedIR = False
+                , useResolvedIR = False, resolveBridge = Types.noResolveBridge
                 }
                 finalEnv
                 |> driveInternalMemo
@@ -5649,7 +5645,7 @@ evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw (ProjectEnv projectEnv) add
                 , intercepts = intercepts
                 , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                 , collectMemoStats = False
-                , useResolvedIR = False
+                , useResolvedIR = False, resolveBridge = Types.noResolveBridge
                 }
                 finalEnv
 
@@ -6029,14 +6025,6 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                    resolved-IR closures that reach it through kernel
                    callbacks.
                 -}
-                existingShared : Types.SharedContext
-                existingShared =
-                    env.shared
-
-                finalShared : Types.SharedContext
-                finalShared =
-                    { existingShared | resolveBridge = installedBridge }
-
                 finalEnv : Env
                 finalEnv =
                     { env
@@ -6051,9 +6039,12 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                                 (\name value acc -> Dict.insert name value acc)
                                 env.values
                                 injectedValues
-                        , shared = finalShared
                     }
 
+                -- Defunctionalization step 6: `resolveBridge` lives on
+                -- Config, not SharedContext. Install the real bridge here
+                -- so the old evaluator can route resolved-IR closures
+                -- back into the new evaluator.
                 fallbackConfig : Types.Config
                 fallbackConfig =
                     { trace = False
@@ -6066,6 +6057,7 @@ evalWithResolvedIRFromFilesAndInterceptsAndLimit maxSteps (ProjectEnv projectEnv
                     , memoizedFunctions = MemoSpec.emptyRegistry
                     , collectMemoStats = False
                     , useResolvedIR = False
+                    , resolveBridge = installedBridge
                     }
 
                 resolverCtx : Resolver.ResolverContext
@@ -6258,7 +6250,7 @@ evalWithIntercepts (ProjectEnv projectEnv) additionalSources intercepts expressi
                                 , intercepts = intercepts
                                 , memoizedFunctions = MemoSpec.emptyRegistry
                                 , collectMemoStats = False
-                                , useResolvedIR = False
+                                , useResolvedIR = False, resolveBridge = Types.noResolveBridge
                                 }
                                 finalEnv
                                 |> EvalResult.toResult
@@ -6417,7 +6409,7 @@ evalWithInterceptsAndMemoRaw (ProjectEnv projectEnv) additionalSources intercept
                         , intercepts = intercepts
                         , memoizedFunctions = MemoSpec.buildRegistry memoizedFunctions
                         , collectMemoStats = False
-                        , useResolvedIR = False
+                        , useResolvedIR = False, resolveBridge = Types.noResolveBridge
                         }
                         finalEnv
 
@@ -6941,7 +6933,6 @@ setModulePrecomputedValues moduleName values (ProjectEnv projectEnv) =
                         | shared =
                             { functions = env.shared.functions
                             , moduleImports = env.shared.moduleImports
-                            , resolveBridge = env.shared.resolveBridge
                             , precomputedValues = Dict.insert key values env.shared.precomputedValues
                             , tcoAnalyses = env.shared.tcoAnalyses
                             }
@@ -6989,7 +6980,6 @@ replaceModuleFunctionsInEnv moduleName newFunctions (ProjectEnv projectEnv) =
                 | shared =
                     { functions = updatedFunctions
                     , moduleImports = env.shared.moduleImports
-                    , resolveBridge = env.shared.resolveBridge
                     , precomputedValues = env.shared.precomputedValues
                     , tcoAnalyses =
                         Dict.insert moduleKey
@@ -7118,7 +7108,6 @@ normalizeOneModuleInEnvSelectedWithFlags flags normalizationTargets moduleName (
                 | shared =
                     { functions = updatedFunctions
                     , moduleImports = sharedImports
-                    , resolveBridge = env.shared.resolveBridge
                     , precomputedValues = updatedPrecomputed
                     , tcoAnalyses =
                         Dict.insert moduleKey
@@ -7182,7 +7171,6 @@ mergeModuleFunctionsIntoEnv moduleName deltaFns (ProjectEnv projectEnv) =
                 | shared =
                     { functions = updatedFunctions
                     , moduleImports = env.shared.moduleImports
-                    , resolveBridge = env.shared.resolveBridge
                     , precomputedValues = env.shared.precomputedValues
                     , tcoAnalyses =
                         Dict.insert moduleKey
@@ -7274,7 +7262,6 @@ normalizeUserModulesInEnv moduleNames (ProjectEnv projectEnv) =
                 | shared =
                     { functions = updatedFunctions
                     , moduleImports = env.shared.moduleImports
-                    , resolveBridge = env.shared.resolveBridge
                     , precomputedValues = updatedPrecomputed
                     , tcoAnalyses = env.shared.tcoAnalyses
                     }
@@ -7376,7 +7363,7 @@ traceWithEnv (ProjectEnv projectEnv) additionalSources expression =
                         evalResult =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
+                                { trace = True, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False, resolveBridge = Types.noResolveBridge }
                                 finalEnv
 
                         ( result, callTrees, logLines ) =
@@ -7488,7 +7475,7 @@ coverageWithEnvAndLimit maxSteps probeLines (ProjectEnv projectEnv) additionalSo
                         evalResult =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, coverage = True, coverageProbeLines = probeLines, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
+                                { trace = False, coverage = True, coverageProbeLines = probeLines, maxSteps = maxSteps, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False, resolveBridge = Types.noResolveBridge }
                                 finalEnv
 
                         ( result, coverageSet ) =
@@ -7545,7 +7532,6 @@ buildInitialEnv file =
                 , moduleImports =
                     coreModuleImports
                         |> Dict.insert (Environment.moduleKey moduleName) imports
-                , resolveBridge = Types.noResolveBridge
                 , precomputedValues = Dict.empty
                 , tcoAnalyses = Dict.empty
                 }
@@ -7859,7 +7845,7 @@ evalProject sources expression =
                                 { currentModule = []
                                 , currentModuleKey = ""
                                 , callStack = []
-                                , shared = { functions = coreFunctions, moduleImports = Dict.empty, resolveBridge = Types.noResolveBridge, precomputedValues = Dict.empty, tcoAnalyses = Dict.empty }
+                                , shared = { functions = coreFunctions, moduleImports = Dict.empty, precomputedValues = Dict.empty, tcoAnalyses = Dict.empty }
                                 , currentModuleFunctions = Dict.empty
                                 , letFunctions = Dict.empty
                                 , values = Dict.empty
@@ -7921,7 +7907,7 @@ evalProject sources expression =
                         result =
                             Eval.Expression.evalExpression
                                 (fakeNode expression)
-                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False }
+                                { trace = False, coverage = False, coverageProbeLines = Set.empty, maxSteps = Nothing, tcoTarget = Nothing, callCounts = Nothing, intercepts = Dict.empty, memoizedFunctions = MemoSpec.emptyRegistry, collectMemoStats = False, useResolvedIR = False, resolveBridge = Types.noResolveBridge }
                                 finalEnv
                                 |> EvalResult.toResult
                     in
@@ -7947,7 +7933,7 @@ buildModuleEnv allInterfaces { file, moduleName } env =
 
         envWithModuleImports : Env
         envWithModuleImports =
-            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports, resolveBridge = env.shared.resolveBridge, precomputedValues = env.shared.precomputedValues, tcoAnalyses = env.shared.tcoAnalyses } }
+            { env | shared = { functions = env.shared.functions, moduleImports = Dict.insert (Environment.moduleKey moduleName) moduleImportedNames env.shared.moduleImports, precomputedValues = env.shared.precomputedValues, tcoAnalyses = env.shared.tcoAnalyses } }
 
         addDeclaration : Node Declaration -> Env -> Result Error Env
         addDeclaration (Node _ decl) envAcc =

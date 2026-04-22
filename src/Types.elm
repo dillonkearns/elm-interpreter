@@ -55,6 +55,17 @@ type alias Config =
     , memoizedFunctions : MemoSpec.Registry
     , collectMemoStats : Bool
     , useResolvedIR : Bool
+
+    -- Bridge from the old string-keyed evaluator back into the new
+    -- resolved-IR evaluator. Installed at eval entry-point time by
+    -- `evalWithResolvedIRFromFilesAndIntercepts`; default
+    -- `noResolveBridge` for code paths that don't route through the
+    -- new evaluator. Lives on `Config` rather than `SharedContext`
+    -- because the bridge is transient runtime state, not data:
+    -- keeping it off `Env.shared` lets `SharedContext` (and
+    -- `ProjectEnv` by extension) be Wire3-serializable so a project
+    -- loaded on the main thread can be shipped to parallel workers.
+    , resolveBridge : ResolveBridge
     }
 
 
@@ -237,7 +248,6 @@ type Implementation
 type alias SharedContext =
     { functions : Dict String (Dict String FunctionImplementation)
     , moduleImports : Dict String ImportedNames
-    , resolveBridge : ResolveBridge
 
     -- Module-level 0-arg values that have already been evaluated to a
     -- concrete `Value`. Keyed by moduleKey → name. Populated during the

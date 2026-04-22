@@ -4,7 +4,7 @@ import Elm.Syntax.Expression exposing (FunctionImplementation)
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node
 import FastDict as Dict
-import Types exposing (Env, EnvValues, Value, noResolveBridge)
+import Types exposing (Env, EnvValues, Value)
 
 
 moduleKey : ModuleName -> String
@@ -112,7 +112,6 @@ addFunction moduleName function env =
         | shared =
             { functions = Dict.insert key newInner env.shared.functions
             , moduleImports = env.shared.moduleImports
-            , resolveBridge = env.shared.resolveBridge
             , precomputedValues = env.shared.precomputedValues
             , tcoAnalyses = env.shared.tcoAnalyses
             }
@@ -163,7 +162,7 @@ empty moduleName =
     { currentModule = moduleName
     , currentModuleKey = moduleKey moduleName
     , callStack = []
-    , shared = { functions = Dict.empty, moduleImports = Dict.empty, resolveBridge = noResolveBridge, precomputedValues = Dict.empty, tcoAnalyses = Dict.empty }
+    , shared = { functions = Dict.empty, moduleImports = Dict.empty, precomputedValues = Dict.empty, tcoAnalyses = Dict.empty }
     , currentModuleFunctions = Dict.empty
     , letFunctions = Dict.empty
     , values = Dict.empty

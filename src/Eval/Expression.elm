@@ -2023,7 +2023,7 @@ evalFullyApplied localEnv args patterns maybeQualifiedName implementation cfg en
                         (List.length args)
 
                 (ResolveBridge bridge) =
-                    localEnv.shared.resolveBridge
+                    cfg.resolveBridge
             in
             Recursion.base (bridge payload selfClosure args cfg localEnv)
 
@@ -2309,11 +2309,11 @@ call maybeQualifiedName implementation cfg env =
                                                 Nothing ->
                                                     TcoAnalysis.analyze qualifiedName.name (Dict.keys newEnv.values) expr
                                     in
-                                    Recursion.base (tcoLoop tcoKey expr strategy limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
+                                    Recursion.base (tcoLoop tcoKey expr strategy limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR, resolveBridge = cfg.resolveBridge } newEnv)
 
                                 else
                                     -- Not tail-recursive: clear tcoTarget
-                                    Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, newEnv )
+                                    Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR, resolveBridge = cfg.resolveBridge }, newEnv )
 
                         Nothing ->
                             -- No tcoTarget: skip qualifiedNameToString for tcoKey
@@ -2353,7 +2353,7 @@ call maybeQualifiedName implementation cfg env =
                                             Nothing ->
                                                 TcoAnalysis.analyze qualifiedName.name (Dict.keys newEnv.values) expr
                                 in
-                                Recursion.base (tcoLoop tcoKey expr strategy limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR } newEnv)
+                                Recursion.base (tcoLoop tcoKey expr strategy limit { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Just tcoKey, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR, resolveBridge = cfg.resolveBridge } newEnv)
 
                             else
                                 -- Common case: not TCO, no tcoTarget — pass cfg as-is
@@ -2365,7 +2365,7 @@ call maybeQualifiedName implementation cfg env =
                         Recursion.recurse ( expr, cfg, env )
 
                     else
-                        Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, env )
+                        Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR, resolveBridge = cfg.resolveBridge }, env )
 
         KernelImpl moduleName name ->
             dispatchZeroArgKernelCall cfg env moduleName name (resolveStaticKernel moduleName name env)
@@ -2401,7 +2401,7 @@ call maybeQualifiedName implementation cfg env =
                         0
 
                 (ResolveBridge bridge) =
-                    env.shared.resolveBridge
+                    cfg.resolveBridge
             in
             Recursion.base (bridge payload selfClosure [] cfg env)
 
@@ -2679,7 +2679,7 @@ tcoLoop funcName body strategy remaining cfg env =
             , intercepts = cfg.intercepts
             , memoizedFunctions = cfg.memoizedFunctions
             , collectMemoStats = cfg.collectMemoStats
-            , useResolvedIR = cfg.useResolvedIR
+            , useResolvedIR = cfg.useResolvedIR, resolveBridge = cfg.resolveBridge
             }
 
         -- For statically-safe shapes (`TcoSafe` / `TcoListDrain`),
@@ -3849,7 +3849,7 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                             patternsLength
 
                     (ResolveBridge bridge) =
-                        localEnv.shared.resolveBridge
+                        cfg.resolveBridge
                 in
                 bridge payload selfClosure oldArgs cfg localEnv
 
