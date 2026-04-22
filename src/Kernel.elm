@@ -1,4 +1,11 @@
-module Kernel exposing (EvalFunction, functions)
+module Kernel exposing
+    ( EvalFunction
+    , KernelId
+    , functions
+    , kernelCount
+    , kernelIdsByName
+    , lookupKernelId
+    )
 
 import Array exposing (Array)
 import Bitwise
@@ -1999,3 +2006,96 @@ parserAdvancedSucceedStep args _ env =
         _ ->
             EvalResult.fail <|
                 typeError env "Parser.Advanced.succeed step (kernel): expected [captured, state]"
+
+
+
+-- ───────────────────────── Kernel ID registry ─────────────────────────
+--
+-- Step 1 of KernelImpl defunctionalization (see .scratch/parallel-
+-- ceiling.md "Defunctionalize KernelImpl"): assign each (moduleName,
+-- name) pair a stable Int ID. Lets later steps replace
+-- `KernelImpl ModuleName String fn` with `KernelImpl ModuleName String`
+-- + a separate `Array fn` indexed by ID — so the function field stops
+-- blocking Wire3 serialization of `Implementation`/`Value`/`Env`.
+--
+-- This step adds the registry as a no-op preliminary; nothing reads
+-- it yet.
+
+
+type alias KernelId =
+    Int
+
+
+{-| Eval-function stub used to build the kernel structure for ID
+assignment. The real eval function isn't needed because we only iterate
+the dict's KEYS — never call any of the kernel functions. If a
+construction-time setup ever depends on the eval function (none today),
+this would need to switch to a dummy that's safe-to-call.
+-}
+stubEvalFunction : EvalFunction
+stubEvalFunction _ _ _ _ _ _ env =
+    EvalResult.fail <|
+        typeError env "Kernel.stubEvalFunction called — should never happen"
+
+
+{-| Stable `(moduleName, name) -> KernelId` map. IDs are assigned by
+iterating the kernel registry's keys in dict (alphabetical) order. As
+long as the kernel definitions in `functions` don't change, IDs are
+stable across invocations and across processes.
+
+Used (eventually) by the dispatch path to replace per-Value function
+pointers with a constant-time array lookup.
+
+-}
+kernelIdsByName : Dict ModuleName (Dict String KernelId)
+kernelIdsByName =
+    let
+        baseRegistry : Dict ModuleName (Dict String ( Int, List Value -> Eval Value ))
+        baseRegistry =
+            functions stubEvalFunction
+    in
+    -- Two-pass assign: outer iterates module names alphabetically (Dict
+    -- iteration is sorted), inner iterates kernel names alphabetically
+    -- per module. Use a foldl with a running counter to assign sequential
+    -- IDs.
+    Dict.foldl
+        (\moduleName moduleKernels ( outerAcc, outerCounter ) ->
+            let
+                ( moduleIds, nextCounter ) =
+                    Dict.foldl
+                        (\kernelName _ ( innerAcc, innerCounter ) ->
+                            ( Dict.insert kernelName innerCounter innerAcc
+                            , innerCounter + 1
+                            )
+                        )
+                        ( Dict.empty, outerCounter )
+                        moduleKernels
+            in
+            ( Dict.insert moduleName moduleIds outerAcc
+            , nextCounter
+            )
+        )
+        ( Dict.empty, 0 )
+        baseRegistry
+        |> Tuple.first
+
+
+{-| Total number of kernel IDs assigned. Convenient for sizing the
+runtime kernel function array.
+-}
+kernelCount : Int
+kernelCount =
+    Dict.foldl
+        (\_ moduleKernels acc -> acc + Dict.size moduleKernels)
+        0
+        kernelIdsByName
+
+
+{-| Look up a kernel's stable ID, if it exists in the registry. Returns
+`Nothing` for unknown (moduleName, name) pairs — caller decides whether
+to fall back, error, or treat as user code.
+-}
+lookupKernelId : ModuleName -> String -> Maybe KernelId
+lookupKernelId moduleName name =
+    Dict.get moduleName kernelIdsByName
+        |> Maybe.andThen (Dict.get name)

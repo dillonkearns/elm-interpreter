@@ -11,13 +11,84 @@ import Kernel
 import Rope exposing (Rope)
 import Syntax
 import Test exposing (Test, describe, test)
+import Types exposing (Eval, Value)
 
 
 suite : Test
 suite =
-    kernelFunctions
-        |> List.map testDefined
-        |> describe "Check that all Kernel functions have been defined"
+    describe "Kernel"
+        [ kernelFunctions
+            |> List.map testDefined
+            |> describe "Check that all Kernel functions have been defined"
+        , kernelIdRegistry
+        ]
+
+
+{-| Step 1 of KernelImpl defunctionalization (see Kernel.kernelIdsByName).
+The id-by-name registry is the substrate later steps build on, so guard
+its invariants:
+
+  - every kernel in `Kernel.functions` has an ID via `lookupKernelId`
+  - IDs are unique
+  - IDs are dense (`[0, kernelCount)`) so an `Array` indexed by ID covers
+    every entry without holes
+
+If any of these break, defunctionalized dispatch will silently miss
+or alias kernels.
+
+-}
+kernelIdRegistry : Test
+kernelIdRegistry =
+    let
+        registry : Dict.Dict ModuleName (Dict.Dict String ( Int, List Value -> Eval Value ))
+        registry =
+            Kernel.functions Eval.Expression.evalFunction
+
+        allKernels : List ( ModuleName, String )
+        allKernels =
+            registry
+                |> Dict.toList
+                |> List.concatMap
+                    (\( moduleName, moduleKernels ) ->
+                        Dict.keys moduleKernels |> List.map (\name -> ( moduleName, name ))
+                    )
+
+        allIds : List Kernel.KernelId
+        allIds =
+            allKernels |> List.filterMap (\( m, n ) -> Kernel.lookupKernelId m n)
+    in
+    describe "kernelIdsByName"
+        [ test "every kernel has an assigned ID" <|
+            \_ ->
+                allKernels
+                    |> List.filter (\( m, n ) -> Kernel.lookupKernelId m n == Nothing)
+                    |> Expect.equal []
+        , test "ID count matches registry count" <|
+            \_ ->
+                Expect.equal Kernel.kernelCount (List.length allKernels)
+        , test "IDs are unique" <|
+            \_ ->
+                Expect.equal (List.length (uniq allIds)) (List.length allIds)
+        , test "IDs are dense in [0, kernelCount)" <|
+            \_ ->
+                Expect.equal (List.sort allIds) (List.range 0 (Kernel.kernelCount - 1))
+        ]
+
+
+{-| Local de-dup helper (Set is overkill; the lists are small).
+-}
+uniq : List Int -> List Int
+uniq xs =
+    List.foldl
+        (\x acc ->
+            if List.member x acc then
+                acc
+
+            else
+                x :: acc
+        )
+        []
+        xs
 
 
 kernelFunctions : List ( ( ModuleName, String ), List String )
