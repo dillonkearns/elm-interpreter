@@ -141,7 +141,10 @@ toExpression value =
                             , expression = expr
                             }
 
-                    KernelImpl moduleName name _ ->
+                    KernelImpl moduleName name ->
+                        Expression.FunctionOrValue moduleName name
+
+                    DynamicKernelImpl moduleName name _ ->
                         Expression.FunctionOrValue moduleName name
 
                     RExprImpl _ ->
@@ -165,7 +168,13 @@ toExpression value =
                         )
                             |> Expression.Application
 
-                    KernelImpl moduleName name _ ->
+                    KernelImpl moduleName name ->
+                        (fakeNode (Expression.FunctionOrValue moduleName name)
+                            :: List.map toExpression args
+                        )
+                            |> Expression.Application
+
+                    DynamicKernelImpl moduleName name _ ->
                         (fakeNode (Expression.FunctionOrValue moduleName name)
                             :: List.map toExpression args
                         )

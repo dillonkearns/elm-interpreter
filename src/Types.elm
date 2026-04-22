@@ -211,7 +211,22 @@ happen via `useResolvedIR = False` misrouting.
 -}
 type Implementation
     = AstImpl (Node Expression)
-    | KernelImpl ModuleName String (List Value -> Eval Value)
+      -- A reference to a static kernel function — one whose `(moduleName,
+      -- name)` pair is registered in `Kernel.functions`. Defunctionalized
+      -- (no inline function pointer); dispatch resolves via
+      -- `Kernel.lookupKernelId` + `Eval.Expression.kernelArrayCache` at
+      -- call time. Wire3-friendly: contains only first-order data, so
+      -- `Value`/`Implementation`/`Env` round-trip through the codec.
+    | KernelImpl ModuleName String
+      -- A kernel call site that can't be resolved by name — the function
+      -- body captures local state at construction time. Used by
+      -- `Random.step`'s `intStepKernelImpl`/`floatStepKernelImpl` and
+      -- `Parser.Advanced.parserStep`/`makeParserValue` where the closure
+      -- carries `lo`/`hi`/`captured`/etc. Not Wire3-friendly because of
+      -- the embedded function pointer; never appears in
+      -- post-`loadProject` `ProjectEnv` state since these are constructed
+      -- at user-eval time, not project-load time.
+    | DynamicKernelImpl ModuleName String (List Value -> Eval Value)
     | RExprImpl
         { body : IR.RExpr
         , capturedLocals : List Value

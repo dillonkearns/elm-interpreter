@@ -2831,7 +2831,11 @@ makeParserValue staticEnv debugName parserFn =
             []
             []
             Nothing
-            (KernelImpl
+            -- Dynamic: closure captures `staticEnv` + `parserFn` —
+            -- not in the static kernel registry. Routed through the
+            -- `DynamicKernelImpl` variant so dispatch uses the embedded
+            -- function instead of trying to resolve by name.
+            (DynamicKernelImpl
                 parserAdvancedModuleName
                 ("fast-" ++ debugName)
                 (\args cfg callEnv ->

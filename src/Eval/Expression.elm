@@ -2088,82 +2088,11 @@ bindSimplePatternsHelp patterns args values =
 evalFullyAppliedWithEnv : Env -> List Value -> Maybe QualifiedNameRef -> Implementation -> PartialEval Value
 evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env =
     case implementation of
-        KernelImpl moduleName name f ->
-            let
-                -- Defunctionalization step 3: prefer the array-indexed
-                -- kernel function from `kernelArrayCache` over the inline
-                -- function pointer `f`. The cache is built once at module
-                -- init from the same registry that produced `f`, so the
-                -- two should be identical for any kernel that came from
-                -- `Kernel.functions`. Fall back to `f` if the (mod, name)
-                -- pair isn't in the registry — a defensive case for
-                -- KernelImpl values constructed outside the static
-                -- registry (Random.step's intStepKernelImpl etc.).
-                kernelFn : List Value -> Eval Value
-                kernelFn =
-                    case Kernel.lookupKernelId moduleName name of
-                        Just kernelId ->
-                            case Array.get kernelId kernelArrayCache of
-                                Just arrayFn ->
-                                    arrayFn
+        KernelImpl moduleName name ->
+            dispatchKernelCall args cfg env moduleName name (resolveStaticKernel moduleName name env)
 
-                                Nothing ->
-                                    f
-
-                        Nothing ->
-                            f
-            in
-            if cfg.trace then
-                let
-                    childEnv : Env
-                    childEnv =
-                        Environment.callKernel moduleName name env
-
-                    kernelEvalResult : EvalResult Value
-                    kernelEvalResult =
-                        kernelFn args cfg childEnv
-
-                    ( kernelResult, children, logLines ) =
-                        EvalResult.toTriple kernelEvalResult
-
-                    callTree : Rope CallTree
-                    callTree =
-                        Rope.singleton
-                            (CallNode
-                                { env = childEnv
-                                , expression =
-                                    fakeNode <|
-                                        Application <|
-                                            fakeNode (FunctionOrValue moduleName name)
-                                                :: List.map Value.toExpression args
-                                , result = kernelResult
-                                , children = children
-                                }
-                            )
-                in
-                (case kernelResult of
-                    Ok v ->
-                        EvOkTrace v callTree logLines
-
-                    Err e ->
-                        EvErrTrace e callTree logLines
-                )
-                    |> Recursion.base
-
-            else
-                -- Native-dispatch fast path: for the hottest Basics/List
-                -- calls (`+`, `-`, `*`, `/=`, `==`, `<`, ..., `::`, `++`),
-                -- skip the `twoWithError`-style selector/EvalResult wrapping
-                -- and return the result directly. When `Application` form
-                -- is used (`List.foldl (+) 0 xs`), this is the inner loop
-                -- for every element, so dropping per-call constant overhead
-                -- compounds into a real speedup on fold/map/filter bodies.
-                case Eval.NativeDispatch.tryDispatchByName moduleName name args of
-                    Just v ->
-                        Recursion.base (EvOk v)
-
-                    Nothing ->
-                        Recursion.base (kernelFn args cfg env)
+        DynamicKernelImpl moduleName name f ->
+            dispatchKernelCall args cfg env moduleName name f
 
         AstImpl (Node range (FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name)) ->
             -- Fallback for AST-based kernel references (shouldn't happen often with KernelImpl)
@@ -2438,32 +2367,11 @@ call maybeQualifiedName implementation cfg env =
                     else
                         Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, env )
 
-        KernelImpl moduleName name f ->
-            let
-                kernelFn : List Value -> Eval Value
-                kernelFn =
-                    case Kernel.lookupKernelId moduleName name of
-                        Just kernelId ->
-                            case Array.get kernelId kernelArrayCache of
-                                Just arrayFn ->
-                                    arrayFn
+        KernelImpl moduleName name ->
+            dispatchZeroArgKernelCall cfg env moduleName name (resolveStaticKernel moduleName name env)
 
-                                Nothing ->
-                                    f
-
-                        Nothing ->
-                            f
-            in
-            if cfg.trace then
-                let
-                    childEnv : Env
-                    childEnv =
-                        Environment.callKernel moduleName name env
-                in
-                Recursion.base (kernelFn [] cfg childEnv)
-
-            else
-                Recursion.base (kernelFn [] cfg env)
+        DynamicKernelImpl moduleName name f ->
+            dispatchZeroArgKernelCall cfg env moduleName name f
 
         RExprImpl payload ->
             {- `call` is the 0-arg dispatch entry: used from
@@ -3716,10 +3624,9 @@ kernelFunctions =
 
 
 {-| Defunctionalization step 3: array-indexed kernel dispatch table,
-computed once at module init. Step 4+ will drop the function field
-from `KernelImpl` and dispatch sites will look up here by `KernelId`
-instead of using the inline function pointer; this top-level value
-keeps the lookup amortized to one Array index per call.
+computed once at module init. Step 4 dropped the function field
+from `Implementation.KernelImpl`; dispatch sites look up here by
+`KernelId` instead of using a per-Value function pointer.
 
 Built from `Kernel.functions evalFunction` so HOF kernels (List.map,
 Dict.foldl, etc.) close over the right `evalFunction` callback.
@@ -3728,6 +3635,154 @@ Dict.foldl, etc.) close over the right `evalFunction` callback.
 kernelArrayCache : Array.Array (List Value -> Eval Value)
 kernelArrayCache =
     Kernel.kernelArray evalFunction
+
+
+{-| Resolve a static `KernelImpl` reference to its runtime function via
+the kernel registry. Always returns a callable function: if the
+`(moduleName, name)` pair somehow isn't in the registry — should be
+unreachable for properly-constructed `KernelImpl` values — the returned
+function fails with a clearly-labeled error so a misrouted construction
+shows up loudly rather than silently miscomputing.
+
+The `env` parameter is captured into the fail-fn so the error message
+can name where it came from; the success path doesn't use it.
+
+-}
+resolveStaticKernel : ModuleName -> String -> Env -> (List Value -> Eval Value)
+resolveStaticKernel moduleName name env =
+    case Kernel.lookupKernelId moduleName name of
+        Just kernelId ->
+            case Array.get kernelId kernelArrayCache of
+                Just arrayFn ->
+                    arrayFn
+
+                Nothing ->
+                    \_ _ _ ->
+                        EvalResult.fail <|
+                            typeError env <|
+                                "KernelImpl array index out of range for "
+                                    ++ Syntax.qualifiedNameToString { moduleName = moduleName, name = name }
+
+        Nothing ->
+            \_ _ _ ->
+                EvalResult.fail <|
+                    typeError env <|
+                        "KernelImpl reference to non-registered kernel: "
+                            ++ Syntax.qualifiedNameToString { moduleName = moduleName, name = name }
+
+
+{-| Shared dispatch body for `KernelImpl` and `DynamicKernelImpl` —
+both variants flow through here once `kernelFn` has been resolved
+(either via the static registry array or directly from the dynamic
+variant's embedded function). Handles the trace branch (build a
+`CallNode` for the call tree) and the non-trace branch (try the
+`NativeDispatch` fast path, fall through to a regular call).
+-}
+dispatchKernelCall :
+    List Value
+    -> Config
+    -> Env
+    -> ModuleName
+    -> String
+    -> (List Value -> Eval Value)
+    -> PartialResult Value
+dispatchKernelCall args cfg env moduleName name kernelFn =
+    if cfg.trace then
+        let
+            childEnv : Env
+            childEnv =
+                Environment.callKernel moduleName name env
+
+            kernelEvalResult : EvalResult Value
+            kernelEvalResult =
+                kernelFn args cfg childEnv
+
+            ( kernelResult, children, logLines ) =
+                EvalResult.toTriple kernelEvalResult
+
+            callTree : Rope CallTree
+            callTree =
+                Rope.singleton
+                    (CallNode
+                        { env = childEnv
+                        , expression =
+                            fakeNode <|
+                                Application <|
+                                    fakeNode (FunctionOrValue moduleName name)
+                                        :: List.map Value.toExpression args
+                        , result = kernelResult
+                        , children = children
+                        }
+                    )
+        in
+        (case kernelResult of
+            Ok v ->
+                EvOkTrace v callTree logLines
+
+            Err e ->
+                EvErrTrace e callTree logLines
+        )
+            |> Recursion.base
+
+    else
+        -- Native-dispatch fast path: for the hottest Basics/List calls
+        -- (`+`, `-`, `*`, `/=`, `==`, `<`, ..., `::`, `++`), skip the
+        -- `twoWithError`-style selector/EvalResult wrapping and return
+        -- the result directly. When `Application` form is used
+        -- (`List.foldl (+) 0 xs`), this is the inner loop for every
+        -- element, so dropping per-call constant overhead compounds
+        -- into a real speedup on fold/map/filter bodies.
+        case Eval.NativeDispatch.tryDispatchByName moduleName name args of
+            Just v ->
+                Recursion.base (EvOk v)
+
+            Nothing ->
+                Recursion.base (kernelFn args cfg env)
+
+
+{-| Zero-arg variant of `dispatchKernelCall` for the `call` entry-point
+that handles arity-0 kernel references (no NativeDispatch fast path
+because there's nothing to dispatch on; just call with `[]`).
+-}
+dispatchZeroArgKernelCall :
+    Config
+    -> Env
+    -> ModuleName
+    -> String
+    -> (List Value -> Eval Value)
+    -> PartialResult Value
+dispatchZeroArgKernelCall cfg env moduleName name kernelFn =
+    if cfg.trace then
+        let
+            childEnv : Env
+            childEnv =
+                Environment.callKernel moduleName name env
+        in
+        Recursion.base (kernelFn [] cfg childEnv)
+
+    else
+        Recursion.base (kernelFn [] cfg env)
+
+
+{-| Direct kernel invocation used by the pattern-binding paths inside
+`evalFunction` (the post-pattern-bind dispatch and the slow-match
+dispatch). Returns `EvalResult Value` directly — caller is already
+inside an `Eval` chain, no `Recursion.base` wrap needed.
+-}
+callKernelInBoundEnv :
+    Config
+    -> Env
+    -> ModuleName
+    -> String
+    -> List Value
+    -> (List Value -> Eval Value)
+    -> EvalResult Value
+callKernelInBoundEnv cfg localEnv moduleName name oldArgs kernelFn =
+    if cfg.trace then
+        kernelFn oldArgs cfg (Environment.callKernel moduleName name localEnv)
+
+    else
+        kernelFn oldArgs cfg localEnv
 
 
 evalFunction : Kernel.EvalFunction
@@ -3803,29 +3858,11 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                 case bindSimplePatterns patterns oldArgs localEnv of
                     Just boundEnv ->
                         case implementation of
-                            KernelImpl moduleName name f ->
-                                let
-                                    kernelFn : List Value -> Eval Value
-                                    kernelFn =
-                                        case Kernel.lookupKernelId moduleName name of
-                                            Just kernelId ->
-                                                case Array.get kernelId kernelArrayCache of
-                                                    Just arrayFn ->
-                                                        arrayFn
+                            KernelImpl moduleName name ->
+                                callKernelInBoundEnv cfg localEnv moduleName name oldArgs (resolveStaticKernel moduleName name localEnv)
 
-                                                    Nothing ->
-                                                        f
-
-                                            Nothing ->
-                                                f
-                                in
-                                if cfg.trace then
-                                    kernelFn oldArgs
-                                        cfg
-                                        (Environment.callKernel moduleName name localEnv)
-
-                                else
-                                    kernelFn oldArgs cfg localEnv
+                            DynamicKernelImpl moduleName name f ->
+                                callKernelInBoundEnv cfg localEnv moduleName name oldArgs f
 
                             AstImpl expr ->
                                 evalExpression expr cfg boundEnv
@@ -3851,29 +3888,11 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
 
                             Ok (Just newBindings) ->
                                 case implementation of
-                                    KernelImpl moduleName name f ->
-                                        let
-                                            kernelFn : List Value -> Eval Value
-                                            kernelFn =
-                                                case Kernel.lookupKernelId moduleName name of
-                                                    Just kernelId ->
-                                                        case Array.get kernelId kernelArrayCache of
-                                                            Just arrayFn ->
-                                                                arrayFn
+                                    KernelImpl moduleName name ->
+                                        callKernelInBoundEnv cfg localEnv moduleName name oldArgs (resolveStaticKernel moduleName name localEnv)
 
-                                                            Nothing ->
-                                                                f
-
-                                                    Nothing ->
-                                                        f
-                                        in
-                                        if cfg.trace then
-                                            kernelFn oldArgs
-                                                cfg
-                                                (Environment.callKernel moduleName name localEnv)
-
-                                        else
-                                            kernelFn oldArgs cfg localEnv
+                                    DynamicKernelImpl moduleName name f ->
+                                        callKernelInBoundEnv cfg localEnv moduleName name oldArgs f
 
                                     AstImpl expr ->
                                         -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
@@ -3964,7 +3983,10 @@ runKernelTuple moduleName name argCount f cfg env =
             []
             (List.repeat argCount (fakeNode AllPattern))
             (Just { moduleName = moduleName, name = name })
-            (KernelImpl moduleName name f)
+            -- Static kernel reference — `f` from the registry is dropped;
+            -- dispatch sites resolve via `Kernel.lookupKernelId` +
+            -- `kernelArrayCache`. Wire3-friendly construction.
+            (KernelImpl moduleName name)
             argCount
             |> Types.succeedPartial
 
@@ -4019,7 +4041,9 @@ evalKernelFunctionWithKey key moduleName name cfg env =
                             []
                             (List.repeat argCount (fakeNode AllPattern))
                             (Just { moduleName = moduleName, name = name })
-                            (KernelImpl moduleName name f)
+                            -- Static kernel reference — `f` dropped, see
+                            -- KernelImpl construction site above for rationale.
+                            (KernelImpl moduleName name)
                             argCount
                             |> Types.succeedPartial
 

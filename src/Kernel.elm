@@ -734,7 +734,11 @@ makeNativeGenerator a b stepKernelFn =
             [ a, b ]
             [ fakeNode (VarPattern "$a"), fakeNode (VarPattern "$b"), fakeNode (VarPattern "$seed") ]
             (Just { moduleName = [ "Random" ], name = "nativeGenerator" })
-            (KernelImpl [ "Random" ] "nativeGeneratorStep" stepKernelFn)
+            -- Dynamic: `stepKernelFn` is a closure capturing `lo`/`hi`
+            -- (or `lo`/`hi` floats) at construction time. Not in the
+            -- static kernel registry, so dispatch can't resolve by
+            -- name — must carry the closure in the value.
+            (DynamicKernelImpl [ "Random" ] "nativeGeneratorStep" stepKernelFn)
             3
         ]
 
@@ -1970,7 +1974,9 @@ makeParserAdvancedParser1 captured stepFn =
             [ captured ]
             [ fakeNode (VarPattern "$captured"), fakeNode (VarPattern "$state") ]
             (Just { moduleName = [ "Parser", "Advanced" ], name = "nativeParser" })
-            (KernelImpl [ "Parser", "Advanced" ] "nativeParserStep" stepFn)
+            -- Dynamic: `stepFn` closes over the captured value. See
+            -- `makeNativeGenerator` for the same pattern.
+            (DynamicKernelImpl [ "Parser", "Advanced" ] "nativeParserStep" stepFn)
             2
         ]
 
