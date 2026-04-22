@@ -2,6 +2,7 @@ module Kernel exposing
     ( EvalFunction
     , KernelId
     , functions
+    , kernelArray
     , kernelCount
     , kernelIdsByName
     , lookupKernelId
@@ -2099,3 +2100,28 @@ lookupKernelId : ModuleName -> String -> Maybe KernelId
 lookupKernelId moduleName name =
     Dict.get moduleName kernelIdsByName
         |> Maybe.andThen (Dict.get name)
+
+
+{-| Build the runtime kernel function array indexed by `KernelId`. Same
+iteration order as `kernelIdsByName` (Dict iteration is sorted), so
+`Array.get id kernelArray` returns the function corresponding to the
+`(moduleName, name)` pair that `lookupKernelId` maps to `id`.
+
+The array is dense by `kernelIdRegistry`'s "IDs are dense in
+[0, kernelCount)" invariant — every ID has a slot.
+
+Built per-eval-context because some kernels (HOF: `List.map`, etc.)
+need the ambient `EvalFunction` to call back into the evaluator.
+
+-}
+kernelArray : EvalFunction -> Array (List Value -> Eval Value)
+kernelArray evalFunction =
+    functions evalFunction
+        |> Dict.toList
+        |> List.concatMap
+            (\( _, moduleKernels ) ->
+                moduleKernels
+                    |> Dict.toList
+                    |> List.map (\( _, ( _, fn ) ) -> fn)
+            )
+        |> Array.fromList

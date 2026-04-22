@@ -1,5 +1,6 @@
 module KernelTests exposing (suite)
 
+import Array
 import Core
 import Elm.Syntax.Expression exposing (Case, CaseBlock, Expression(..), Function, FunctionImplementation, Lambda, LetBlock, LetDeclaration(..), RecordSetter)
 import Elm.Syntax.ModuleName exposing (ModuleName)
@@ -72,6 +73,20 @@ kernelIdRegistry =
         , test "IDs are dense in [0, kernelCount)" <|
             \_ ->
                 Expect.equal (List.sort allIds) (List.range 0 (Kernel.kernelCount - 1))
+        , test "kernelArray length matches kernelCount" <|
+            \_ ->
+                Expect.equal Kernel.kernelCount
+                    (Array.length (Kernel.kernelArray Eval.Expression.evalFunction))
+        , test "kernelArray slot count matches Dict-derived registry" <|
+            \_ ->
+                -- Stronger guard than IDs-are-dense: actually verify the
+                -- runtime array slot count, since `kernelArray` uses
+                -- the same Dict iteration as `kernelIdsByName`. If the
+                -- two ever desync (e.g. a future refactor changes one
+                -- iteration order), `Array.get id` would silently
+                -- return the wrong function.
+                Expect.equal (List.length allKernels)
+                    (Array.length (Kernel.kernelArray Eval.Expression.evalFunction))
         ]
 
 
