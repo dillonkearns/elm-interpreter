@@ -35,7 +35,55 @@ suite =
         , multiModuleSmoke
         , noErrorsForBasicProgram
         , broadLanguageCoverage
+        , rebuildDispatchersMatchesInitialBuild
         ]
+
+
+rebuildDispatchersMatchesInitialBuild : Test
+rebuildDispatchersMatchesInitialBuild =
+    test "rebuildDispatchers reproduces native/higherOrder/kernel dispatcher key sets" <|
+        \_ ->
+            -- Step 7 (parallel-ceiling defunctionalization): preparation for
+            -- step 8's Wire3 codec for ResolvedProject. The codec will skip
+            -- the three function-bearing dispatcher fields on encode and
+            -- call rebuildDispatchers on decode to repopulate them. This
+            -- test guards that the rebuild produces the same set of keys
+            -- (and same arities for kernelDispatchers) as the original
+            -- inline construction inside resolveProject.
+            case Eval.Module.buildProjectEnv [] of
+                Ok projectEnv ->
+                    let
+                        resolved =
+                            Eval.Module.projectEnvResolved projectEnv
+
+                        rebuilt =
+                            Eval.Module.rebuildDispatchers resolved.globalIds
+                    in
+                    Expect.all
+                        [ \_ ->
+                            FastDict.keys rebuilt.native
+                                |> Expect.equal (FastDict.keys resolved.nativeDispatchers)
+                        , \_ ->
+                            FastDict.keys rebuilt.higherOrder
+                                |> Expect.equal (FastDict.keys resolved.higherOrderDispatchers)
+                        , \_ ->
+                            FastDict.keys rebuilt.kernel
+                                |> Expect.equal (FastDict.keys resolved.kernelDispatchers)
+                        , \_ ->
+                            -- Arities must match exactly — kernelDispatchers
+                            -- is the only field with a comparable scalar
+                            -- alongside its function pointer.
+                            FastDict.toList rebuilt.kernel
+                                |> List.map (\( id, d ) -> ( id, d.arity ))
+                                |> Expect.equal
+                                    (FastDict.toList resolved.kernelDispatchers
+                                        |> List.map (\( id, d ) -> ( id, d.arity ))
+                                    )
+                        ]
+                        ()
+
+                Err err ->
+                    Expect.fail (errToString err)
 
 
 coreIdsPopulated : Test

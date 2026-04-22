@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeDependencySummaryStats, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeOneModuleInEnvSelectedWithFlags, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeDependencySummaryStats, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeOneModuleInEnvSelectedWithFlags, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, rebuildDispatchers, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -93,6 +93,107 @@ Value.toExpression + synthesized AST round-trip.
 type alias KernelDispatcher =
     { arity : Int
     , kernelFn : List Value -> Types.Config -> Env -> EvalResult Value
+    }
+
+
+{-| Rebuild the three function-bearing dispatcher dicts from a `globalIds`
+map plus the static dispatcher registries. Pure function of its input —
+the same `globalIds` always yields the same dicts.
+
+Step 8's Wire3 codec for `ResolvedProject` skips these three fields on
+encode and calls this on decode to repopulate them, sidestepping the
+function-pointer wire-encoding constraint.
+
+Also used at the single inline construction site inside `resolveProject`
+so the build path and the decode path stay byte-identical.
+
+-}
+rebuildDispatchers :
+    Dict.Dict ( ModuleName, String ) IR.GlobalId
+    ->
+        { native : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+        , higherOrder : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
+        , kernel : Dict.Dict IR.GlobalId KernelDispatcher
+        }
+rebuildDispatchers globalIds =
+    let
+        -- `native` maps a handful of hot core-function GlobalIds to
+        -- direct `List Value -> Maybe Value` dispatchers so the new
+        -- evaluator can skip the Value.toExpression + synthesized AST
+        -- delegation path for common operators.
+        nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+        nativeDispatchers =
+            NativeDispatch.buildRegistry
+                (\key -> Dict.get key globalIds)
+
+        -- `higherOrder` is parallel to `native`, but for core functions
+        -- like `List.foldl` that take a callback Value. These dispatchers
+        -- invoke callbacks via `applyClosure` directly, bypassing the old
+        -- evaluator's `Kernel.function` marshaling layer which mis-handles
+        -- `RExprImpl` closures (patterns = [] but arity > 0).
+        higherOrderDispatchers : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
+        higherOrderDispatchers =
+            RE.buildHigherOrderRegistry
+                (\key -> Dict.get key globalIds)
+
+        {- `kernel` maps GlobalIds to direct kernel-fn dispatchers by
+           **exact qualified name only**.
+
+           This deliberately does NOT do the old unsafe
+           `Elm.Kernel.X.fn` → `X.fn` prefix-strip rewrite. That
+           rewrite assumed the Core wrapper for `X.fn` was a trivial
+           pass-through, which is false for wrappers that adapt
+           argument types across the kernel boundary, e.g.:
+
+             String.join sep chunks =
+                 Elm.Kernel.String.join sep (Elm.Kernel.List.toArray chunks)
+
+           The user-level `String.join` takes a `List String`, but the
+           kernel `Elm.Kernel.String.join` takes a `jsArray string`
+           (JsArray). Short-circuiting `String.join` to the kernel
+           dispatcher bypasses the `toArray chunks` conversion, the
+           kernel sees a `List` where it expects a `JsArray`, and fires
+           "Expected the second argument to be List String".
+
+           Exact-name dispatch is safe for both cases:
+
+             - user-facing overrides like `Dict.insert`, which are
+               intentionally registered as drop-in replacements
+             - explicit `Elm.Kernel.*` references that appear in
+               package source (e.g. `Regex`, `Bytes`, `Json`) after
+               the caller has already chosen the kernel entry point
+        -}
+        kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
+        kernelDispatchers =
+            Eval.Expression.kernelFunctions
+                |> Dict.foldl
+                    (\moduleKey moduleDict outer ->
+                        let
+                            parts : List String
+                            parts =
+                                String.split "." moduleKey
+                        in
+                        moduleDict
+                            |> Dict.foldl
+                                (\funcName ( arity, kernelFn ) acc ->
+                                    case Dict.get ( parts, funcName ) globalIds of
+                                        Just id ->
+                                            Dict.insert id
+                                                { arity = arity
+                                                , kernelFn = kernelFn
+                                                }
+                                                acc
+
+                                        Nothing ->
+                                            acc
+                                )
+                                outer
+                    )
+                    Dict.empty
+    in
+    { native = nativeDispatchers
+    , higherOrder = higherOrderDispatchers
+    , kernel = kernelDispatchers
     }
 
 
@@ -495,81 +596,13 @@ resolveProject summaries =
                     (\key id acc -> Dict.insert id key acc)
                     Dict.empty
 
-        -- Build the native dispatcher registry once per project env. The
-        -- registry maps a handful of hot core-function GlobalIds to
-        -- direct `List Value -> Maybe Value` dispatchers so the new
-        -- evaluator can skip the Value.toExpression + synthesized AST
-        -- delegation path for common operators.
-        nativeDispatchers : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
-        nativeDispatchers =
-            NativeDispatch.buildRegistry
-                (\key -> Dict.get key globalIds)
-
-        -- Build the higher-order dispatcher registry — parallel to
-        -- `nativeDispatchers`, but for core functions like `List.foldl`
-        -- that take a callback Value. These dispatchers invoke callbacks
-        -- via `applyClosure` directly, bypassing the old evaluator's
-        -- `Kernel.function` marshaling layer which mis-handles
-        -- `RExprImpl` closures (patterns = [] but arity > 0).
-        higherOrderDispatchers : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
-        higherOrderDispatchers =
-            RE.buildHigherOrderRegistry
-                (\key -> Dict.get key globalIds)
-
-        {- Build the kernel dispatcher registry from `kernelFunctions`
-           by exact qualified name.
-
-           This deliberately does NOT do the old unsafe
-           `Elm.Kernel.X.fn` → `X.fn` prefix-strip rewrite. That
-           rewrite assumed the Core wrapper for `X.fn` was a trivial
-           pass-through, which is false for wrappers that adapt
-           argument types across the kernel boundary, e.g.:
-
-             String.join sep chunks =
-                 Elm.Kernel.String.join sep (Elm.Kernel.List.toArray chunks)
-
-           The user-level `String.join` takes a `List String`, but the
-           kernel `Elm.Kernel.String.join` takes a `jsArray string`
-           (JsArray). Short-circuiting `String.join` to the kernel
-           dispatcher bypasses the `toArray chunks` conversion, the
-           kernel sees a `List` where it expects a `JsArray`, and fires
-           "Expected the second argument to be List String".
-
-           Exact-name dispatch is safe for both cases:
-
-             - user-facing overrides like `Dict.insert`, which are
-               intentionally registered as drop-in replacements
-             - explicit `Elm.Kernel.*` references that appear in
-               package source (e.g. `Regex`, `Bytes`, `Json`) after
-               the caller has already chosen the kernel entry point
-        -}
-        kernelDispatchers : Dict.Dict IR.GlobalId KernelDispatcher
-        kernelDispatchers =
-            Eval.Expression.kernelFunctions
-                |> Dict.foldl
-                    (\moduleKey moduleDict outer ->
-                        let
-                            parts : List String
-                            parts =
-                                String.split "." moduleKey
-                        in
-                        moduleDict
-                            |> Dict.foldl
-                                (\funcName ( arity, kernelFn ) acc ->
-                                    case Dict.get ( parts, funcName ) globalIds of
-                                        Just id ->
-                                            Dict.insert id
-                                                { arity = arity
-                                                , kernelFn = kernelFn
-                                                }
-                                                acc
-
-                                        Nothing ->
-                                            acc
-                                )
-                                outer
-                    )
-                    Dict.empty
+        dispatchers :
+            { native : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+            , higherOrder : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
+            , kernel : Dict.Dict IR.GlobalId KernelDispatcher
+            }
+        dispatchers =
+            rebuildDispatchers globalIds
 
         -- Pass 2: resolve each user declaration's body against the full
         -- globalIds map. Accumulate successes in `bodies` and failures
@@ -580,9 +613,9 @@ resolveProject summaries =
             { globalIds = globalIds
             , bodies = Dict.empty
             , globalIdToName = globalIdToName
-            , nativeDispatchers = nativeDispatchers
-            , higherOrderDispatchers = higherOrderDispatchers
-            , kernelDispatchers = kernelDispatchers
+            , nativeDispatchers = dispatchers.native
+            , higherOrderDispatchers = dispatchers.higherOrder
+            , kernelDispatchers = dispatchers.kernel
             , globals = Dict.empty
             , errors = []
             }
