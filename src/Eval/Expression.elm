@@ -2089,6 +2089,30 @@ evalFullyAppliedWithEnv : Env -> List Value -> Maybe QualifiedNameRef -> Impleme
 evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env =
     case implementation of
         KernelImpl moduleName name f ->
+            let
+                -- Defunctionalization step 3: prefer the array-indexed
+                -- kernel function from `kernelArrayCache` over the inline
+                -- function pointer `f`. The cache is built once at module
+                -- init from the same registry that produced `f`, so the
+                -- two should be identical for any kernel that came from
+                -- `Kernel.functions`. Fall back to `f` if the (mod, name)
+                -- pair isn't in the registry — a defensive case for
+                -- KernelImpl values constructed outside the static
+                -- registry (Random.step's intStepKernelImpl etc.).
+                kernelFn : List Value -> Eval Value
+                kernelFn =
+                    case Kernel.lookupKernelId moduleName name of
+                        Just kernelId ->
+                            case Array.get kernelId kernelArrayCache of
+                                Just arrayFn ->
+                                    arrayFn
+
+                                Nothing ->
+                                    f
+
+                        Nothing ->
+                            f
+            in
             if cfg.trace then
                 let
                     childEnv : Env
@@ -2097,7 +2121,7 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
 
                     kernelEvalResult : EvalResult Value
                     kernelEvalResult =
-                        f args cfg childEnv
+                        kernelFn args cfg childEnv
 
                     ( kernelResult, children, logLines ) =
                         EvalResult.toTriple kernelEvalResult
@@ -2139,7 +2163,7 @@ evalFullyAppliedWithEnv boundEnv args maybeQualifiedName implementation cfg env 
                         Recursion.base (EvOk v)
 
                     Nothing ->
-                        Recursion.base (f args cfg env)
+                        Recursion.base (kernelFn args cfg env)
 
         AstImpl (Node range (FunctionOrValue (("Elm" :: "Kernel" :: _) as moduleName) name)) ->
             -- Fallback for AST-based kernel references (shouldn't happen often with KernelImpl)
@@ -2415,16 +2439,31 @@ call maybeQualifiedName implementation cfg env =
                         Recursion.recurse ( expr, { trace = cfg.trace, coverage = cfg.coverage, coverageProbeLines = cfg.coverageProbeLines, maxSteps = cfg.maxSteps, tcoTarget = Nothing, callCounts = cfg.callCounts, intercepts = cfg.intercepts, memoizedFunctions = cfg.memoizedFunctions, collectMemoStats = cfg.collectMemoStats, useResolvedIR = cfg.useResolvedIR }, env )
 
         KernelImpl moduleName name f ->
+            let
+                kernelFn : List Value -> Eval Value
+                kernelFn =
+                    case Kernel.lookupKernelId moduleName name of
+                        Just kernelId ->
+                            case Array.get kernelId kernelArrayCache of
+                                Just arrayFn ->
+                                    arrayFn
+
+                                Nothing ->
+                                    f
+
+                        Nothing ->
+                            f
+            in
             if cfg.trace then
                 let
                     childEnv : Env
                     childEnv =
                         Environment.callKernel moduleName name env
                 in
-                Recursion.base (f [] cfg childEnv)
+                Recursion.base (kernelFn [] cfg childEnv)
 
             else
-                Recursion.base (f [] cfg env)
+                Recursion.base (kernelFn [] cfg env)
 
         RExprImpl payload ->
             {- `call` is the 0-arg dispatch entry: used from
@@ -3676,6 +3715,21 @@ kernelFunctions =
             Dict.empty
 
 
+{-| Defunctionalization step 3: array-indexed kernel dispatch table,
+computed once at module init. Step 4+ will drop the function field
+from `KernelImpl` and dispatch sites will look up here by `KernelId`
+instead of using the inline function pointer; this top-level value
+keeps the lookup amortized to one Array index per call.
+
+Built from `Kernel.functions evalFunction` so HOF kernels (List.map,
+Dict.foldl, etc.) close over the right `evalFunction` callback.
+
+-}
+kernelArrayCache : Array.Array (List Value -> Eval Value)
+kernelArrayCache =
+    Kernel.kernelArray evalFunction
+
+
 evalFunction : Kernel.EvalFunction
 evalFunction oldArgs patterns patternsLength functionName implementation cfg localEnv =
     let
@@ -3750,13 +3804,28 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                     Just boundEnv ->
                         case implementation of
                             KernelImpl moduleName name f ->
+                                let
+                                    kernelFn : List Value -> Eval Value
+                                    kernelFn =
+                                        case Kernel.lookupKernelId moduleName name of
+                                            Just kernelId ->
+                                                case Array.get kernelId kernelArrayCache of
+                                                    Just arrayFn ->
+                                                        arrayFn
+
+                                                    Nothing ->
+                                                        f
+
+                                            Nothing ->
+                                                f
+                                in
                                 if cfg.trace then
-                                    f oldArgs
+                                    kernelFn oldArgs
                                         cfg
                                         (Environment.callKernel moduleName name localEnv)
 
                                 else
-                                    f oldArgs cfg localEnv
+                                    kernelFn oldArgs cfg localEnv
 
                             AstImpl expr ->
                                 evalExpression expr cfg boundEnv
@@ -3783,13 +3852,28 @@ evalFunction oldArgs patterns patternsLength functionName implementation cfg loc
                             Ok (Just newBindings) ->
                                 case implementation of
                                     KernelImpl moduleName name f ->
+                                        let
+                                            kernelFn : List Value -> Eval Value
+                                            kernelFn =
+                                                case Kernel.lookupKernelId moduleName name of
+                                                    Just kernelId ->
+                                                        case Array.get kernelId kernelArrayCache of
+                                                            Just arrayFn ->
+                                                                arrayFn
+
+                                                            Nothing ->
+                                                                f
+
+                                                    Nothing ->
+                                                        f
+                                        in
                                         if cfg.trace then
-                                            f oldArgs
+                                            kernelFn oldArgs
                                                 cfg
                                                 (Environment.callKernel moduleName name localEnv)
 
                                         else
-                                            f oldArgs cfg localEnv
+                                            kernelFn oldArgs cfg localEnv
 
                                     AstImpl expr ->
                                         -- This is fine because it's never going to be recursive. FOR NOW. TODO: fix
