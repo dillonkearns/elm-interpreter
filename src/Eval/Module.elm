@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeDependencySummaryStats, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeOneModuleInEnvSelectedWithFlags, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, rebuildDispatchers, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, allModuleFunctions, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeDependencySummaryStats, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeOneModuleInEnvSelectedWithFlags, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, rebuildDispatchers, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -6982,6 +6982,16 @@ getModuleFunctions : ModuleName -> ProjectEnv -> Dict.Dict String FunctionImplem
 getModuleFunctions moduleName (ProjectEnv projectEnv) =
     Dict.get (Environment.moduleKey moduleName) projectEnv.env.shared.functions
         |> Maybe.withDefault Dict.empty
+
+
+{-| Enumerate every module's function dict in the project. Used by the
+step-8a ProjectEnv sizing benchmark to total up FunctionImplementation
+payload weight. Returned in `(moduleKey, functionsDict)` form matching
+the underlying `SharedContext.functions` storage.
+-}
+allModuleFunctions : ProjectEnv -> List ( String, Dict.Dict String FunctionImplementation )
+allModuleFunctions (ProjectEnv projectEnv) =
+    Dict.toList projectEnv.env.shared.functions
 
 
 {-| Install a pre-computed normalized function dict for a module into an
