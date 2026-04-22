@@ -1,4 +1,4 @@
-module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, allModuleFunctions, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeDependencySummaryStats, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeOneModuleInEnvSelectedWithFlags, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, rebuildDispatchers, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, trace, traceOrEvalModule, traceWithEnv)
+module Eval.Module exposing (CachedModuleSummary, DependencySummaryStats, ProjectEnv, ResolveErrorEntry, ResolvedProject, WireFields, allModuleFunctions, buildCachedModuleSummariesFromParsed, buildInterfaceFromFile, buildProjectEnv, buildProjectEnvFromParsed, buildProjectEnvFromSummaries, coverageWithEnv, coverageWithEnvAndLimit, emptyDependencySummaryStats, eval, evalProject, evalWithEnv, evalWithEnvAndLimit, evalWithEnvFromFiles, evalWithEnvFromFilesAndLimit, evalWithEnvFromFilesAndMemo, evalWithEnvFromFilesAndValues, evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw, evalWithEnvFromFilesAndValuesAndInterceptsRaw, evalWithEnvFromFilesAndValuesAndMemo, evalWithIntercepts, evalWithInterceptsAndMemoRaw, evalWithInterceptsRaw, evalWithMemoizedFunctions, evalWithResolvedIR, evalWithResolvedIRExpression, evalWithResolvedIRFromFilesAndIntercepts, evalWithResolvedIRFromFilesAndInterceptsAndLimit, evalWithValuesAndMemoizedFunctions, extendResolvedWithFiles, extendWithFiles, extendWithFilesNormalized, fileModuleName, fromWireFields, getModuleFunctions, getModulePrecomputedValues, handleInternalMemoLookup, handleInternalMemoStore, handleInternalMemoYield, isLosslessValue, mergeDependencySummaryStats, mergeModuleFunctionsIntoEnv, normalizeOneModuleInEnv, normalizeOneModuleInEnvSelected, normalizeOneModuleInEnvSelectedWithFlags, normalizeSummaries, normalizeSummariesWithStats, normalizeUserModulesInEnv, parseProjectSources, precomputedValuesByModule, precomputedValuesCount, projectEnvResolved, rebuildDispatchers, replaceModuleFunctionsInEnv, replaceModuleInEnv, setModulePrecomputedValues, toWireFields, trace, traceOrEvalModule, traceWithEnv)
 
 import Array
 import Bitwise
@@ -38,7 +38,7 @@ import Rope exposing (Rope)
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import TcoAnalysis
-import Types exposing (CallTree, Config, Env, Error(..), EvalResult(..), ImportedNames, Value)
+import Types exposing (CallTree, Config, Env, Error(..), EvalResult(..), ImportedNames, SharedContext, Value)
 import Value exposing (unsupported)
 
 
@@ -271,6 +271,155 @@ refreshResolvedGlobals (ProjectEnv projectEnv) =
     in
     ProjectEnv
         { projectEnv | resolved = { resolved | globals = newGlobals } }
+
+
+{-| Wire-shipping shape for `ProjectEnv`. Carries every field the
+worker pool needs to reproduce eval behavior, with a couple of
+deliberate omissions to keep the wire payload small:
+
+  - `shared.tcoAnalyses` is rebuilt from `sharedFunctions` on the
+    receive side via `precomputeOneModule`. Each entry is a small
+    metadata record, but they total to a non-trivial dict; cheaper
+    to recompute than to ship.
+
+  - `resolved.{native,higherOrder,kernel}Dispatchers` are rebuilt
+    via `rebuildDispatchers`. These are function-bearing (per
+    step 7) and not Wire3-encodable.
+
+  - Per-eval transient `Env` state — `letFunctions`, `values`,
+    `callStack`, `callDepth`, `recursionCheck` — is reset to fresh
+    defaults on the receive side. A worker that decodes a
+    `WireFields` is in the same "just loaded" state the main thread
+    was when it called `toWireFields`.
+
+The two `currentModule*` fields preserve "where the env was last
+focused" so derived defaults (`currentModuleFunctions`, `imports`)
+reconstruct via lookup against the shared maps.
+
+The `sharedPrecomputedValues` field is ASSUMED to be already
+filtered through `isLosslessValue` by the caller — wire-encoding
+non-finite Floats, `RegexValue`, etc. fails on the wire codec
+side. Filtering at construction time, not encode time, is so the
+caller knows exactly what's getting dropped.
+
+-}
+type alias WireFields =
+    { sharedFunctions : Dict.Dict String (Dict.Dict String FunctionImplementation)
+    , sharedModuleImports : Dict.Dict String ImportedNames
+    , sharedPrecomputedValues : Dict.Dict String (Dict.Dict String Value)
+    , allInterfaces : ElmDict.Dict ModuleName (List Exposed)
+    , resolvedGlobalIds : Dict.Dict ( ModuleName, String ) IR.GlobalId
+    , resolvedBodies : Dict.Dict IR.GlobalId IR.RExpr
+    , resolvedGlobalIdToName : Dict.Dict IR.GlobalId ( ModuleName, String )
+    , resolvedGlobals : Dict.Dict IR.GlobalId Value
+    , resolvedErrors : List ResolveErrorEntry
+    , currentModule : ModuleName
+    , currentModuleKey : String
+    }
+
+
+{-| Decompose a `ProjectEnv` into the wire-shipping fields. Pure;
+the original `ProjectEnv` is preserved.
+
+The caller is responsible for filtering `sharedPrecomputedValues`
+through `isLosslessValue` before encoding — see `WireFields`'s
+doc-comment.
+
+-}
+toWireFields : ProjectEnv -> WireFields
+toWireFields (ProjectEnv pe) =
+    { sharedFunctions = pe.env.shared.functions
+    , sharedModuleImports = pe.env.shared.moduleImports
+    , sharedPrecomputedValues = pe.env.shared.precomputedValues
+    , allInterfaces = pe.allInterfaces
+    , resolvedGlobalIds = pe.resolved.globalIds
+    , resolvedBodies = pe.resolved.bodies
+    , resolvedGlobalIdToName = pe.resolved.globalIdToName
+    , resolvedGlobals = pe.resolved.globals
+    , resolvedErrors = pe.resolved.errors
+    , currentModule = pe.env.currentModule
+    , currentModuleKey = pe.env.currentModuleKey
+    }
+
+
+{-| Reassemble a `ProjectEnv` from wire-shipping fields. Rebuilds
+`tcoAnalyses` from `sharedFunctions`, dispatchers from
+`resolvedGlobalIds`, and resets per-eval transient `Env` state to
+fresh defaults. The reassembled `ProjectEnv` is observationally
+equivalent (for purposes of `evalWithEnv*`) to the one
+`toWireFields` was called on.
+
+-}
+fromWireFields : WireFields -> ProjectEnv
+fromWireFields w =
+    let
+        tcoAnalyses : Dict.Dict String (Dict.Dict String TcoAnalysis.TcoMetadata)
+        tcoAnalyses =
+            Dict.map
+                (\_ moduleFns -> precomputeOneModule moduleFns)
+                w.sharedFunctions
+
+        shared : SharedContext
+        shared =
+            { functions = w.sharedFunctions
+            , moduleImports = w.sharedModuleImports
+            , precomputedValues = w.sharedPrecomputedValues
+            , tcoAnalyses = tcoAnalyses
+            }
+
+        currentModuleFunctions : Dict.Dict String FunctionImplementation
+        currentModuleFunctions =
+            Dict.get w.currentModuleKey w.sharedFunctions
+                |> Maybe.withDefault Dict.empty
+
+        currentImports : ImportedNames
+        currentImports =
+            Dict.get w.currentModuleKey w.sharedModuleImports
+                |> Maybe.withDefault
+                    { aliases = Dict.empty
+                    , exposedValues = Dict.empty
+                    , exposedConstructors = Dict.empty
+                    }
+
+        env : Env
+        env =
+            { currentModule = w.currentModule
+            , currentModuleKey = w.currentModuleKey
+            , shared = shared
+            , currentModuleFunctions = currentModuleFunctions
+            , letFunctions = Dict.empty
+            , values = Dict.empty
+            , callStack = []
+            , imports = currentImports
+            , callDepth = 0
+            , recursionCheck = Nothing
+            }
+
+        dispatchers :
+            { native : Dict.Dict IR.GlobalId NativeDispatch.NativeDispatcher
+            , higherOrder : Dict.Dict IR.GlobalId RE.HigherOrderDispatcher
+            , kernel : Dict.Dict IR.GlobalId KernelDispatcher
+            }
+        dispatchers =
+            rebuildDispatchers w.resolvedGlobalIds
+
+        resolved : ResolvedProject
+        resolved =
+            { globalIds = w.resolvedGlobalIds
+            , bodies = w.resolvedBodies
+            , globalIdToName = w.resolvedGlobalIdToName
+            , nativeDispatchers = dispatchers.native
+            , higherOrderDispatchers = dispatchers.higherOrder
+            , kernelDispatchers = dispatchers.kernel
+            , globals = w.resolvedGlobals
+            , errors = w.resolvedErrors
+            }
+    in
+    ProjectEnv
+        { env = env
+        , allInterfaces = w.allInterfaces
+        , resolved = resolved
+        }
 
 
 {-| Evaluate a top-level expression via the new resolved-IR evaluator.

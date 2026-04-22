@@ -19,10 +19,12 @@ that's the signal Phase 2 iteration 2b was built to catch.
 
 -}
 
+import Elm.Syntax.Expression
 import Eval.Module
 import Eval.ResolvedIR as IR
 import Expect
 import FastDict
+import Syntax
 import Test exposing (Test, describe, test)
 import Types
 
@@ -36,7 +38,52 @@ suite =
         , noErrorsForBasicProgram
         , broadLanguageCoverage
         , rebuildDispatchersMatchesInitialBuild
+        , wireFieldsRoundtripPreservesEval
         ]
+
+
+wireFieldsRoundtripPreservesEval : Test
+wireFieldsRoundtripPreservesEval =
+    test "toWireFields → fromWireFields preserves eval behavior" <|
+        \_ ->
+            -- Step 8b prep: the worker pool's main→worker handoff goes through
+            -- toWireFields → encode → ship → decode → fromWireFields. Before
+            -- writing the wire codec, prove the toWireFields/fromWireFields
+            -- round-trip itself is observationally correct.
+            let
+                src =
+                    """module Foo exposing (..)
+
+answer : Int
+answer =
+    6 * 7
+"""
+
+                expression =
+                    Elm.Syntax.Expression.FunctionOrValue [ "Foo" ] "answer"
+            in
+            case Eval.Module.buildProjectEnv [ src ] of
+                Ok original ->
+                    let
+                        roundtripped =
+                            original
+                                |> Eval.Module.toWireFields
+                                |> Eval.Module.fromWireFields
+
+                        evalAndStringify env =
+                            case Eval.Module.evalWithEnv env [] expression of
+                                Ok value ->
+                                    "ok:" ++ Debug.toString value
+
+                                Err err ->
+                                    "err:" ++ errToString err
+                    in
+                    Expect.equal
+                        (evalAndStringify original)
+                        (evalAndStringify roundtripped)
+
+                Err err ->
+                    Expect.fail (errToString err)
 
 
 rebuildDispatchersMatchesInitialBuild : Test
