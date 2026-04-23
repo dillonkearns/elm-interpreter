@@ -48,6 +48,7 @@ import Kernel.Parser as KernelParser
 import MemoSpec
 import Set
 import Syntax
+import TcoAnalysis
 import Types
     exposing
         ( Config
@@ -1018,6 +1019,19 @@ dispatchGlobalApplyStep staticEnv locals id argValues =
                        bound as locals. This keeps the trampoline
                        iterative across cross-body calls, which
                        is exactly the point of the refactor.
+
+                       Exception: tail-recursive functions
+                       (`TcoListDrain` or `TcoSafe` per
+                       `TcoAnalysis`) skip this path and route
+                       through OLD eval's `tcoLoop` via
+                       `delegateByName`. The `RTail` trampoline is
+                       iterative but pays per-iteration cost on
+                       arg eval, case match, and dispatch lookups
+                       — measured at ~200-300 µs per iter on 1 M-
+                       element list walks where OLD eval's
+                       `tcoLoopHelp` (which mutates locals in
+                       place via `Environment.replaceValues`)
+                       completes in ~1-2 µs per iter.
                     -}
                     let
                         argCount : Int
@@ -1025,12 +1039,17 @@ dispatchGlobalApplyStep staticEnv locals id argValues =
                             List.length argValues
                     in
                     if argCount == lambda.arity then
-                        let
-                            bodyLocals : List Value
-                            bodyLocals =
-                                List.foldl (::) [] argValues
-                        in
-                        rTail ( bodyLocals, lambda.body )
+                        case maybeTcoDelegateTarget staticEnv id of
+                            Just ( moduleName, name ) ->
+                                rBase (delegateByName (envWithLocals staticEnv locals) moduleName name argValues)
+
+                            Nothing ->
+                                let
+                                    bodyLocals : List Value
+                                    bodyLocals =
+                                        List.foldl (::) [] argValues
+                                in
+                                rTail ( bodyLocals, lambda.body )
 
                     else
                         -- Partial / over-application: fall back
@@ -1880,6 +1899,75 @@ delegateViaAst env id args =
 
         Just ( moduleName, name ) ->
             delegateByName env moduleName name args
+
+
+{-| Tail-call optimization router: when dispatching to a top-level
+function known to be tail-recursive, return its `(moduleName, name)`
+so the caller can route via `delegateByName` → OLD eval's `tcoLoop`.
+Otherwise return `Nothing` and let the resolved-IR `RTail` trampoline
+handle the call.
+
+The resolved-IR evaluator's `RTail` is iterative (no JS stack growth)
+but pays per-iteration overhead on arg eval (`rRecThen` per arg),
+case match, and dispatch dict lookups. Measured at ~200-300 µs per
+iter on tight 1 M-element list walks. OLD eval's `tcoLoopHelp`
+(`Eval/Expression.elm:2713`) mutates locals in place via
+`Environment.replaceValues` and re-enters the body via direct JS
+recursion — closer to ~1-2 µs per iter. For tail-recursive shapes
+(`TcoListDrain` for list-drain patterns, `TcoSafe` for general
+shrinking-arg shapes) the OLD path is much faster.
+
+Returns `Nothing` when the strategy isn't tail-recursive (e.g.
+`TcoGeneral`) or the function isn't analyzed (e.g., a Test value or
+core library function we haven't analyzed). Callers fall through to
+the existing `RTail` path.
+
+-}
+maybeTcoDelegateTarget : REnv -> IR.GlobalId -> Maybe ( ModuleName, String )
+maybeTcoDelegateTarget env id =
+    case FastDict.get id env.globalIdToName of
+        Nothing ->
+            Nothing
+
+        Just (( moduleName, name ) as qualified) ->
+            let
+                moduleKey : String
+                moduleKey =
+                    Environment.moduleKey moduleName
+            in
+            case FastDict.get moduleKey env.fallbackEnv.shared.tcoAnalyses of
+                Nothing ->
+                    Nothing
+
+                Just moduleAnalyses ->
+                    case FastDict.get name moduleAnalyses of
+                        Nothing ->
+                            Nothing
+
+                        Just metadata ->
+                            case metadata.strategy of
+                                TcoAnalysis.TcoListDrain _ ->
+                                    -- List-drain pattern (case on list arg,
+                                    -- advance to tail). This is the shape
+                                    -- that hits the worst cliff in `RTail`'s
+                                    -- per-iteration overhead — measured at
+                                    -- ~200 µs/iter vs ~2 µs/iter via OLD
+                                    -- eval's `tcoLoopHelp`. Delegate.
+                                    Just qualified
+
+                                TcoAnalysis.TcoSafe ->
+                                    -- General "tail call where args shrink"
+                                    -- — can be light (recursion of depth N
+                                    -- on small N) or heavy (countdown over
+                                    -- millions). For light cases, OLD eval's
+                                    -- per-call setup (synth Application AST,
+                                    -- bind args, swap env) outweighs RTail's
+                                    -- per-iter cost. Stay on RTail until we
+                                    -- have data showing TcoSafe benefits.
+                                    Nothing
+
+                                TcoAnalysis.TcoGeneral ->
+                                    Nothing
 
 
 {-| Synthesize an `Application` AST calling `moduleName.name` with the
